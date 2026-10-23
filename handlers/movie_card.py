@@ -49,8 +49,10 @@ def make_quality_slug(q_name: str) -> str:
 def build_final_movie_card_text(movie: Dict[str, Any]) -> str:
     """
     Builds the clean, professional final movie card text.
+    Includes plain title + hashtags so group auto-filter / search can match easily.
     """
-    title = movie.get("title", "Untitled").upper()
+    title = movie.get("title", "Untitled")
+    title_upper = title.upper()
     year = movie.get("year")
     year_str = f" ({year})" if year else ""
     languages = movie.get("languages", ["Hindi"])
@@ -65,10 +67,16 @@ def build_final_movie_card_text(movie: Dict[str, Any]) -> str:
             base_qualities.append(bq)
     q_str = " | ".join(base_qualities) if base_qualities else "Standard"
 
-    text = f"🎬 <b>{title}{year_str}</b>\n\n"
+    # Clean hashtag from title (remove spaces / special chars)
+    tag = re.sub(r"[^a-zA-Z0-9]", "", title)
+    year_tag = f" #{year}" if year else ""
+
+    text = f"🎬 <b>{title_upper}{year_str}</b>\n\n"
     text += f"🌐 <b>Language:</b> {lang_str}\n"
-    text += f"🎞 <b>Quality:</b> {q_str}\n\n"
-    text += "🍿 <b>Available Downloads:</b>"
+    text += f"🎬 <b>Quality:</b> {q_str}\n\n"
+    text += "🍿 <b>Available Downloads:</b>\n\n"
+    # Searchable keywords for auto-filter + group history sync
+    text += f"#{tag}{year_tag} #movie"
     return text
 
 def build_final_movie_card_buttons(movie: Dict[str, Any], for_group: bool = False) -> InlineKeyboardMarkup:
