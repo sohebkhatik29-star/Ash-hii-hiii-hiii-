@@ -1,11 +1,18 @@
-# Temporary runtime restore of save_media from last good commit
-import importlib.util, urllib.request, tempfile, sys, os
+# Runtime restore of save_media.py from last good commit
+import importlib.util
+import urllib.request
+import tempfile
+import sys
+import os
 
-_URL = "https://raw.githubusercontent.com/sohebkhatik29-star/Ash-hii-hiii-hiii-/7aebbab5eaeda8fefc2a9ae4158b50592d2d8369/handlers/save_media.py"
+_URL = (
+    "https://raw.githubusercontent.com/sohebkhatik29-star/Ash-hii-hiii-hiii-/"
+    "7aebbab5eaeda8fefc2a9ae4158b50592d2d8369/handlers/save_media.py"
+)
 _path = os.path.join(tempfile.gettempdir(), "ash_save_media_restored.py")
 
 def _load():
-    with urllib.request.urlopen(_URL, timeout=20) as r:
+    with urllib.request.urlopen(_URL, timeout=25) as r:
         code = r.read()
     with open(_path, "wb") as f:
         f.write(code)

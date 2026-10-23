@@ -1,17 +1,54 @@
-# Temporary runtime restore of database from last good commit
-import importlib.util, urllib.request, tempfile, sys, os
+# Runtime restore of database.py from last good commit (Render-safe DATA_DIR)
+import importlib.util
+import urllib.request
+import tempfile
+import sys
+import os
 
-_URL = "https://raw.githubusercontent.com/sohebkhatik29-star/Ash-hii-hiii-hiii-/7aebbab5eaeda8fefc2a9ae4158b50592d2d8369/handlers/database.py"
+_URL = (
+    "https://raw.githubusercontent.com/sohebkhatik29-star/Ash-hii-hiii-hiii-/"
+    "7aebbab5eaeda8fefc2a9ae4158b50592d2d8369/handlers/database.py"
+)
 _path = os.path.join(tempfile.gettempdir(), "ash_database_restored.py")
 
 def _load():
-    with urllib.request.urlopen(_URL, timeout=20) as r:
-        code = r.read()
-    text = code.decode("utf-8")
+    with urllib.request.urlopen(_URL, timeout=25) as r:
+        text = r.read().decode("utf-8")
+
+    # Ensure regex import (used by search_movies)
     if "import re" not in text:
         text = text.replace("import asyncio\n", "import asyncio\nimport re\n")
+
+    # Fix DATA_DIR so it never tries to create /data on Render
+    old = (
+        'DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")\n'
+        "os.makedirs(DATA_DIR, exist_ok=True)"
+    )
+    new = (
+        "_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n"
+        'DATA_DIR = os.environ.get("DATA_DIR") or os.path.join(_BASE, "data")\n'
+        "try:\n"
+        "    os.makedirs(DATA_DIR, exist_ok=True)\n"
+        "except OSError:\n"
+        '    DATA_DIR = "/tmp/ash_movie_data"\n'
+        "    os.makedirs(DATA_DIR, exist_ok=True)"
+    )
+    if old in text:
+        text = text.replace(old, new)
+    else:
+        # Fallback: force /tmp if makedirs to data fails conceptually
+        text = text.replace(
+            "os.makedirs(DATA_DIR, exist_ok=True)",
+            "try:\n    os.makedirs(DATA_DIR, exist_ok=True)\nexcept OSError:\n"
+            "    DATA_DIR = '/tmp/ash_movie_data'\n"
+            "    os.makedirs(DATA_DIR, exist_ok=True)\n"
+            "MOVIES_FILE = os.path.join(DATA_DIR, 'movies.json')  # noop guard",
+            1,
+        )
+
     with open(_path, "w", encoding="utf-8") as f:
         f.write(text)
+
     spec = importlib.util.spec_from_file_location("handlers._database_restored", _path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["handlers._database_restored"] = mod
