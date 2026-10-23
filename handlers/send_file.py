@@ -1,0 +1,244 @@
+# ==============================================================================
+# ASH AUTOMATIC MOVIE FILE STORE BOT 🎬
+# Module: handlers/send_file.py
+# Purpose: Movie delivery, quality download execution, 30-min auto-delete timers,
+#          and backward compatibility for legacy file links.
+# ==============================================================================
+
+import asyncio
+import logging
+from pyrogram import Client
+from pyrogram.types import Message, CallbackQuery
+from pyrogram.errors import FloodWait
+
+from configs import Config
+from handlers.database import db
+from handlers.movie_card import build_final_movie_card_text, build_final_movie_card_buttons
+
+logger = logging.getLogger(__name__)
+
+async def delete_after_delay(message: Message, delay: int = 1800):
+    """Auto-deletes delivered movie file after specified seconds (default 30 min)."""
+    try:
+        await asyncio.sleep(delay)
+        await message.delete()
+        logger.info(f"Auto-deleted file message {message.id} after {delay} seconds.")
+    except Exception as e:
+        logger.debug(f"Auto-delete note: {e}")
+
+async def send_movie_card(bot: Client, user_id: int, movie_id: str, is_admin: bool = False):
+    """
+    Sends the clean final movie card to a user when they click the deep link.
+    """
+    movie = await db.get_movie(movie_id)
+    if not movie:
+        await bot.send_message(
+            chat_id=user_id,
+            text="❌ **Movie Not Found!**\n\nYeh movie database se remove kar di gayi hai ya link invalid hai."
+        )
+        return
+
+    card_text = build_final_movie_card_text(movie)
+    card_buttons = build_final_movie_card_buttons(movie)
+
+    poster = movie.get("poster_file_id")
+    if not poster and movie.get("qualities") and Config.DB_CHANNEL:
+        try:
+            from handlers.poster import extract_poster_from_message
+            first_q = list(movie["qualities"].values())[0]
+            channel_msg_id = first_q.get("channel_msg_id")
+            if channel_msg_id:
+                db_msg = await bot.get_messages(Config.DB_CHANNEL, channel_msg_id)
+                extracted_poster, _ = await extract_poster_from_message(bot, db_msg)
+                if extracted_poster:
+                    poster = extracted_poster
+                    await db.update_movie_poster(movie_id, poster, "on_demand_extract")
+        except Exception as e:
+            logger.debug(f"On-demand poster extraction in send_movie_card: {e}")
+
+    if poster:
+        try:
+            await bot.send_photo(
+                chat_id=user_id,
+                photo=poster,
+                caption=card_text,
+                reply_markup=card_buttons
+            )
+            return
+        except Exception as e:
+            logger.warning(f"Failed to send poster photo: {e}")
+
+    await bot.send_message(
+        chat_id=user_id,
+        text=card_text,
+        reply_markup=card_buttons
+    )
+
+def find_matching_quality(qualities: dict, quality_query: str):
+    if not qualities or not quality_query:
+        return None, None
+    if quality_query in qualities:
+        return quality_query, qualities[quality_query]
+    norm_query = re.sub(r"[^a-zA-Z0-9]", "", quality_query).lower()
+    for q_name, q_val in qualities.items():
+        norm_name = re.sub(r"[^a-zA-Z0-9]", "", q_name).lower()
+        if norm_name == norm_query:
+            return q_name, q_val
+    return None, None
+
+async def deliver_movie_quality(bot: Client, query: CallbackQuery, movie_id: str, quality: str):
+    """
+    Sends the requested movie quality file to the user from DB_CHANNEL with auto-delete notice.
+    """
+    user_id = query.from_user.id
+    movie = await db.get_movie(movie_id)
+
+    if not movie:
+        await query.answer("Movie record nahi mila!", show_alert=True)
+        return
+
+    qualities = movie.get("qualities", {})
+    matched_q_name, q_data = find_matching_quality(qualities, quality)
+
+    if not q_data:
+        await query.answer(f"Quality '{quality}' is movie ke liye uplabdh nahi hai!", show_alert=True)
+        return
+
+    channel_msg_id = q_data.get("channel_msg_id")
+    if not channel_msg_id:
+        await query.answer("File reference missing!", show_alert=True)
+        return
+
+    await query.answer("Sending your file... please wait!", show_alert=False)
+
+    try:
+        sent_file = None
+        if channel_msg_id and Config.DB_CHANNEL:
+            try:
+                if Config.FORWARD_AS_COPY:
+                    sent_file = await bot.copy_message(
+                        chat_id=user_id,
+                        from_chat_id=Config.DB_CHANNEL,
+                        message_id=channel_msg_id
+                    )
+                else:
+                    sent_file = await bot.forward_messages(
+                        chat_id=user_id,
+                        from_chat_id=Config.DB_CHANNEL,
+                        message_ids=channel_msg_id
+                    )
+            except Exception as e:
+                logger.warning(f"Channel copy failed: {e}")
+
+        if not sent_file and q_data.get("file_id"):
+            sent_file = await bot.send_cached_media(
+                chat_id=user_id,
+                file_id=q_data["file_id"]
+            )
+
+        if not sent_file:
+            await query.answer("File deliver karne mein samasya aayi!", show_alert=True)
+            return
+
+        notice = await bot.send_message(
+            chat_id=user_id,
+            text=f"⚠️ **Copyright Protection Alert:**\n\n"
+                 f"File will be automatically deleted in **{Config.AUTO_DELETE_TIME // 60} minutes**.\n"
+                 f"Kripya ise turant apne 'Saved Messages' mein forward kar lein!",
+            reply_to_message_id=sent_file.id
+        )
+
+        asyncio.create_task(delete_after_delay(sent_file, Config.AUTO_DELETE_TIME))
+        asyncio.create_task(delete_after_delay(notice, Config.AUTO_DELETE_TIME))
+
+    except FloodWait as sl:
+        await asyncio.sleep(sl.value)
+        await deliver_movie_quality(bot, query, movie_id, quality)
+    except Exception as e:
+        logger.error(f"Error sending movie quality: {e}")
+        await bot.send_message(chat_id=user_id, text=f"File bhejne mein error aaya: {e}")
+
+async def deliver_movie_quality_direct(bot: Client, user_id: int, movie_id: str, quality: str):
+    """
+    Direct delivery triggered when user clicks a movie download link/button from a group.
+    Delivers file into user's private bot chat with copyright auto-delete timer.
+    """
+    movie = await db.get_movie(movie_id)
+    if not movie:
+        await bot.send_message(chat_id=user_id, text="❌ **Movie record nahi mila ya link invalid hai!**")
+        return
+
+    qualities = movie.get("qualities", {})
+    matched_q_name, q_data = find_matching_quality(qualities, quality)
+    if not q_data:
+        await bot.send_message(chat_id=user_id, text=f"❌ **Quality '{quality}' is movie ke liye uplabdh nahi hai!**")
+        return
+
+    channel_msg_id = q_data.get("channel_msg_id")
+
+    try:
+        sent_file = None
+        if channel_msg_id and Config.DB_CHANNEL:
+            try:
+                if Config.FORWARD_AS_COPY:
+                    sent_file = await bot.copy_message(
+                        chat_id=user_id,
+                        from_chat_id=Config.DB_CHANNEL,
+                        message_id=channel_msg_id
+                    )
+                else:
+                    sent_file = await bot.forward_messages(
+                        chat_id=user_id,
+                        from_chat_id=Config.DB_CHANNEL,
+                        message_ids=channel_msg_id
+                    )
+            except Exception as e:
+                logger.warning(f"Direct channel copy failed: {e}")
+
+        if not sent_file and q_data.get("file_id"):
+            sent_file = await bot.send_cached_media(
+                chat_id=user_id,
+                file_id=q_data["file_id"]
+            )
+
+        if not sent_file:
+            await bot.send_message(chat_id=user_id, text="❌ **File deliver nahi ho paayi.**")
+            return
+
+        notice = await bot.send_message(
+            chat_id=user_id,
+            text=f"⚠️ **Copyright Protection Alert:**\n\n"
+                 f"File will be automatically deleted in **{Config.AUTO_DELETE_TIME // 60} minutes**.\n"
+                 f"Kripya ise turant apne 'Saved Messages' mein forward kar lein!",
+            reply_to_message_id=sent_file.id
+        )
+
+        asyncio.create_task(delete_after_delay(sent_file, Config.AUTO_DELETE_TIME))
+        asyncio.create_task(delete_after_delay(notice, Config.AUTO_DELETE_TIME))
+
+    except FloodWait as sl:
+        await asyncio.sleep(sl.value)
+        await deliver_movie_quality_direct(bot, user_id, movie_id, quality)
+    except Exception as e:
+        logger.error(f"Error direct sending movie quality: {e}")
+        await bot.send_message(chat_id=user_id, text=f"File bhejne mein error aaya: {e}")
+
+# ==================== LEGACY FILE SUPPORT ====================
+
+async def send_media_and_reply(bot: Client, user_id: int, file_id: int):
+    """Maintains backward compatibility for old FileStore base64 links."""
+    try:
+        if Config.FORWARD_AS_COPY:
+            sent = await bot.copy_message(chat_id=user_id, from_chat_id=Config.DB_CHANNEL, message_id=file_id)
+        else:
+            sent = await bot.forward_messages(chat_id=user_id, from_chat_id=Config.DB_CHANNEL, message_ids=file_id)
+
+        notice = await bot.send_message(
+            chat_id=user_id,
+            text=f"⚠️ File will be auto-deleted in {Config.AUTO_DELETE_TIME // 60} minutes.",
+            reply_to_message_id=sent.id
+        )
+        asyncio.create_task(delete_after_delay(sent, Config.AUTO_DELETE_TIME))
+        asyncio.create_task(delete_after_delay(notice, Config.AUTO_DELETE_TIME))
+    except Exception as e:
+        logger.error(f"Legacy file send error: {e}")
