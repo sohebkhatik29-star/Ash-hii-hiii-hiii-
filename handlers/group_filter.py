@@ -48,12 +48,9 @@ def _get_post_link(m: dict) -> str:
 
 def build_filter_results(query: str, results: list, page: int = 1, is_group: bool = True):
     """
-    Builds a clean list like:
-        1. Pushpa 1 (2021)
-           🔗 Link
-        2. Pushpa 2 (2024)
-           🔗 Link
-    with clickable buttons that jump straight to the group post.
+    Clean text-only results (no buttons):
+        1. Buddy (2026)  [English]
+        🔗 Link https://t.me/c/xxxxx/yyyyy
     """
     total = len(results)
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -66,8 +63,6 @@ def build_filter_results(query: str, results: list, page: int = 1, is_group: boo
     text = f"🎬 <b>Results for:</b> <code>{query}</code>\n"
     text += f"📄 <b>Page {page}/{total_pages}</b> • Total: <b>{total}</b>\n\n"
 
-    buttons = []
-
     for i, m in enumerate(page_results, start=start_idx + 1):
         title = m.get("title", "Untitled")
         year = m.get("year")
@@ -77,33 +72,14 @@ def build_filter_results(query: str, results: list, page: int = 1, is_group: boo
 
         post_link = _get_post_link(m)
 
-        # Text style exactly as requested
         text += f"<b>{i}. {title}{year_str}</b>"
         if lang_str:
             text += f"  [{lang_str}]"
-        text += f"\n🔗 <a href=\"{post_link}\">Link</a>\n\n"
+        # Full visible link (Telegram auto-makes it clickable)
+        text += f"\n🔗 Link {post_link}\n\n"
 
-        # Button that opens the existing group post
-        btn_label = f"🎬 {title[:28]}{year_str}"
-        buttons.append([InlineKeyboardButton(btn_label, url=post_link)])
-
-    # Pagination
-    nav_row = []
-    # Keep query short in callback (Telegram limit 64 bytes)
-    safe_q = re.sub(r"[^\w\s]", "", query)[:30].strip() or "q"
-    if page > 1:
-        nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"flt_{page-1}_{safe_q}"))
-    if page < total_pages:
-        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"flt_{page+1}_{safe_q}"))
-    if nav_row:
-        buttons.append(nav_row)
-
-    buttons.append([
-        InlineKeyboardButton("🤖 Open Movie Bot", url=f"https://t.me/{Config.BOT_USERNAME}"),
-        InlineKeyboardButton("❌ Close", callback_data="close_card")
-    ])
-
-    return text, InlineKeyboardMarkup(buttons)
+    # No buttons — only text links as requested
+    return text, None
 
 
 def register_group_filter_handlers(bot: Client):
@@ -195,7 +171,7 @@ def register_group_filter_handlers(bot: Client):
         except Exception as e:
             logger.error(f"Error in execute_movie_search: {e}")
 
-    # 3. Pagination callbacks
+    # 3. Pagination callbacks (kept for compatibility; no buttons now)
     @bot.on_callback_query(filters.regex(r"^flt_(\d+)_(.+)"))
     async def filter_pagination_callback(client: Client, query: CallbackQuery):
         match = query.matches[0]
