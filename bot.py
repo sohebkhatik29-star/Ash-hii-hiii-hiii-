@@ -15,6 +15,7 @@ from pyrogram.types import (
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllChatAdministrators,
+    BotCommandScopeChatAdministrators,
     BotCommandScopeDefault,
 )
 
@@ -74,7 +75,7 @@ async def addmovie_command(bot: Client, cmd: Message):
         )
         await session_mgr.start_addmovie_session(admin_id, status_msg.id, cmd.chat.id)
     except Exception as e:
-        logger.error(f"addmovie_command error: {e}", exc_info=True)
+        logger.error(f"addmovie_command error: {e}", exp_info=True)
         try:
             await cmd.reply_text(f"❌ Error: <code>{e}</code>", quote=True)
         except Exception:
@@ -132,14 +133,29 @@ register_moderation_handlers(Bot)
 async def setup_bot_commands(bot: Client):
     """
     Group / menu:
-      - Normal members: empty (koi command menu nahi dikhega)
+      - Normal members: empty
       - Chat admins + owners: full moderation menu
-    Private chat: basic user commands.
+    Private: start/help.
+    Also forces menu on MOVIE_GROUP_ID so it always appears for that group.
     """
+    admin_group_cmds = [
+        BotCommand("warn", "User ko warning (3 = ban)"),
+        BotCommand("sp", "Spelling galat + Google button"),
+        BotCommand("rls", "Movie abhi release nahi hui"),
+        BotCommand("n_available", "Telegram pe available nahi"),
+        BotCommand("prm", "Sirf Premium pe available"),
+        BotCommand("dl", "Poster pe reply → filter delete"),
+        BotCommand("dl_all_filters", "Saare filters delete"),
+        BotCommand("unban", "User unban (reply / user_id)"),
+        BotCommand("done", "Not-found session close"),
+        BotCommand("menu", "Admin commands list"),
+    ]
     try:
         await bot.set_bot_commands([], scope=BotCommandScopeDefault())
+    except Exception as e:
+        logger.warning(f"clear default cmds: {e}")
 
-        # Private chats — basic user commands
+    try:
         await bot.set_bot_commands(
             [
                 BotCommand("start", "Bot start / welcome"),
@@ -147,32 +163,33 @@ async def setup_bot_commands(bot: Client):
             ],
             scope=BotCommandScopeAllPrivateChats(),
         )
+    except Exception as e:
+        logger.warning(f"private cmds: {e}")
 
-        # ALL group members (non-admin) — EMPTY menu
-        await bot.set_bot_commands(
-            [],
-            scope=BotCommandScopeAllGroupChats(),
-        )
+    try:
+        await bot.set_bot_commands([], scope=BotCommandScopeAllGroupChats())
+    except Exception as e:
+        logger.warning(f"all group cmds: {e}")
 
-        # ONLY group admins + owners — full moderation menu
-        admin_group_cmds = [
-            BotCommand("warn", "User ko warning (3 = ban)"),
-            BotCommand("sp", "Spelling galat + Google button"),
-            BotCommand("rls", "Movie abhi release nahi hui"),
-            BotCommand("n_available", "Telegram pe available nahi"),
-            BotCommand("prm", "Sirf Premium pe available"),
-            BotCommand("dl", "Poster pe reply → filter delete"),
-            BotCommand("dl_all_filters", "Saare filters delete"),
-            BotCommand("unban", "User unban (reply / user_id)"),
-            BotCommand("done", "Not-found session close"),
-        ]
+    try:
         await bot.set_bot_commands(
             admin_group_cmds,
             scope=BotCommandScopeAllChatAdministrators(),
         )
-        logger.info("✅ Bot command menus set: group menu = admins only")
+        logger.info("✅ Admin menu set for AllChatAdministrators")
     except Exception as e:
-        logger.warning(f"setup_bot_commands failed (non-fatal): {e}")
+        logger.warning(f"AllChatAdministrators cmds failed: {e}")
+
+    try:
+        gid = int(getattr(Config, "MOVIE_GROUP_ID", 0) or 0)
+        if gid:
+            await bot.set_bot_commands(
+                admin_group_cmds,
+                scope=BotCommandScopeChatAdministrators(chat_id=gid),
+            )
+            logger.info(f"✅ Admin menu forced for group {gid}")
+    except Exception as e:
+        logger.warning(f"group-specific admin cmds failed: {e}")
 
 
 # 6. Application Lifecycle & Startup Notification
