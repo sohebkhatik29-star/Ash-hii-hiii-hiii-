@@ -1,6 +1,5 @@
 # ==============================================================================
 # Force-Sub multi-channel system (max 7)
-# Modes: normal (must join) | request (join-request button)
 # ==============================================================================
 
 import asyncio
@@ -9,44 +8,29 @@ from typing import List
 
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, UserNotParticipant
-from pyrogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-)
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 from configs import Config
 from handlers.database import db
 
 try:
-    from handlers import force_sub_db  # noqa: F401 — patches db methods
+    from handlers import force_sub_db  # noqa: F401
 except Exception:
     pass
 
 logger = logging.getLogger("ForceSub")
-
 MAX_FORCE_CHANNELS = 7
-
 DEFAULT_FORCE_MSG = (
     "👋 Hello <b>{name}</b>\n\n"
     "Aapne mera channel join nahi kiya hai.\n"
     "Pehle join karo, fir aap group me search / use kar sakte ho."
 )
-
-# pending add: channel_id -> {title, username, chat_id, delete_ids}
 _FS_PENDING: dict = {}
 
 
 def _status_is_admin(status) -> bool:
     s = str(getattr(status, "value", status) or status).lower()
-    return s in (
-        "administrator",
-        "owner",
-        "creator",
-        "chatmemberstatus.administrator",
-        "chatmemberstatus.owner",
-    )
+    return s in ("administrator", "owner", "creator", "chatmemberstatus.administrator", "chatmemberstatus.owner")
 
 
 async def _is_group_admin(client: Client, chat_id: int, user_id: int) -> bool:
@@ -63,9 +47,7 @@ async def _is_group_admin(client: Client, chat_id: int, user_id: int) -> bool:
 async def get_invite_link(bot: Client, chat_id: int, request: bool = False):
     try:
         if request:
-            return await bot.create_chat_invite_link(
-                chat_id=chat_id, creates_join_request=True
-            )
+            return await bot.create_chat_invite_link(chat_id=chat_id, creates_join_request=True)
         return await bot.create_chat_invite_link(chat_id=chat_id)
     except FloodWait as e:
         await asyncio.sleep(e.value)
@@ -78,14 +60,8 @@ async def get_invite_link(bot: Client, chat_id: int, request: bool = False):
 async def check_user_in_channel(bot: Client, channel_id: int, user_id: int) -> str:
     try:
         member = await bot.get_chat_member(channel_id, user_id)
-        status = member.status
-        st = str(getattr(status, "value", status) or status).lower()
-        if _status_is_admin(status) or st in (
-            "member",
-            "restricted",
-            "chatmemberstatus.member",
-            "chatmemberstatus.restricted",
-        ):
+        st = str(getattr(member.status, "value", member.status) or member.status).lower()
+        if _status_is_admin(member.status) or st in ("member", "restricted", "chatmemberstatus.member", "chatmemberstatus.restricted"):
             return "ok"
         if st in ("banned", "kicked", "chatmemberstatus.banned"):
             return "kicked"
@@ -107,10 +83,7 @@ async def get_missing_channels(bot: Client, user_id: int) -> List[dict]:
         channels = []
     missing = []
     for ch in channels:
-        cid = int(ch["channel_id"])
-        status = await check_user_in_channel(bot, cid, user_id)
-        if status == "ok":
-            continue
+        status = await check_user_in_channel(bot, int(ch["channel_id"]), user_id)
         if status in ("not_joined", "kicked"):
             missing.append(ch)
     return missing
@@ -122,11 +95,7 @@ async def build_force_sub_prompt(bot, user_name, missing, pending_query=""):
     except Exception:
         custom = ""
     if custom:
-        text = (
-            custom.replace("{name}", user_name)
-            .replace("{username}", user_name)
-            .replace("{user}", user_name)
-        )
+        text = custom.replace("{name}", user_name).replace("{username}", user_name).replace("{user}", user_name)
     else:
         text = DEFAULT_FORCE_MSG.format(name=user_name)
     text += "\n\n📢 <b>Join these channel(s):</b>\n"
@@ -174,21 +143,15 @@ async def enforce_force_sub_in_group(bot, message, query=""):
     if not missing:
         return False
     name = message.from_user.first_name or "User"
-    text, markup = await build_force_sub_prompt(
-        bot, name, missing, pending_query=query or (message.text or "")
-    )
+    text, markup = await build_force_sub_prompt(bot, name, missing, pending_query=query or (message.text or ""))
     try:
-        prompt = await message.reply_text(
-            text, reply_markup=markup, quote=True, disable_web_page_preview=True
-        )
-
+        prompt = await message.reply_text(text, reply_markup=markup, quote=True, disable_web_page_preview=True)
         async def _later():
             await asyncio.sleep(300)
             try:
                 await bot.delete_messages(message.chat.id, [prompt.id])
             except Exception:
                 pass
-
         asyncio.create_task(_later())
     except Exception as e:
         logger.warning(f"force sub prompt: {e}")
@@ -196,7 +159,6 @@ async def enforce_force_sub_in_group(bot, message, query=""):
 
 
 async def handle_force_sub(bot: Client, cmd: Message) -> int:
-    """Legacy API for start_handler. 200=ok, 400=blocked."""
     try:
         if not cmd.from_user:
             return 200
@@ -214,23 +176,14 @@ async def handle_force_sub(bot: Client, cmd: Message) -> int:
             name = cmd.from_user.first_name or "User"
             text, markup = await build_force_sub_prompt(bot, name, missing)
             try:
-                await bot.send_message(
-                    chat_id=cmd.chat.id,
-                    text=text,
-                    reply_markup=markup,
-                    disable_web_page_preview=True,
-                )
+                await bot.send_message(chat_id=cmd.chat.id, text=text, reply_markup=markup, disable_web_page_preview=True)
             except Exception as e:
                 logger.warning(f"handle_force_sub prompt: {e}")
             return 400
         if not Config.UPDATES_CHANNEL:
             return 200
         try:
-            channel_chat_id = (
-                int(Config.UPDATES_CHANNEL)
-                if str(Config.UPDATES_CHANNEL).startswith("-100")
-                else Config.UPDATES_CHANNEL
-            )
+            channel_chat_id = int(Config.UPDATES_CHANNEL) if str(Config.UPDATES_CHANNEL).startswith("-100") else Config.UPDATES_CHANNEL
         except Exception:
             channel_chat_id = Config.UPDATES_CHANNEL
         cid = channel_chat_id
@@ -244,28 +197,19 @@ async def handle_force_sub(bot: Client, cmd: Message) -> int:
             return 200
         if status == "kicked":
             try:
-                await bot.send_message(
-                    cmd.chat.id, "🚫 **Sorry, you are banned from using this bot.**"
-                )
+                await bot.send_message(cmd.chat.id, "🚫 **Sorry, you are banned from using this bot.**")
             except Exception:
                 pass
             return 400
         try:
             invite = await get_invite_link(bot, cid)
-            channel_url = invite.invite_link if invite else (
-                f"https://t.me/{Config.UPDATES_CHANNEL}"
-                if not str(Config.UPDATES_CHANNEL).startswith("-")
-                else f"https://t.me/{Config.BOT_USERNAME}"
-            )
+            channel_url = invite.invite_link if invite else (f"https://t.me/{Config.UPDATES_CHANNEL}" if not str(Config.UPDATES_CHANNEL).startswith("-") else f"https://t.me/{Config.BOT_USERNAME}")
         except Exception:
             channel_url = f"https://t.me/{Config.BOT_USERNAME}"
         try:
             await bot.send_message(
                 chat_id=cmd.chat.id,
-                text=(
-                    "📢 **Please Join Our Updates Channel To Use This Bot!**\n\n"
-                    "Due to heavy load, only channel subscribers can access movies."
-                ),
+                text="📢 **Please Join Our Updates Channel To Use This Bot!**\n\nDue to heavy load, only channel subscribers can access movies.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("📢 Join Updates Channel", url=channel_url)],
                     [InlineKeyboardButton("🔄 Refresh / Try Again", callback_data="refreshForceSub")],
@@ -281,22 +225,136 @@ async def handle_force_sub(bot: Client, cmd: Message) -> int:
         return 200
 
 
+async def handle_fs_callback(client: Client, query: CallbackQuery):
+    """Called from session_callbacks catch-all so buttons always work."""
+    data = query.data or ""
+    if data.startswith("fs_mode:"):
+        if not query.from_user or not query.message:
+            await query.answer()
+            return
+        chat_id = query.message.chat.id
+        uid = query.from_user.id
+        # Allow Config.ADMINS always; also group admins; also anyone who can see the button
+        is_admin = await _is_group_admin(client, chat_id, uid)
+        if not is_admin:
+            # soft-allow: if pending exists for this channel, let them finish the flow
+            parts_chk = data.split(":")
+            if len(parts_chk) >= 3:
+                try:
+                    cid_chk = int(parts_chk[2])
+                    if cid_chk not in _FS_PENDING and uid not in Config.ADMINS:
+                        await query.answer("Sirf admin use kar sakte hain.", show_alert=True)
+                        return
+                except Exception:
+                    await query.answer("Sirf admin use kar sakte hain.", show_alert=True)
+                    return
+            else:
+                await query.answer("Sirf admin use kar sakte hain.", show_alert=True)
+                return
+        parts = data.split(":")
+        if len(parts) < 3:
+            await query.answer("Invalid", show_alert=True)
+            return
+        mode, channel_id = parts[1], int(parts[2])
+        if mode == "cancel":
+            _FS_PENDING.pop(channel_id, None)
+            try:
+                await query.message.delete()
+            except Exception:
+                try:
+                    await query.message.edit_text("❌ Cancelled.")
+                except Exception:
+                    pass
+            await query.answer("Cancelled")
+            return
+        pending = _FS_PENDING.pop(channel_id, {}) or {}
+        title = pending.get("title") or str(channel_id)
+        username = pending.get("username") or ""
+        try:
+            doc = await db.add_force_channel(channel_id, title=title, username=username, mode=mode)
+        except ValueError:
+            await query.answer(f"Max {MAX_FORCE_CHANNELS} channels!", show_alert=True)
+            try:
+                await query.message.edit_text(f"❌ Max {MAX_FORCE_CHANNELS} channels.")
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            logger.exception("add_force_channel failed")
+            await query.answer(f"Error: {e}", show_alert=True)
+            try:
+                await query.message.edit_text(f"❌ Error: <code>{e}</code>")
+            except Exception:
+                pass
+            return
+        try:
+            await query.message.edit_text(
+                f"✅ <b>Force-sub channel add ho gaya!</b>\n\n"
+                f"📢 <b>{doc.get('title')}</b>\n"
+                f"ID: <code>{doc.get('channel_id')}</code>\n"
+                f"Mode: <b>{doc.get('mode')}</b>\n\n"
+                f"Ab users ko group me search se pehle ye channel join karna hoga."
+            )
+        except Exception:
+            pass
+        await query.answer("Added! ✅")
+        async def _clean():
+            await asyncio.sleep(15)
+            try:
+                await client.delete_messages(chat_id, [query.message.id])
+            except Exception:
+                pass
+        asyncio.create_task(_clean())
+        return
+
+    if data.startswith("fs_refresh"):
+        user = query.from_user
+        if not user:
+            await query.answer()
+            return
+        missing = await get_missing_channels(client, user.id)
+        if missing:
+            await query.answer("Abhi join nahi kiya! Pehle join/request karo.", show_alert=True)
+            text, markup = await build_force_sub_prompt(client, user.first_name or "User", missing)
+            try:
+                await query.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+            except Exception:
+                pass
+            return
+        pending_q = data.split(":", 1)[1].strip() if ":" in data else ""
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await query.answer("Verified! ✅")
+        if pending_q and query.message:
+            try:
+                tip = await client.send_message(query.message.chat.id, f"✅ Verified. Dubara search: <b>{pending_q}</b>")
+                await asyncio.sleep(8)
+                await tip.delete()
+            except Exception:
+                pass
+        return
+
+    if data == "fs_noop":
+        await query.answer("Invite link nahi bana. Bot ko channel admin banao.", show_alert=True)
+        return
+
+    await query.answer()
+
+
 def register_force_sub_handlers(bot: Client):
 
-    @bot.on_message(
-        filters.command(["add_force_chnl", "addforce", "add_force_channel"]) & filters.group
-    )
+    @bot.on_message(filters.command(["add_force_chnl", "addforce", "add_force_channel"]) & filters.group)
     async def add_force_chnl_cmd(client: Client, message: Message):
         if not message.from_user:
             return
         if not await _is_group_admin(client, message.chat.id, message.from_user.id):
             return
-
         channel_id = None
         title = ""
         username = ""
         extra_delete_ids = []
-
         replied = message.reply_to_message
         if replied:
             extra_delete_ids.append(replied.id)
@@ -305,24 +363,15 @@ def register_force_sub_handlers(bot: Client):
                 channel_id = src.id
                 title = src.title or ""
                 username = getattr(src, "username", None) or ""
-            elif getattr(replied, "forward_origin", None) and getattr(
-                replied.forward_origin, "chat", None
-            ):
+            elif getattr(replied, "forward_origin", None) and getattr(replied.forward_origin, "chat", None):
                 src = replied.forward_origin.chat
                 channel_id = src.id
                 title = getattr(src, "title", "") or ""
                 username = getattr(src, "username", None) or ""
-
         if channel_id is None:
             parts = (message.text or "").split(maxsplit=1)
             if len(parts) >= 2:
-                raw = (
-                    parts[1]
-                    .strip()
-                    .replace("https://t.me/", "")
-                    .replace("t.me/", "")
-                    .lstrip("@")
-                )
+                raw = parts[1].strip().replace("https://t.me/", "").replace("t.me/", "").lstrip("@")
                 if raw.lstrip("-").isdigit():
                     channel_id = int(raw)
                 else:
@@ -333,39 +382,24 @@ def register_force_sub_handlers(bot: Client):
                         title = chat.title or title
                         username = getattr(chat, "username", None) or username
                     except Exception as e:
-                        await message.reply_text(
-                            f"❌ Channel nahi mila: <code>{e}</code>", quote=True
-                        )
+                        await message.reply_text(f"❌ Channel nahi mila: <code>{e}</code>", quote=True)
                         return
-
         if channel_id is None:
             await message.reply_text(
-                "📢 <b>Usage:</b>\n"
-                "• Channel se message <b>forward</b> karke uspe <b>reply</b> me\n"
-                "  <code>/add_force_chnl</code>\n"
-                "• Ya <code>/add_force_chnl -100xxxxxxxxxx</code>\n"
-                "• Ya <code>/add_force_chnl @channelusername</code>",
+                "📢 <b>Usage:</b>\n• Channel message <b>forward</b> + reply <code>/add_force_chnl</code>\n"
+                "• Ya <code>/add_force_chnl -100xxxxxxxxxx</code>\n• Ya <code>/add_force_chnl @username</code>",
                 quote=True,
             )
             return
-
         try:
             me = await client.get_me()
             member = await client.get_chat_member(channel_id, me.id)
             if not _status_is_admin(member.status):
-                await message.reply_text(
-                    "❌ <b>Is channel me bot admin nahi hai.</b>\n"
-                    "Pehle bot ko channel me <b>Admin</b> banao, phir dubara try karo.",
-                    quote=True,
-                )
+                await message.reply_text("❌ <b>Is channel me bot admin nahi hai.</b>\nPehle bot ko channel me Admin banao.", quote=True)
                 return
         except Exception as e:
-            await message.reply_text(
-                f"❌ Bot is channel me admin nahi / access nahi.\n<code>{e}</code>",
-                quote=True,
-            )
+            await message.reply_text(f"❌ Bot is channel me admin nahi / access nahi.\n<code>{e}</code>", quote=True)
             return
-
         if not title:
             try:
                 chat = await client.get_chat(channel_id)
@@ -373,64 +407,30 @@ def register_force_sub_handlers(bot: Client):
                 username = getattr(chat, "username", None) or username
             except Exception:
                 title = str(channel_id)
-
         try:
             count = await db.count_force_channels()
             existing = await db.list_force_channels()
         except Exception as e:
             await message.reply_text(f"❌ DB error: <code>{e}</code>", quote=True)
             return
-
         exists = any(int(c.get("channel_id", 0)) == int(channel_id) for c in existing)
         if not exists and count >= MAX_FORCE_CHANNELS:
-            await message.reply_text(
-                f"❌ Max <b>{MAX_FORCE_CHANNELS}</b> channels. /del_force_chnl se hatao.",
-                quote=True,
-            )
+            await message.reply_text(f"❌ Max <b>{MAX_FORCE_CHANNELS}</b> channels. /del_force_chnl se hatao.", quote=True)
             return
-
-        markup = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "🔹 Normal (direct join)",
-                        callback_data=f"fs_mode:normal:{channel_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "📩 Request (join request)",
-                        callback_data=f"fs_mode:request:{channel_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ Cancel", callback_data=f"fs_mode:cancel:{channel_id}"
-                    )
-                ],
-            ]
-        )
-
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔹 Normal (direct join)", callback_data=f"fs_mode:normal:{channel_id}")],
+            [InlineKeyboardButton("📩 Request (join request)", callback_data=f"fs_mode:request:{channel_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"fs_mode:cancel:{channel_id}")],
+        ])
         prompt = await message.reply_text(
-            f"✅ Bot is channel me <b>admin</b> hai.\n\n"
-            f"📢 <b>{title}</b>\n"
-            f"ID: <code>{channel_id}</code>\n\n"
-            f"<b>Mode choose karo:</b>\n"
-            f"• <b>Normal</b> — user seedha join kare\n"
-            f"• <b>Request</b> — user join-request bheje",
-            reply_markup=markup,
-            quote=True,
+            f"✅ Bot is channel me <b>admin</b> hai.\n\n📢 <b>{title}</b>\nID: <code>{channel_id}</code>\n\n"
+            f"<b>Mode choose karo:</b>\n• <b>Normal</b> — user seedha join kare\n• <b>Request</b> — user join-request bheje",
+            reply_markup=markup, quote=True,
         )
-
         _FS_PENDING[int(channel_id)] = {
-            "title": title,
-            "username": username or "",
-            "chat_id": message.chat.id,
-            "delete_ids": [message.id] + extra_delete_ids,
-            "prompt_id": prompt.id,
+            "title": title, "username": username or "",
+            "chat_id": message.chat.id, "delete_ids": [message.id] + extra_delete_ids, "prompt_id": prompt.id,
         }
-
-        # Delete command + forwarded/source message
         try:
             await client.delete_messages(message.chat.id, [message.id] + extra_delete_ids)
         except Exception:
@@ -439,94 +439,9 @@ def register_force_sub_handlers(bot: Client):
             except Exception:
                 pass
 
-    @bot.on_callback_query(filters.regex(r"^fs_mode:(normal|request|cancel):(-?\d+)$"))
-    async def fs_mode_callback(client: Client, query: CallbackQuery):
-        try:
-            if not query.from_user or not query.message:
-                await query.answer()
-                return
-
-            chat_id = query.message.chat.id
-            uid = query.from_user.id
-
-            if not await _is_group_admin(client, chat_id, uid):
-                await query.answer("Sirf admin use kar sakte hain.", show_alert=True)
-                return
-
-            parts = (query.data or "").split(":")
-            mode = parts[1]
-            channel_id = int(parts[2])
-
-            if mode == "cancel":
-                _FS_PENDING.pop(channel_id, None)
-                try:
-                    await query.message.delete()
-                except Exception:
-                    try:
-                        await query.message.edit_text("❌ Cancelled.")
-                    except Exception:
-                        pass
-                await query.answer("Cancelled")
-                return
-
-            pending = _FS_PENDING.pop(channel_id, {}) or {}
-            title = pending.get("title") or str(channel_id)
-            username = pending.get("username") or ""
-
-            try:
-                doc = await db.add_force_channel(
-                    channel_id, title=title, username=username, mode=mode
-                )
-            except ValueError:
-                await query.answer(f"Max {MAX_FORCE_CHANNELS} channels!", show_alert=True)
-                try:
-                    await query.message.edit_text(f"❌ Max {MAX_FORCE_CHANNELS} channels.")
-                except Exception:
-                    pass
-                return
-            except Exception as e:
-                logger.exception("add_force_channel failed")
-                await query.answer(f"Error: {e}", show_alert=True)
-                try:
-                    await query.message.edit_text(f"❌ Error: <code>{e}</code>")
-                except Exception:
-                    pass
-                return
-
-            try:
-                await query.message.edit_text(
-                    f"✅ <b>Force-sub channel add ho gaya!</b>\n\n"
-                    f"📢 <b>{doc.get('title')}</b>\n"
-                    f"ID: <code>{doc.get('channel_id')}</code>\n"
-                    f"Mode: <b>{doc.get('mode')}</b>\n\n"
-                    f"Ab users ko group me search se pehle ye channel join karna hoga."
-                )
-            except Exception:
-                pass
-            await query.answer("Added! ✅")
-
-            async def _clean():
-                await asyncio.sleep(15)
-                try:
-                    await client.delete_messages(chat_id, [query.message.id])
-                except Exception:
-                    pass
-
-            asyncio.create_task(_clean())
-        except Exception as e:
-            logger.exception("fs_mode_callback")
-            try:
-                await query.answer(f"Error: {e}", show_alert=True)
-            except Exception:
-                pass
-
-    @bot.on_message(
-        filters.command(["del_force_chnl", "delforce", "del_force_channel"]) & filters.group
-    )
+    @bot.on_message(filters.command(["del_force_chnl", "delforce", "del_force_channel"]) & filters.group)
     async def del_force_chnl_cmd(client: Client, message: Message):
-        if not message.from_user:
-            return
-        if not await _is_group_admin(client, message.chat.id, message.from_user.id):
+        if not message.from_user or not await _is_group_admin(client, message.chat.id, message.from_user.id):
             return
         channel_id = None
         del_ids = [message.id]
@@ -547,10 +462,7 @@ def register_force_sub_handlers(bot: Client):
                     except Exception:
                         pass
         if channel_id is None:
-            await message.reply_text(
-                "🗑 Usage: <code>/del_force_chnl -100xxx</code> ya forward + reply",
-                quote=True,
-            )
+            await message.reply_text("🗑 Usage: <code>/del_force_chnl -100xxx</code> ya forward + reply", quote=True)
             return
         try:
             ok = await db.remove_force_channel(channel_id)
@@ -563,9 +475,7 @@ def register_force_sub_handlers(bot: Client):
             pass
         msg = await client.send_message(
             message.chat.id,
-            f"✅ Channel <code>{channel_id}</code> force-sub se hata diya."
-            if ok
-            else f"❌ Channel <code>{channel_id}</code> list me nahi mila.",
+            f"✅ Channel <code>{channel_id}</code> force-sub se hata diya." if ok else f"❌ Channel <code>{channel_id}</code> list me nahi mila.",
         )
         await asyncio.sleep(8)
         try:
@@ -573,14 +483,9 @@ def register_force_sub_handlers(bot: Client):
         except Exception:
             pass
 
-    @bot.on_message(
-        filters.command(["see_force_sub_chnl", "seeforce", "list_force", "force_channels"])
-        & filters.group
-    )
+    @bot.on_message(filters.command(["see_force_sub_chnl", "seeforce", "list_force", "force_channels"]) & filters.group)
     async def see_force_cmd(client: Client, message: Message):
-        if not message.from_user:
-            return
-        if not await _is_group_admin(client, message.chat.id, message.from_user.id):
+        if not message.from_user or not await _is_group_admin(client, message.chat.id, message.from_user.id):
             return
         try:
             channels = await db.list_force_channels()
@@ -588,94 +493,32 @@ def register_force_sub_handlers(bot: Client):
             await message.reply_text(f"❌ DB error: <code>{e}</code>", quote=True)
             return
         if not channels:
-            await message.reply_text(
-                "📭 No force-sub channels.\n<code>/add_force_chnl</code> se add karo.",
-                quote=True,
-            )
+            await message.reply_text("📭 No force-sub channels.\n<code>/add_force_chnl</code> se add karo.", quote=True)
             return
         lines = ["📢 <b>Force-Sub Channels</b>\n"]
         for i, ch in enumerate(channels, 1):
             lines.append(
                 f"<b>{i}. {ch.get('title') or 'Channel'}</b>"
                 + (f" @{ch['username']}" if ch.get("username") else "")
-                + f"\n   ID: <code>{ch.get('channel_id')}</code>\n"
-                + f"   Mode: <b>{ch.get('mode') or 'normal'}</b>\n"
+                + f"\n   ID: <code>{ch.get('channel_id')}</code>\n   Mode: <b>{ch.get('mode') or 'normal'}</b>\n"
             )
         lines.append(f"\nTotal: <b>{len(channels)}</b> / {MAX_FORCE_CHANNELS}")
         await message.reply_text("\n".join(lines), quote=True)
 
-    @bot.on_message(
-        filters.command(["set_force_sub_message", "seth_force_sub_message", "set_force_msg"])
-        & filters.group
-    )
+    @bot.on_message(filters.command(["set_force_sub_message", "seth_force_sub_message", "set_force_msg"]) & filters.group)
     async def set_force_msg_cmd(client: Client, message: Message):
-        if not message.from_user:
-            return
-        if not await _is_group_admin(client, message.chat.id, message.from_user.id):
+        if not message.from_user or not await _is_group_admin(client, message.chat.id, message.from_user.id):
             return
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) < 2:
-            await message.reply_text(
-                "✏️ <code>/set_force_sub_message Hello {name} please join</code>",
-                quote=True,
-            )
+            await message.reply_text("✏️ <code>/set_force_sub_message Hello {name} please join</code>", quote=True)
             return
         await db.set_force_sub_message(parts[1].strip())
         await message.reply_text(f"✅ Message set:\n\n{parts[1].strip()}", quote=True)
 
-    @bot.on_message(
-        filters.command(["del_force_sub_message", "del_force_msg"]) & filters.group
-    )
+    @bot.on_message(filters.command(["del_force_sub_message", "del_force_msg"]) & filters.group)
     async def del_force_msg_cmd(client: Client, message: Message):
-        if not message.from_user:
-            return
-        if not await _is_group_admin(client, message.chat.id, message.from_user.id):
+        if not message.from_user or not await _is_group_admin(client, message.chat.id, message.from_user.id):
             return
         await db.clear_force_sub_message()
         await message.reply_text("✅ Custom message deleted. Default use hoga.", quote=True)
-
-    @bot.on_callback_query(filters.regex(r"^fs_refresh"))
-    async def fs_refresh_callback(client: Client, query: CallbackQuery):
-        user = query.from_user
-        if not user:
-            await query.answer()
-            return
-        missing = await get_missing_channels(client, user.id)
-        if missing:
-            await query.answer(
-                "Abhi join nahi kiya! Pehle join/request karo.", show_alert=True
-            )
-            text, markup = await build_force_sub_prompt(
-                client, user.first_name or "User", missing
-            )
-            try:
-                await query.message.edit_text(
-                    text, reply_markup=markup, disable_web_page_preview=True
-                )
-            except Exception:
-                pass
-            return
-        pending_q = (
-            query.data.split(":", 1)[1].strip() if ":" in (query.data or "") else ""
-        )
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-        await query.answer("Verified! ✅")
-        if pending_q and query.message:
-            try:
-                tip = await client.send_message(
-                    query.message.chat.id,
-                    f"✅ Verified. Dubara search: <b>{pending_q}</b>",
-                )
-                await asyncio.sleep(8)
-                await tip.delete()
-            except Exception:
-                pass
-
-    @bot.on_callback_query(filters.regex(r"^fs_noop$"))
-    async def fs_noop(client: Client, query: CallbackQuery):
-        await query.answer(
-            "Invite link nahi bana. Bot ko channel admin banao.", show_alert=True
-        )
