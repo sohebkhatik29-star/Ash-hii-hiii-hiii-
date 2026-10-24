@@ -138,15 +138,19 @@ class Database:
     async def ban_user(self, user_id: int):
         pass
 
+    def generate_movie_id(self) -> str:
+        return str(uuid.uuid4())[:8]
+
     async def create_movie(self, title: str, normalized_title: str, year: int = None,
-                           movie_id: str = None, poster_file_id: str = None,
-                           qualities: dict = None) -> str:
-        mid = movie_id or str(uuid.uuid4())
+                           languages=None, qualities=None, poster_file_id=None, **extra):
+        """Create movie. Accepts movie_id/admin_id via extra. Returns movie dict."""
+        m_id = extra.pop("movie_id", None) or self.generate_movie_id()
         doc = {
-            "movie_id": mid,
+            "movie_id": m_id,
             "title": title,
             "normalized_title": normalized_title,
             "year": year,
+            "languages": languages or [],
             "poster_file_id": poster_file_id,
             "qualities": qualities or {},
             "group_chat_id": None,
@@ -155,18 +159,21 @@ class Database:
             "created_at": datetime.datetime.utcnow().isoformat(),
             "updated_at": datetime.datetime.utcnow().isoformat(),
         }
-        self._mem_movies[mid] = doc
+        for k, v in extra.items():
+            if k != "movie_id":
+                doc[k] = v
+        self._mem_movies[m_id] = doc
         self._save_local_movies()
         if self.has_mongo:
             try:
                 await self.movies_col.update_one(
-                    {"movie_id": mid},
+                    {"movie_id": m_id},
                     {"$set": doc},
                     upsert=True,
                 )
             except Exception as e:
                 logger.error(f"[DB] create_movie: {e}")
-        return mid
+        return doc
 
     async def get_movie(self, movie_id: str) -> dict:
         if movie_id in self._mem_movies:
@@ -257,13 +264,11 @@ class Database:
         if not q_tokens:
             return []
 
-        # Separate pure year tokens (4 digits 19xx/20xx) from title tokens
         year_tokens = set()
         for t in q_tokens:
             if t.isdigit() and len(t) == 4 and t.startswith(("19", "20")):
                 year_tokens.add(t)
         title_tokens = [t for t in q_tokens if t not in year_tokens]
-        # If user only typed a year, fall back to year search
         if not title_tokens and year_tokens:
             title_tokens = list(year_tokens)
             year_tokens = set()
@@ -302,14 +307,12 @@ class Database:
                             title_matched += 0.5
                             break
 
-            # When multiple title tokens exist, require majority match
             if len(title_tokens) >= 2 and title_matched < max(1.0, len(title_tokens) * 0.5):
                 continue
             if title_matched <= 0:
                 continue
 
             score = float(title_matched)
-            # Exact year boost only (never treat year as title word for unrelated films)
             if year and year in year_tokens:
                 score += 2.0
             core_phrase = " ".join(title_tokens)
@@ -319,7 +322,6 @@ class Database:
             scored.append((score, m))
 
         scored = [(s, m) for s, m in scored if s >= 1]
-        # Oldest year first when scores equal
         scored.sort(key=lambda x: (-x[0], x[1].get("year") or 9999, x[1].get("title", "") or ""))
         return [m for _, m in scored]
 
@@ -413,7 +415,6 @@ class Database:
                 continue
         for mid in set(to_remove):
             await self.delete_movie(mid)
-        # Always also query mongo in case mem is stale
         if self.has_mongo:
             try:
                 cursor = self.movies_col.find({
@@ -493,11 +494,11 @@ class Database:
         try:
             async for msg in bot.get_chat_history(group_id, limit=limit):
                 text = (msg.caption or msg.text or "")
-                if "\ud83c\udfac" in text and "Available Downloads" in text:
+                if "🎬" in text and "Available Downloads" in text:
                     already = any(m.get("group_msg_id") == msg.id for m in self._mem_movies.values())
                     if already:
                         continue
-                    title_m = re.search(r"\ud83c\udfac\s*(?:<b>)?([^\n<(]+)(?:</b>)?", text)
+                    title_m = re.search(r"🎬\s*(?:<b>)?([^\n<(]+)(?:</b>)?", text)
                     if not title_m:
                         continue
                     raw_title = title_m.group(1).strip()
