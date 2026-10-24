@@ -13,12 +13,12 @@ from configs import Config
 from handlers.database import db
 from handlers.session_manager import session_mgr
 from handlers.send_file import send_movie_card
+from handlers.force_sub_handler import enforce_force_sub_in_group
 
 logger = logging.getLogger("GroupFilter")
 
 
 async def _is_group_admin(client: Client, message: Message) -> bool:
-    """Config.ADMINS ya Telegram group admin/owner — full command access."""
     if not message.from_user:
         return False
     uid = message.from_user.id
@@ -32,7 +32,6 @@ async def _is_group_admin(client: Client, message: Message) -> bool:
 
 PAGE_SIZE = 8
 AUTO_DELETE_SECONDS = 2 * 60
-
 _pending_not_found: dict = {}
 
 async def _get_all_movies() -> dict:
@@ -79,7 +78,6 @@ def build_filter_results(query: str, results: list, page: int = 1, is_group: boo
         if not link or "t.me/c/" not in link:
             continue
         filtered.append(m)
-
     dedup = {}
     for m in filtered:
         title_key = (m.get("normalized_title") or (m.get("title") or "").lower()).strip()
@@ -100,20 +98,16 @@ def build_filter_results(query: str, results: list, page: int = 1, is_group: boo
                 dedup[key] = m
     filtered = list(dedup.values())
     filtered.sort(key=lambda x: (x.get("year") or 9999, x.get("title") or ""))
-
     total = len(filtered)
     if total == 0:
         return None, None
-
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(1, min(page, total_pages))
     start_idx = (page - 1) * PAGE_SIZE
     end_idx = min(start_idx + PAGE_SIZE, total)
     page_results = filtered[start_idx:end_idx]
-
     text = f"🎬 <b>Results for:</b> <code>{query}</code>\n"
     text += f"📄 <b>Page {page}/{total_pages}</b> • Total: <b>{total}</b>\n\n"
-
     for i, m in enumerate(page_results, start=start_idx + 1):
         title = m.get("title", "Untitled")
         year = m.get("year")
@@ -125,9 +119,7 @@ def build_filter_results(query: str, results: list, page: int = 1, is_group: boo
         if lang_str:
             text += f"  [{lang_str}]"
         text += f"\n🔗 {post_link}\n\n"
-
     return text, None
-
 
 async def _safe_delete(client: Client, chat_id: int, message_ids: list):
     for mid in message_ids:
@@ -138,14 +130,12 @@ async def _safe_delete(client: Client, chat_id: int, message_ids: list):
         except Exception:
             pass
 
-
 async def _schedule_delete(client: Client, chat_id: int, message_ids: list, delay: int = AUTO_DELETE_SECONDS):
     try:
         await asyncio.sleep(delay)
         await _safe_delete(client, chat_id, message_ids)
     except Exception as e:
         logger.debug(f"schedule_delete: {e}")
-
 
 def register_group_filter_handlers(bot: Client):
 
@@ -156,7 +146,12 @@ def register_group_filter_handlers(bot: Client):
             await message.reply_text("Usage: /find movie name", quote=True)
             return
         is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
-        await execute_movie_search(client, message, parts[1].strip(), is_group=is_group)
+        q = parts[1].strip()
+        if is_group:
+            blocked = await enforce_force_sub_in_group(client, message, query=q)
+            if blocked:
+                return
+        await execute_movie_search(client, message, q, is_group=is_group)
 
     @bot.on_message(filters.command("done") & filters.group)
     async def done_command(client: Client, message: Message):
@@ -233,28 +228,14 @@ def register_group_filter_handlers(bot: Client):
                         pass
             if not deleted_ids:
                 return
-            logger.info(f"[AUTO-DL] deleted_messages update: ids={deleted_ids}")
             for msg_id in deleted_ids:
-                titles = []
                 if hasattr(db, "delete_by_group_msg_id"):
                     titles = await db.delete_by_group_msg_id(msg_id)
-                else:
-                    all_movies = await _get_all_movies()
-                    for mid, m in list(all_movies.items()):
-                        gmsg = m.get("group_msg_id")
-                        try:
-                            if gmsg is not None and int(gmsg) == msg_id:
-                                titles.append(m.get("title", "?"))
-                                await db.delete_movie(mid)
-                        except (TypeError, ValueError):
-                            continue
-                if titles:
-                    for title in titles:
-                        logger.info(f"[AUTO-DL] Post deleted → filter removed: {title} (msg_id={msg_id})")
-                else:
-                    logger.info(f"[AUTO-DL] No DB entry for deleted msg_id={msg_id}")
+                    if titles:
+                        for title in titles:
+                            logger.info(f"[AUTO-DL] filter removed: {title}")
         except Exception as e:
-            logger.error(f"on_movie_post_deleted error: {e}")
+            logger.error(f"on_movie_post_deleted: {e}")
 
     @bot.on_message(
         filters.text
@@ -264,6 +245,11 @@ def register_group_filter_handlers(bot: Client):
             "dl_all_filters", "deleteallfilters", "warn", "sp", "rls",
             "n_available", "navail", "notavailable", "prm", "premium", "unban",
             "menu", "mod", "adminpanel",
+            "add_force_chnl", "addforce", "add_force_channel",
+            "del_force_chnl", "delforce", "del_force_channel",
+            "see_force_sub_chnl", "seeforce", "list_force", "force_channels",
+            "set_force_sub_message", "seth_force_sub_message", "set_force_msg",
+            "del_force_sub_message", "del_force_msg",
             "find", "filter", "search",
         ])
         & ~filters.via_bot
@@ -301,8 +287,7 @@ def register_group_filter_handlers(bot: Client):
                             message.chat.id,
                             f"🚫 <b>Aap ban ho.</b>\n\n"
                             f"Reason: <code>{reason}</code>\n"
-                            f"Aap ne niyam toda hai — <b>ek din me sirf ek request</b>.\n"
-                            f"Unban ke liye owner se baat karo: {owner}",
+                            f"Unban: {owner}",
                         )
                         asyncio.create_task(
                             _schedule_delete(client, message.chat.id, [notice.id], AUTO_DELETE_SECONDS)
@@ -320,6 +305,10 @@ def register_group_filter_handlers(bot: Client):
             return
         if len(raw_text) <= 3 and not any(c.isalpha() for c in raw_text):
             return
+        if is_group:
+            blocked = await enforce_force_sub_in_group(client, message, query=raw_text)
+            if blocked:
+                return
         await execute_movie_search(client, message, raw_text, is_group=is_group)
 
     async def execute_movie_search(client: Client, message: Message, query: str, is_group: bool = True):
@@ -342,9 +331,7 @@ def register_group_filter_handlers(bot: Client):
             result_text, result_markup = build_filter_results(query, results, page=1, is_group=is_group)
             if not result_text:
                 not_found = await message.reply_text(
-                    f"❌ <b>'{query}'</b> group / database mein nahi mila!\n\n"
-                    f"🔍 Spelling check karein ya thoda short name try karein.\n"
-                    f"⏳ Request save hai — upload hone ke baad admin /done se notify karega.",
+                    f"❌ <b>'{query}'</b> group / database mein nahi mila!",
                     quote=True
                 )
                 if is_group:
@@ -373,7 +360,7 @@ def register_group_filter_handlers(bot: Client):
         search_query = match.group(2)
         results = await db.search_movies(search_query)
         if not results:
-            await query.answer("Results expire ho gaye / nahi mile!", show_alert=True)
+            await query.answer("Results expire / nahi mile!", show_alert=True)
             return
         is_group = query.message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
         result_text, result_markup = build_filter_results(search_query, results, page=page, is_group=is_group)
@@ -382,13 +369,10 @@ def register_group_filter_handlers(bot: Client):
             return
         try:
             await query.message.edit_text(
-                text=result_text,
-                reply_markup=result_markup,
-                disable_web_page_preview=True
+                text=result_text, reply_markup=result_markup, disable_web_page_preview=True
             )
             await query.answer()
-        except Exception as e:
-            logger.debug(f"Pagination edit: {e}")
+        except Exception:
             await query.answer()
 
     @bot.on_callback_query(filters.regex(r"^close_card$"))
