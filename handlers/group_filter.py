@@ -20,6 +20,9 @@ PAGE_SIZE = 8
 # 2 minutes for testing — change back to 24 * 60 * 60 later
 AUTO_DELETE_SECONDS = 2 * 60
 
+# user_msg_id -> not_found_bot_msg_id  (so /done can delete the not-found reply)
+_pending_not_found: dict = {}
+
 async def _get_all_movies() -> dict:
     mem = getattr(db, "_mem_movies", None)
     if mem is None:
@@ -153,11 +156,19 @@ def register_group_filter_handlers(bot: Client):
         if not replied:
             return
         try:
+            # Delete previous not-found bot message if exists for this user request
+            not_found_id = _pending_not_found.pop(replied.id, None)
+            if not_found_id:
+                try:
+                    await client.delete_messages(message.chat.id, not_found_id)
+                except Exception:
+                    pass
+
             confirm = await replied.reply_text(
                 "\u2705 <b>Your request has been uploaded.</b>\n\nPlease check it in the group. Thank you!",
                 quote=True
             )
-            # Delete user request + confirm after 2 min
+            # Delete user request + confirm after delay
             asyncio.create_task(
                 _schedule_delete(client, message.chat.id, [replied.id, confirm.id], AUTO_DELETE_SECONDS)
             )
@@ -240,7 +251,8 @@ def register_group_filter_handlers(bot: Client):
                         quote=True
                     )
                     if is_group:
-                        # Not-found bot msg auto-deletes after 2 min (user msg stays for /done)
+                        # Remember so /done can delete this not-found msg
+                        _pending_not_found[message.id] = not_found.id
                         asyncio.create_task(
                             _schedule_delete(client, message.chat.id, [not_found.id], AUTO_DELETE_SECONDS)
                         )
@@ -258,6 +270,7 @@ def register_group_filter_handlers(bot: Client):
                     quote=True
                 )
                 if is_group:
+                    _pending_not_found[message.id] = not_found.id
                     asyncio.create_task(
                         _schedule_delete(client, message.chat.id, [not_found.id], AUTO_DELETE_SECONDS)
                     )
@@ -269,7 +282,7 @@ def register_group_filter_handlers(bot: Client):
                 quote=True
             )
             if is_group:
-                # User search + bot result both delete after 2 min
+                # User search + bot result both delete after delay
                 asyncio.create_task(
                     _schedule_delete(client, message.chat.id, [message.id, bot_msg.id], AUTO_DELETE_SECONDS)
                 )
