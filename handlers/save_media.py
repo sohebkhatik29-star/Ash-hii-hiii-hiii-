@@ -34,6 +34,19 @@ async def forward_to_db_channel(bot: Client, message: Message) -> Message:
         raise e
 
 async def handle_incoming_movie_file(bot: Client, message: Message):
+    try:
+        await _handle_incoming_movie_file_inner(bot, message)
+    except Exception as e:
+        logger.error(f"handle_incoming_movie_file FATAL: {e}", exc_info=True)
+        try:
+            await message.reply_text(
+                f"❌ <b>File process fail:</b> <code>{type(e).__name__}: {e}</code>",
+                quote=True
+            )
+        except Exception:
+            pass
+
+async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
     admin_id = message.from_user.id
     if admin_id not in Config.ADMINS:
         return
@@ -84,11 +97,20 @@ async def handle_incoming_movie_file(bot: Client, message: Message):
                 movie_id=movie_id
             )
 
-            channel_msg = await forward_to_db_channel(bot, message)
+            try:
+                channel_msg = await forward_to_db_channel(bot, message)
+                _cid = channel_msg.id
+            except Exception as e:
+                logger.error(f"DB_CHANNEL copy failed: {e}")
+                _cid = None
+                try:
+                    await message.reply_text(f"⚠️ DB_CHANNEL fail: <code>{e}</code>", quote=True)
+                except Exception:
+                    pass
             quality_data = {
                 "file_id": media.file_id,
                 "media_type": "video" if message.video else "document",
-                "channel_msg_id": channel_msg.id,
+                "channel_msg_id": _cid,
                 "file_name": filename,
                 "file_size": filesize,
                 "file_size_formatted": filesize_str,
@@ -100,7 +122,8 @@ async def handle_incoming_movie_file(bot: Client, message: Message):
                 title=incoming_title,
                 year=incoming_year,
                 quality=incoming_quality,
-                languages=incoming_langs
+                languages=incoming_langs,
+                poster_file_id=extracted_poster
             )
 
             # Try to delete the uploaded file message to keep chat clean
@@ -173,11 +196,16 @@ async def handle_incoming_movie_file(bot: Client, message: Message):
             return
 
         # Forward + save quality
-        channel_msg = await forward_to_db_channel(bot, message)
+        try:
+            channel_msg = await forward_to_db_channel(bot, message)
+            _cid = channel_msg.id
+        except Exception as e:
+            logger.error(f"DB_CHANNEL copy failed: {e}")
+            _cid = None
         quality_data = {
             "file_id": media.file_id,
             "media_type": "video" if message.video else "document",
-            "channel_msg_id": channel_msg.id,
+            "channel_msg_id": _cid,
             "file_name": filename,
             "file_size": filesize,
             "file_size_formatted": filesize_str,
@@ -187,14 +215,12 @@ async def handle_incoming_movie_file(bot: Client, message: Message):
         existing = (await db.get_movie(movie_id) or {}).get("qualities", {})
         final_quality = incoming_quality
         if incoming_quality in existing:
-            # Rename with size or index
             idx = 2
             while f"{incoming_quality}_{idx}" in existing:
                 idx += 1
-            old_key_labeled = f"{incoming_quality}_{idx}"
-            final_quality = old_key_labeled
+            final_quality = f"{incoming_quality}_{idx}"
             try:
-                await session_mgr.rename_session_quality(admin_id, incoming_quality, old_key_labeled)
+                await session_mgr.rename_session_quality(admin_id, incoming_quality, final_quality)
             except Exception:
                 pass
 
@@ -271,7 +297,6 @@ async def handle_generate_links_action(bot: Client, chat_id: int, admin_id: int,
     card_buttons = build_final_movie_card_buttons(movie)
     poster = movie.get("poster_file_id")
 
-    # If poster is missing, extract on-demand from the saved video in DB_CHANNEL!
     if not poster and movie.get("qualities") and Config.DB_CHANNEL:
         try:
             first_q = list(movie["qualities"].values())[0]
@@ -285,7 +310,6 @@ async def handle_generate_links_action(bot: Client, chat_id: int, admin_id: int,
         except Exception as e:
             logger.debug(f"On-demand poster extraction: {e}")
 
-    # 1. Send the final movie card to Admin's private chat
     if poster:
         try:
             await bot.send_photo(
@@ -299,7 +323,6 @@ async def handle_generate_links_action(bot: Client, chat_id: int, admin_id: int,
     else:
         await bot.send_message(chat_id=chat_id, text=card_text, reply_markup=card_buttons)
 
-    # 2. AUTO-POST DIRECTLY TO MOVIE GROUP!
     group_posted = False
     if Config.MOVIE_GROUP_ID:
         try:
@@ -325,7 +348,6 @@ async def handle_generate_links_action(bot: Client, chat_id: int, admin_id: int,
         except Exception as e:
             logger.warning(f"Could not auto-post to Movie Group {Config.MOVIE_GROUP_ID}: {e}")
 
-    # 3. Send success message with shareable deep link
     qualities_str = ", ".join(movie.get("qualities", {}).keys())
     group_note = "\n📢 **Group Status:** ✅ Seedha group me upload ho gaya!" if group_posted else ""
     success_text = (
