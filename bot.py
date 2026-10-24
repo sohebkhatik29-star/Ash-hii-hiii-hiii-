@@ -67,13 +67,10 @@ async def addmovie_command(bot: Client, cmd: Message):
         ])
         status_msg = await cmd.reply_text(text, reply_markup=markup, quote=True)
         await session_mgr.start_addmovie_session(admin_id, status_msg.id, cmd.chat.id)
-        logger.info(f"[ADDMOVIE] Session started by admin {admin_id}")
+        logger.info(f"[ADDMOVIE] session started for admin={admin_id}")
     except Exception as e:
         logger.error(f"addmovie_command error: {e}", exc_info=True)
-        try:
-            await cmd.reply_text(f"❌ Session start nahi hua: <code>{e}</code>", quote=True)
-        except Exception:
-            pass
+        await cmd.reply_text(f"❌ /addmovie fail: <code>{e}</code>", quote=True)
 
 @Bot.on_message(filters.command("cancel") & filters.private)
 async def cancel_session_handler(bot: Client, cmd: Message):
@@ -93,11 +90,30 @@ async def finish_session_command(bot: Client, cmd: Message):
         return
     await handle_generate_links_action(bot, cmd.chat.id, admin_id)
 
-# 3. Media Upload Listener
-@Bot.on_message((filters.video | filters.document) & filters.private)
+# 3. Media Upload Listener (video, document, or any media in private)
+@Bot.on_message(
+    (filters.video | filters.document | filters.animation | filters.audio | filters.media)
+    & filters.private
+    & ~filters.command(["start", "help", "addmovie", "newmovie", "cancel", "finish", "generatelink"])
+)
 async def auto_movie_upload_listener(bot: Client, message: Message):
     """Handles incoming movie video/document file uploads within active session."""
-    await handle_incoming_movie_file(bot, message)
+    try:
+        logger.info(
+            f"[MEDIA] private media from {message.from_user.id if message.from_user else None} "
+            f"video={bool(message.video)} doc={bool(message.document)} "
+            f"media_group={message.media_group_id}"
+        )
+        # Only process real video/document files
+        if not (message.video or message.document):
+            return
+        await handle_incoming_movie_file(bot, message)
+    except Exception as e:
+        logger.error(f"auto_movie_upload_listener error: {e}", exc_info=True)
+        try:
+            await message.reply_text(f"❌ Upload error: <code>{e}</code>", quote=True)
+        except Exception:
+            pass
 
 # 4. Register Modular Handlers
 register_start_handlers(Bot)
