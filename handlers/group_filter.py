@@ -5,6 +5,7 @@
 #          Works in Groups, Supergroups, and Private Chat.
 #          When user types movie name → shows group post links (jump to existing post).
 #          Auto-deletes search messages after 24h. /done marks fulfilled requests.
+#          /dl reply on poster deletes that movie filter from database.
 # ==============================================================================
 
 import asyncio
@@ -23,6 +24,24 @@ logger = logging.getLogger("GroupFilter")
 PAGE_SIZE = 8
 # Group search messages auto-delete after 24 hours
 AUTO_DELETE_SECONDS = 24 * 60 * 60  # 86400
+
+async def _get_all_movies() -> dict:
+    """Return current movie map; pull from Mongo if available."""
+    mem = getattr(db, "_mem_movies", None)
+    if mem is None:
+        mem = {}
+    if getattr(db, "has_mongo", False) and getattr(db, "movies_col", None) is not None:
+        try:
+            async for doc in db.movies_col.find({}):
+                mid = doc.get("movie_id")
+                if mid:
+                    doc.pop("_id", None)
+                    mem[mid] = doc
+            db._mem_movies = mem
+        except Exception as e:
+            logger.warning(f"[DL] mongo load: {e}")
+    return mem
+
 
 # Common noise words – ignore these so chat stays clean
 IGNORED_WORDS = {
@@ -174,12 +193,101 @@ def register_group_filter_handlers(bot: Client):
             )
         )
 
+    # 2b. /dl — admin replies to a movie POSTER to delete its filter from DB
+    @bot.on_message(filters.command("dl") & filters.group)
+    async def delete_filter_handler(client: Client, message: Message):
+        """
+        Admin: reply to the movie poster/card in group with /dl
+        → remove that movie from search database
+        → so searching its name no longer shows this result
+        """
+        admin_id = message.from_user.id if message.from_user else 0
+        if admin_id not in Config.ADMINS:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            return
+
+        if not message.reply_to_message:
+            tip = await message.reply_text(
+                "⚠️ <b>/dl</b> ko movie ke <b>poster / card</b> pe reply karke bhejo.\n"
+                "Usse us movie ka filter database se delete ho jayega.",
+                quote=True
+            )
+            await asyncio.sleep(20)
+            await _safe_delete(client, message.chat.id, [message.id, tip.id])
+            return
+
+        target = message.reply_to_message
+        text = (target.caption or target.text or "").strip()
+        msg_id = target.id
+
+        deleted_title = None
+        movie_id_to_delete = None
+
+        movies = await _get_all_movies()
+        for mid, m in list(movies.items()):
+            if m.get("group_msg_id") == msg_id:
+                movie_id_to_delete = mid
+                deleted_title = m.get("title", "Unknown")
+                break
+            link = m.get("group_post_link") or ""
+            if link.endswith(f"/{msg_id}"):
+                movie_id_to_delete = mid
+                deleted_title = m.get("title", "Unknown")
+                break
+
+        # Fallback: parse title from caption
+        if not movie_id_to_delete and text:
+            title_match = re.search(r"🎬\s*(?:<b>)?([^\n<(]+)(?:</b>)?", text)
+            if title_match:
+                raw_title = title_match.group(1).strip()
+                clean_title = re.sub(r"\(\d{4}\)", "", raw_title).strip()
+                for mid, m in list(movies.items()):
+                    if m.get("title", "").lower() == clean_title.lower():
+                        movie_id_to_delete = mid
+                        deleted_title = m.get("title", clean_title)
+                        break
+                    if m.get("normalized_title", "") == clean_title.lower():
+                        movie_id_to_delete = mid
+                        deleted_title = m.get("title", clean_title)
+                        break
+
+        # Delete admin /dl command
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        if not movie_id_to_delete:
+            tip = await client.send_message(
+                message.chat.id,
+                "❌ Is post ka filter database me nahi mila.\n"
+                "Sirf bot ke movie poster pe /dl reply karein.",
+            )
+            await asyncio.sleep(15)
+            await _safe_delete(client, message.chat.id, [tip.id])
+            return
+
+        await db.delete_movie(movie_id_to_delete)
+        confirm = await client.send_message(
+            message.chat.id,
+            f"🗑️ <b>Filter deleted!</b>\n\n"
+            f"🎬 <b>{deleted_title}</b>\n"
+            f"Ab search results me yeh movie nahi aayegi.",
+        )
+        asyncio.create_task(
+            _schedule_delete(client, message.chat.id, [confirm.id], 30)
+        )
+        logger.info(f"[DL] Admin {admin_id} deleted filter: {deleted_title} ({movie_id_to_delete})")
+
     # 3. Direct text search (auto-filter style) – works only when Group Privacy is OFF
     @bot.on_message(
         filters.text
         & ~filters.command(["start", "help", "find", "filter", "search", "addmovie",
                             "newmovie", "finish", "cancel", "status", "movies",
-                            "delete", "stats", "broadcast", "generatelink", "done"])
+                            "delete", "stats", "broadcast", "generatelink", "done", "dl"])
         & ~filters.via_bot
     )
     async def direct_text_search_handler(client: Client, message: Message):
