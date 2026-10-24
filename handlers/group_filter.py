@@ -17,7 +17,8 @@ from handlers.send_file import send_movie_card
 logger = logging.getLogger("GroupFilter")
 
 PAGE_SIZE = 8
-AUTO_DELETE_SECONDS = 24 * 60 * 60
+# 2 minutes for testing — change back to 24 * 60 * 60 later
+AUTO_DELETE_SECONDS = 2 * 60
 
 async def _get_all_movies() -> dict:
     mem = getattr(db, "_mem_movies", None)
@@ -156,6 +157,7 @@ def register_group_filter_handlers(bot: Client):
                 "\u2705 <b>Your request has been uploaded.</b>\n\nPlease check it in the group. Thank you!",
                 quote=True
             )
+            # Delete user request + confirm after 2 min
             asyncio.create_task(
                 _schedule_delete(client, message.chat.id, [replied.id, confirm.id], AUTO_DELETE_SECONDS)
             )
@@ -192,12 +194,14 @@ def register_group_filter_handlers(bot: Client):
                     await db.delete_movie(mid)
                     break
         if deleted:
-            await client.send_message(
+            msg = await client.send_message(
                 message.chat.id,
                 f"\ud83d\uddd1\ufe0f Filter deleted: <b>{deleted.get('title', '?')}</b>\nAb search results me yeh movie nahi aayegi."
             )
+            asyncio.create_task(_schedule_delete(client, message.chat.id, [msg.id], AUTO_DELETE_SECONDS))
         else:
-            await client.send_message(message.chat.id, "\u274c Is poster ka filter database me nahi mila.")
+            msg = await client.send_message(message.chat.id, "\u274c Is poster ka filter database me nahi mila.")
+            asyncio.create_task(_schedule_delete(client, message.chat.id, [msg.id], AUTO_DELETE_SECONDS))
 
     @bot.on_message(
         filters.text
@@ -236,6 +240,7 @@ def register_group_filter_handlers(bot: Client):
                         quote=True
                     )
                     if is_group:
+                        # Not-found bot msg auto-deletes after 2 min (user msg stays for /done)
                         asyncio.create_task(
                             _schedule_delete(client, message.chat.id, [not_found.id], AUTO_DELETE_SECONDS)
                         )
@@ -264,6 +269,7 @@ def register_group_filter_handlers(bot: Client):
                 quote=True
             )
             if is_group:
+                # User search + bot result both delete after 2 min
                 asyncio.create_task(
                     _schedule_delete(client, message.chat.id, [message.id, bot_msg.id], AUTO_DELETE_SECONDS)
                 )
