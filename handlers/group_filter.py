@@ -114,7 +114,7 @@ def build_filter_results(query: str, results: list, page: int = 1, is_group: boo
         text += f"<b>{i}. {title}{year_str}</b>"
         if lang_str:
             text += f"  [{lang_str}]"
-        text += f"\n🔗 Link {post_link}\n\n"
+        text += f"\n🔗 {post_link}\n\n"
 
     return text, None
 
@@ -141,38 +141,41 @@ def register_group_filter_handlers(bot: Client):
 
     @bot.on_message(filters.command(["find", "filter", "search"]))
     async def find_command(client: Client, message: Message):
-        query = message.command[1:] if message.command else []
-        query = " ".join(query).strip() if query else ""
-        if not query and message.reply_to_message:
-            query = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
-        if not query:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2:
             await message.reply_text("Usage: /find movie name", quote=True)
             return
         is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
-        await execute_movie_search(client, message, query, is_group=is_group)
+        await execute_movie_search(client, message, parts[1].strip(), is_group=is_group)
 
     @bot.on_message(filters.command("done") & filters.group)
     async def done_command(client: Client, message: Message):
+        user_id = message.from_user.id if message.from_user else 0
+        if user_id not in Config.ADMINS:
+            return
         try:
-            replied = message.reply_to_message
-            if not replied:
-                await message.reply_text("Kisi movie query pe reply karke /done bhejo.", quote=True)
-                return
+            await message.delete()
+        except Exception:
+            pass
+        replied = message.reply_to_message
+        if not replied:
+            return
+        try:
             not_found_id = _pending_not_found.pop(replied.id, None)
             if not_found_id:
                 try:
                     await client.delete_messages(message.chat.id, not_found_id)
                 except Exception:
                     pass
-            confirm = await message.reply_text(
-                "✅ Your movie will be uploaded soon!\nAdmin ko notify kar diya gaya hai.",
-                quote=True,
+            confirm = await replied.reply_text(
+                "✅ <b>Your request has been uploaded.</b>\n\nPlease check it in the group. Thank you!",
+                quote=True
             )
             asyncio.create_task(
-                _schedule_delete(client, message.chat.id, [replied.id, confirm.id, message.id], AUTO_DELETE_SECONDS)
+                _schedule_delete(client, message.chat.id, [replied.id, confirm.id], AUTO_DELETE_SECONDS)
             )
         except Exception as e:
-            logger.error(f"done_command: {e}")
+            logger.error(f"/done error: {e}")
 
     @bot.on_message(filters.command("dl") & filters.group)
     async def dl_command(client: Client, message: Message):
@@ -203,17 +206,13 @@ def register_group_filter_handlers(bot: Client):
         if deleted_titles:
             msg = await client.send_message(
                 message.chat.id,
-                f"🗑️ Filter deleted: <b>{deleted_titles[0]}</b>\nAb search results me yeh movie nahi aayegi."
+                f"🗑 Filter deleted: <b>{deleted_titles[0]}</b>\nAb search results me yeh movie nahi aayegi."
             )
             asyncio.create_task(_schedule_delete(client, message.chat.id, [msg.id], AUTO_DELETE_SECONDS))
         else:
             msg = await client.send_message(message.chat.id, "❌ Is poster ka filter database me nahi mila.")
             asyncio.create_task(_schedule_delete(client, message.chat.id, [msg.id], AUTO_DELETE_SECONDS))
 
-    # ------------------------------------------------------------------
-    # When a movie post is deleted from the group → remove it from filter DB
-    # (same effect as /dl)
-    # ------------------------------------------------------------------
     @bot.on_deleted_messages(filters.group)
     async def on_movie_post_deleted(client: Client, messages):
         try:
@@ -251,9 +250,13 @@ def register_group_filter_handlers(bot: Client):
 
     @bot.on_message(
         filters.text
-        & ~filters.command(["start", "help", "addmovie", "newmovie", "cancel", "finish",
-                            "delete", "stats", "broadcast", "generatelink", "done", "dl",
-                            "find", "filter", "search"])
+        & ~filters.command([
+            "start", "help", "addmovie", "newmovie", "cancel", "finish",
+            "delete", "stats", "broadcast", "generatelink", "done", "dl",
+            "dl_all_filters", "deleteallfilters", "warn", "sp", "rls",
+            "n_available", "navail", "notavailable", "prm", "premium", "unban",
+            "find", "filter", "search",
+        ])
         & ~filters.via_bot
     )
     async def direct_text_search_handler(client: Client, message: Message):
@@ -264,6 +267,32 @@ def register_group_filter_handlers(bot: Client):
         user_id = message.from_user.id if message.from_user else 0
         raw_text = (message.text or "").strip()
         is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+
+        # Banned users: delete message, no filter results, show ban notice
+        if is_group and user_id and user_id not in Config.ADMINS:
+            try:
+                ban = await db.get_ban_status(user_id)
+                if ban.get("is_banned"):
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+                    owner = f"@{Config.OWNER_USERNAME}" if Config.OWNER_USERNAME else "@movies_1780"
+                    reason = ban.get("ban_reason") or "ek din me sirf ek request rule break"
+                    notice = await client.send_message(
+                        message.chat.id,
+                        f"🚫 <b>Aap ban ho.</b>\n\n"
+                        f"Reason: <code>{reason}</code>\n"
+                        f"Aap ne niyam toda hai — <b>ek din me sirf ek request</b>.\n"
+                        f"Unban ke liye owner se baat karo: {owner}",
+                    )
+                    asyncio.create_task(
+                        _schedule_delete(client, message.chat.id, [notice.id], AUTO_DELETE_SECONDS)
+                    )
+                    return
+            except Exception as e:
+                logger.debug(f"ban check: {e}")
+
         if not is_group:
             session = await session_mgr.get_session(user_id)
             if session and session.get("status") in ("AWAITING_FIRST_FILE", "ACTIVE"):
@@ -283,8 +312,8 @@ def register_group_filter_handlers(bot: Client):
                     not_found = await message.reply_text(
                         f"❌ <b>'{query}'</b> group / database mein nahi mila!\n\n"
                         f"🔍 Spelling check karein ya thoda short name try karein.\n"
-                        f"Upload ke baad /done reply karke batao.",
-                        quote=True,
+                        f"⏳ Request save hai — upload hone ke baad admin /done se notify karega.",
+                        quote=True
                     )
                     if is_group:
                         _pending_not_found[message.id] = not_found.id
@@ -292,13 +321,13 @@ def register_group_filter_handlers(bot: Client):
                             _schedule_delete(client, message.chat.id, [not_found.id], AUTO_DELETE_SECONDS)
                         )
                 return
-
             result_text, result_markup = build_filter_results(query, results, page=1, is_group=is_group)
             if not result_text:
                 not_found = await message.reply_text(
                     f"❌ <b>'{query}'</b> group / database mein nahi mila!\n\n"
-                    f"🔍 Spelling check karein.",
-                    quote=True,
+                    f"🔍 Spelling check karein ya thoda short name try karein.\n"
+                    f"⏳ Request save hai — upload hone ke baad admin /done se notify karega.",
+                    quote=True
                 )
                 if is_group:
                     _pending_not_found[message.id] = not_found.id
@@ -306,12 +335,11 @@ def register_group_filter_handlers(bot: Client):
                         _schedule_delete(client, message.chat.id, [not_found.id], AUTO_DELETE_SECONDS)
                     )
                 return
-
             bot_msg = await message.reply_text(
                 text=result_text,
                 reply_markup=result_markup,
                 disable_web_page_preview=True,
-                quote=True,
+                quote=True
             )
             if is_group:
                 asyncio.create_task(
@@ -327,18 +355,31 @@ def register_group_filter_handlers(bot: Client):
         search_query = match.group(2)
         results = await db.search_movies(search_query)
         if not results:
-            await query.answer("Results expire ho gaye!", show_alert=True)
+            await query.answer("Results expire ho gaye / nahi mile!", show_alert=True)
             return
         is_group = query.message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
         result_text, result_markup = build_filter_results(search_query, results, page=page, is_group=is_group)
+        if not result_text:
+            await query.answer("No group posts found.", show_alert=True)
+            return
         try:
-            if result_text:
-                await query.message.edit_text(
-                    text=result_text,
-                    reply_markup=result_markup,
-                    disable_web_page_preview=True,
-                )
+            await query.message.edit_text(
+                text=result_text,
+                reply_markup=result_markup,
+                disable_web_page_preview=True
+            )
             await query.answer()
         except Exception as e:
-            logger.debug(f"Pagination edit notice: {e}")
+            logger.debug(f"Pagination edit: {e}")
             await query.answer()
+
+    @bot.on_callback_query(filters.regex(r"^close_card$"))
+    async def close_card_callback(client: Client, query: CallbackQuery):
+        try:
+            await query.message.delete()
+        except Exception:
+            try:
+                await query.message.edit_text("❌ Closed")
+            except Exception:
+                pass
+        await query.answer()
