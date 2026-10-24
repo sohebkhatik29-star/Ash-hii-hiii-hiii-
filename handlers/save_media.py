@@ -89,6 +89,7 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
         incoming_year = meta["year"]
         incoming_langs = meta["languages"]
 
+        # ==================== CASE 1: FIRST FILE ====================
         if session.get("status") == "AWAITING_FIRST_FILE" or not session.get("title"):
             movie_id = db.generate_movie_id()
             extracted_poster, poster_source = await extract_poster_from_message(bot, message)
@@ -174,7 +175,7 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
                 await db.set_active_session(admin_id, session)
             return
 
-        # CASE 2: ADDITIONAL QUALITY
+        # ==================== CASE 2: ADDITIONAL QUALITY ====================
         active_title = session.get("title", "")
         active_year = session.get("year")
         movie_id = session.get("movie_id")
@@ -270,9 +271,10 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
 
 
 async def handle_generate_links_action(bot: Client, chat_id: int, admin_id: int, query: CallbackQuery = None):
-    session = await session_mgr.get_session(admin_id)
+    """Finishes the session and creates ONE clean, professional final movie card."""
+    session = await session_mgr.finish_session(admin_id)
     if not session or not session.get("movie_id"):
-        msg = "⚠️ Koi active movie session nahi hai. Pehle /addmovie se file add karo."
+        msg = "⚠️ Koi active movie session nahi mila jisme files upload hui hon."
         if query:
             await query.answer(msg, show_alert=True)
         else:
@@ -281,24 +283,51 @@ async def handle_generate_links_action(bot: Client, chat_id: int, admin_id: int,
 
     movie_id = session["movie_id"]
     movie = await db.get_movie(movie_id)
-    if not movie:
-        msg = "❌ Movie DB me nahi mili. Session cancel karke dubara try karo."
+    if not movie or not movie.get("qualities"):
+        msg = "⚠️ Is session mein koi quality save nahi hui."
         if query:
             await query.answer(msg, show_alert=True)
-        else:
-            await bot.send_message(chat_id, msg)
         return
 
-    await session_mgr.finish_session(admin_id)
+    short_link, raw_link = generate_movie_links(movie_id)
+    card_text = build_final_movie_card_text(movie)
+    card_buttons = build_final_movie_card_buttons(movie)
+    poster = movie.get("poster_file_id")
 
-    short_link = await generate_movie_links(bot, movie)
-    card_text = build_final_movie_card_text(movie, short_link)
-    group_buttons = build_final_movie_card_buttons(movie, short_link)
+    # If poster is missing, extract on-demand from the saved video in DB_CHANNEL!
+    if not poster and movie.get("qualities") and Config.DB_CHANNEL:
+        try:
+            first_q = list(movie["qualities"].values())[0]
+            channel_msg_id = first_q.get("channel_msg_id")
+            if channel_msg_id:
+                db_msg = await bot.get_messages(Config.DB_CHANNEL, channel_msg_id)
+                extracted_poster, _ = await extract_poster_from_message(bot, db_msg)
+                if extracted_poster:
+                    poster = extracted_poster
+                    await db.update_movie_poster(movie_id, poster, "on_demand_extract")
+        except Exception as e:
+            logger.debug(f"On-demand poster extraction: {e}")
 
+    # 1. Send the final movie card to Admin's private chat
+    if poster:
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=poster,
+                caption=card_text,
+                reply_markup=card_buttons
+            )
+        except Exception:
+            await bot.send_message(chat_id=chat_id, text=card_text, reply_markup=card_buttons)
+    else:
+        await bot.send_message(chat_id=chat_id, text=card_text, reply_markup=card_buttons)
+
+    # 2. AUTO-POST DIRECTLY TO MOVIE GROUP!
     group_posted = False
     if Config.MOVIE_GROUP_ID:
         try:
-            poster = movie.get("poster_file_id")
+            group_buttons = build_final_movie_card_buttons(movie, for_group=True)
+            group_post = None
             if poster:
                 group_post = await bot.send_photo(
                     chat_id=Config.MOVIE_GROUP_ID,
@@ -319,6 +348,7 @@ async def handle_generate_links_action(bot: Client, chat_id: int, admin_id: int,
         except Exception as e:
             logger.warning(f"Could not auto-post to Movie Group {Config.MOVIE_GROUP_ID}: {e}")
 
+    # 3. Send success message with shareable deep link
     qualities_str = ", ".join(movie.get("qualities", {}).keys())
     group_note = "\n📢 **Group Status:** ✅ Seedha group me upload ho gaya!" if group_posted else ""
     success_text = (
