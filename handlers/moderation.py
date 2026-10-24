@@ -58,7 +58,7 @@ async def _delete_cmd_and_reply(
     reply_markup=None,
     quote_to: Message = None,
 ):
-    """Delete admin command, send bot reply, schedule 24h delete of bot reply."""
+    """Delete admin command, send bot reply, then after 24h delete bot reply + user message together."""
     try:
         await message.delete()
     except Exception:
@@ -71,8 +71,12 @@ async def _delete_cmd_and_reply(
             quote=True,
             disable_web_page_preview=True,
         )
+        # 24h baad: bot ka reply + user ka original message dono ek sath delete
+        ids_to_delete = [bot_msg.id]
+        if target and getattr(target, "id", None) and target.id != bot_msg.id:
+            ids_to_delete.append(target.id)
         asyncio.create_task(
-            _schedule_delete(client, message.chat.id, [bot_msg.id], MOD_DELETE_SECONDS)
+            _schedule_delete(client, message.chat.id, ids_to_delete, MOD_DELETE_SECONDS)
         )
         return bot_msg
     except Exception as e:
