@@ -50,20 +50,30 @@ async def check_user(bot: Client, cmd: Message):
 @Bot.on_message(filters.command(["addmovie", "newmovie"]) & filters.private)
 async def addmovie_command(bot: Client, cmd: Message):
     """Starts an explicit movie upload session."""
-    admin_id = cmd.from_user.id
-    if admin_id not in Config.ADMINS:
-        return
+    try:
+        admin_id = cmd.from_user.id
+        if admin_id not in Config.ADMINS:
+            await cmd.reply_text("⚠️ Sirf admin /addmovie use kar sakte hain.", quote=True)
+            return
 
-    await session_mgr.cancel_session(admin_id)
-    text = (
-        "🎬 <b>Movie Upload Session Started</b>\n\n"
-        "Send the first video file now. After that, you can add more qualities of the same movie or generate the final movie link."
-    )
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancel Session", callback_data="session_cancel")]
-    ])
-    status_msg = await cmd.reply_text(text, reply_markup=markup, quote=True)
-    await session_mgr.start_addmovie_session(admin_id, status_msg.id, cmd.chat.id)
+        await session_mgr.cancel_session(admin_id)
+        text = (
+            "🎬 <b>Movie Upload Session Started</b>\n\n"
+            "Pehli video file abhi bhejo.\n"
+            "Uske baad same movie ki aur qualities add kar sakte ho, ya Generate Links dabao."
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel Session", callback_data="session_cancel")]
+        ])
+        status_msg = await cmd.reply_text(text, reply_markup=markup, quote=True)
+        await session_mgr.start_addmovie_session(admin_id, status_msg.id, cmd.chat.id)
+        logger.info(f"[ADDMOVIE] Session started by admin {admin_id}")
+    except Exception as e:
+        logger.error(f"addmovie_command error: {e}", exc_info=True)
+        try:
+            await cmd.reply_text(f"❌ Session start nahi hua: <code>{e}</code>", quote=True)
+        except Exception:
+            pass
 
 @Bot.on_message(filters.command("cancel") & filters.private)
 async def cancel_session_handler(bot: Client, cmd: Message):
@@ -107,7 +117,6 @@ async def main():
     except Exception as e:
         logger.error(f"Startup warning: {e}")
 
-    # Send restart message to LOG_CHANNEL so user immediately sees bot is live!
     if Config.LOG_CHANNEL:
         try:
             bot_info = await Bot.get_me()
