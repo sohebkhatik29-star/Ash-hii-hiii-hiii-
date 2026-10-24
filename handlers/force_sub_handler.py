@@ -111,13 +111,13 @@ async def build_force_sub_prompt(bot, user_name, missing, pending_query=""):
             url = f"https://t.me/{ch['username'].lstrip('@')}"
         else:
             url = None
-        label = f"{'📩 Request: ' if mode == 'request' else '📢 Join: '}{title}"
+        label = f"{'\ud83d\udce9 Request: ' if mode == 'request' else '\ud83d\udce2 Join: '}{title}"
         if url:
             buttons.append([InlineKeyboardButton(label, url=url)])
         else:
-            buttons.append([InlineKeyboardButton(f"⚠️ {title}", callback_data="fs_noop")])
+            buttons.append([InlineKeyboardButton(f"\u26a0\ufe0f {title}", callback_data="fs_noop")])
     cb = f"fs_refresh:{pending_query[:40]}" if pending_query else "fs_refresh"
-    buttons.append([InlineKeyboardButton("✅ Joined / Try Again", callback_data=cb)])
+    buttons.append([InlineKeyboardButton("\u2705 Joined / Try Again", callback_data=cb)])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -143,9 +143,21 @@ async def enforce_force_sub_in_group(bot, message, query=""):
     if not missing:
         return False
     name = message.from_user.first_name or "User"
-    text, markup = await build_force_sub_prompt(bot, name, missing, pending_query=query or (message.text or ""))
+    text, markup = await build_force_sub_prompt(
+        bot, name, missing, pending_query=query or (message.text or "")
+    )
+    # Delete user search message so group stays clean
     try:
-        prompt = await message.reply_text(text, reply_markup=markup, quote=True, disable_web_page_preview=True)
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"force-sub delete user msg: {e}")
+    try:
+        prompt = await bot.send_message(
+            message.chat.id,
+            text,
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
         async def _later():
             await asyncio.sleep(300)
             try:
@@ -197,7 +209,7 @@ async def handle_force_sub(bot: Client, cmd: Message) -> int:
             return 200
         if status == "kicked":
             try:
-                await bot.send_message(cmd.chat.id, "🚫 **Sorry, you are banned from using this bot.**")
+                await bot.send_message(cmd.chat.id, "\ud83d\udeab **Sorry, you are banned from using this bot.**")
             except Exception:
                 pass
             return 400
@@ -209,10 +221,10 @@ async def handle_force_sub(bot: Client, cmd: Message) -> int:
         try:
             await bot.send_message(
                 chat_id=cmd.chat.id,
-                text="📢 **Please Join Our Updates Channel To Use This Bot!**\n\nDue to heavy load, only channel subscribers can access movies.",
+                text="\ud83d\udce2 **Please Join Our Updates Channel To Use This Bot!**\n\nDue to heavy load, only channel subscribers can access movies.",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📢 Join Updates Channel", url=channel_url)],
-                    [InlineKeyboardButton("🔄 Refresh / Try Again", callback_data="refreshForceSub")],
+                    [InlineKeyboardButton("\ud83d\udce2 Join Updates Channel", url=channel_url)],
+                    [InlineKeyboardButton("\ud83d\udd04 Refresh / Try Again", callback_data="refreshForceSub")],
                 ]),
                 disable_web_page_preview=True,
             )
@@ -234,10 +246,8 @@ async def handle_fs_callback(client: Client, query: CallbackQuery):
             return
         chat_id = query.message.chat.id
         uid = query.from_user.id
-        # Allow Config.ADMINS always; also group admins; also anyone who can see the button
         is_admin = await _is_group_admin(client, chat_id, uid)
         if not is_admin:
-            # soft-allow: if pending exists for this channel, let them finish the flow
             parts_chk = data.split(":")
             if len(parts_chk) >= 3:
                 try:
@@ -262,7 +272,7 @@ async def handle_fs_callback(client: Client, query: CallbackQuery):
                 await query.message.delete()
             except Exception:
                 try:
-                    await query.message.edit_text("❌ Cancelled.")
+                    await query.message.edit_text("\u274c Cancelled.")
                 except Exception:
                     pass
             await query.answer("Cancelled")
@@ -275,7 +285,7 @@ async def handle_fs_callback(client: Client, query: CallbackQuery):
         except ValueError:
             await query.answer(f"Max {MAX_FORCE_CHANNELS} channels!", show_alert=True)
             try:
-                await query.message.edit_text(f"❌ Max {MAX_FORCE_CHANNELS} channels.")
+                await query.message.edit_text(f"\u274c Max {MAX_FORCE_CHANNELS} channels.")
             except Exception:
                 pass
             return
@@ -283,21 +293,21 @@ async def handle_fs_callback(client: Client, query: CallbackQuery):
             logger.exception("add_force_channel failed")
             await query.answer(f"Error: {e}", show_alert=True)
             try:
-                await query.message.edit_text(f"❌ Error: <code>{e}</code>")
+                await query.message.edit_text(f"\u274c Error: <code>{e}</code>")
             except Exception:
                 pass
             return
         try:
             await query.message.edit_text(
-                f"✅ <b>Force-sub channel add ho gaya!</b>\n\n"
-                f"📢 <b>{doc.get('title')}</b>\n"
+                f"\u2705 <b>Force-sub channel add ho gaya!</b>\n\n"
+                f"\ud83d\udce2 <b>{doc.get('title')}</b>\n"
                 f"ID: <code>{doc.get('channel_id')}</code>\n"
                 f"Mode: <b>{doc.get('mode')}</b>\n\n"
                 f"Ab users ko group me search se pehle ye channel join karna hoga."
             )
         except Exception:
             pass
-        await query.answer("Added! ✅")
+        await query.answer("Added! \u2705")
         async def _clean():
             await asyncio.sleep(15)
             try:
@@ -326,10 +336,10 @@ async def handle_fs_callback(client: Client, query: CallbackQuery):
             await query.message.delete()
         except Exception:
             pass
-        await query.answer("Verified! ✅")
+        await query.answer("Verified! \u2705")
         if pending_q and query.message:
             try:
-                tip = await client.send_message(query.message.chat.id, f"✅ Verified. Dubara search: <b>{pending_q}</b>")
+                tip = await client.send_message(query.message.chat.id, f"\u2705 Verified. Dubara search: <b>{pending_q}</b>")
                 await asyncio.sleep(8)
                 await tip.delete()
             except Exception:
@@ -382,12 +392,12 @@ def register_force_sub_handlers(bot: Client):
                         title = chat.title or title
                         username = getattr(chat, "username", None) or username
                     except Exception as e:
-                        await message.reply_text(f"❌ Channel nahi mila: <code>{e}</code>", quote=True)
+                        await message.reply_text(f"\u274c Channel nahi mila: <code>{e}</code>", quote=True)
                         return
         if channel_id is None:
             await message.reply_text(
-                "📢 <b>Usage:</b>\n• Channel message <b>forward</b> + reply <code>/add_force_chnl</code>\n"
-                "• Ya <code>/add_force_chnl -100xxxxxxxxxx</code>\n• Ya <code>/add_force_chnl @username</code>",
+                "\ud83d\udce2 <b>Usage:</b>\n\u2022 Channel message <b>forward</b> + reply <code>/add_force_chnl</code>\n"
+                "\u2022 Ya <code>/add_force_chnl -100xxxxxxxxxx</code>\n\u2022 Ya <code>/add_force_chnl @username</code>",
                 quote=True,
             )
             return
@@ -395,10 +405,10 @@ def register_force_sub_handlers(bot: Client):
             me = await client.get_me()
             member = await client.get_chat_member(channel_id, me.id)
             if not _status_is_admin(member.status):
-                await message.reply_text("❌ <b>Is channel me bot admin nahi hai.</b>\nPehle bot ko channel me Admin banao.", quote=True)
+                await message.reply_text("\u274c <b>Is channel me bot admin nahi hai.</b>\nPehle bot ko channel me Admin banao.", quote=True)
                 return
         except Exception as e:
-            await message.reply_text(f"❌ Bot is channel me admin nahi / access nahi.\n<code>{e}</code>", quote=True)
+            await message.reply_text(f"\u274c Bot is channel me admin nahi / access nahi.\n<code>{e}</code>", quote=True)
             return
         if not title:
             try:
@@ -411,20 +421,20 @@ def register_force_sub_handlers(bot: Client):
             count = await db.count_force_channels()
             existing = await db.list_force_channels()
         except Exception as e:
-            await message.reply_text(f"❌ DB error: <code>{e}</code>", quote=True)
+            await message.reply_text(f"\u274c DB error: <code>{e}</code>", quote=True)
             return
         exists = any(int(c.get("channel_id", 0)) == int(channel_id) for c in existing)
         if not exists and count >= MAX_FORCE_CHANNELS:
-            await message.reply_text(f"❌ Max <b>{MAX_FORCE_CHANNELS}</b> channels. /del_force_chnl se hatao.", quote=True)
+            await message.reply_text(f"\u274c Max <b>{MAX_FORCE_CHANNELS}</b> channels. /del_force_chnl se hatao.", quote=True)
             return
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔹 Normal (direct join)", callback_data=f"fs_mode:normal:{channel_id}")],
-            [InlineKeyboardButton("📩 Request (join request)", callback_data=f"fs_mode:request:{channel_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"fs_mode:cancel:{channel_id}")],
+            [InlineKeyboardButton("\ud83d\udd39 Normal (direct join)", callback_data=f"fs_mode:normal:{channel_id}")],
+            [InlineKeyboardButton("\ud83d\udce9 Request (join request)", callback_data=f"fs_mode:request:{channel_id}")],
+            [InlineKeyboardButton("\u274c Cancel", callback_data=f"fs_mode:cancel:{channel_id}")],
         ])
         prompt = await message.reply_text(
-            f"✅ Bot is channel me <b>admin</b> hai.\n\n📢 <b>{title}</b>\nID: <code>{channel_id}</code>\n\n"
-            f"<b>Mode choose karo:</b>\n• <b>Normal</b> — user seedha join kare\n• <b>Request</b> — user join-request bheje",
+            f"\u2705 Bot is channel me <b>admin</b> hai.\n\n\ud83d\udce2 <b>{title}</b>\nID: <code>{channel_id}</code>\n\n"
+            f"<b>Mode choose karo:</b>\n\u2022 <b>Normal</b> \u2014 user seedha join kare\n\u2022 <b>Request</b> \u2014 user join-request bheje",
             reply_markup=markup, quote=True,
         )
         _FS_PENDING[int(channel_id)] = {
@@ -462,12 +472,12 @@ def register_force_sub_handlers(bot: Client):
                     except Exception:
                         pass
         if channel_id is None:
-            await message.reply_text("🗑 Usage: <code>/del_force_chnl -100xxx</code> ya forward + reply", quote=True)
+            await message.reply_text("\ud83d\uddd1 Usage: <code>/del_force_chnl -100xxx</code> ya forward + reply", quote=True)
             return
         try:
             ok = await db.remove_force_channel(channel_id)
         except Exception as e:
-            await message.reply_text(f"❌ Error: <code>{e}</code>", quote=True)
+            await message.reply_text(f"\u274c Error: <code>{e}</code>", quote=True)
             return
         try:
             await client.delete_messages(message.chat.id, del_ids)
@@ -475,7 +485,7 @@ def register_force_sub_handlers(bot: Client):
             pass
         msg = await client.send_message(
             message.chat.id,
-            f"✅ Channel <code>{channel_id}</code> force-sub se hata diya." if ok else f"❌ Channel <code>{channel_id}</code> list me nahi mila.",
+            f"\u2705 Channel <code>{channel_id}</code> force-sub se hata diya." if ok else f"\u274c Channel <code>{channel_id}</code> list me nahi mila.",
         )
         await asyncio.sleep(8)
         try:
@@ -490,12 +500,12 @@ def register_force_sub_handlers(bot: Client):
         try:
             channels = await db.list_force_channels()
         except Exception as e:
-            await message.reply_text(f"❌ DB error: <code>{e}</code>", quote=True)
+            await message.reply_text(f"\u274c DB error: <code>{e}</code>", quote=True)
             return
         if not channels:
-            await message.reply_text("📭 No force-sub channels.\n<code>/add_force_chnl</code> se add karo.", quote=True)
+            await message.reply_text("\ud83d\udded No force-sub channels.\n<code>/add_force_chnl</code> se add karo.", quote=True)
             return
-        lines = ["📢 <b>Force-Sub Channels</b>\n"]
+        lines = ["\ud83d\udce2 <b>Force-Sub Channels</b>\n"]
         for i, ch in enumerate(channels, 1):
             lines.append(
                 f"<b>{i}. {ch.get('title') or 'Channel'}</b>"
@@ -511,14 +521,14 @@ def register_force_sub_handlers(bot: Client):
             return
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) < 2:
-            await message.reply_text("✏️ <code>/set_force_sub_message Hello {name} please join</code>", quote=True)
+            await message.reply_text("\u270f\ufe0f <code>/set_force_sub_message Hello {name} please join</code>", quote=True)
             return
         await db.set_force_sub_message(parts[1].strip())
-        await message.reply_text(f"✅ Message set:\n\n{parts[1].strip()}", quote=True)
+        await message.reply_text(f"\u2705 Message set:\n\n{parts[1].strip()}", quote=True)
 
     @bot.on_message(filters.command(["del_force_sub_message", "del_force_msg"]) & filters.group)
     async def del_force_msg_cmd(client: Client, message: Message):
         if not message.from_user or not await _is_group_admin(client, message.chat.id, message.from_user.id):
             return
         await db.clear_force_sub_message()
-        await message.reply_text("✅ Custom message deleted. Default use hoga.", quote=True)
+        await message.reply_text("\u2705 Custom message deleted. Default use hoga.", quote=True)
