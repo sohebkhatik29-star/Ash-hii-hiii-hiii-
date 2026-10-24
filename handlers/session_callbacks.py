@@ -1,8 +1,6 @@
 # ==============================================================================
 # ASH AUTOMATIC MOVIE FILE STORE BOT 🎬
 # Module: handlers/session_callbacks.py
-# Purpose: Dedicated callback query router for session controls, quality download buttons,
-#          duplicate handling, and navigation.
 # ==============================================================================
 
 import logging
@@ -22,8 +20,21 @@ def register_callback_handlers(bot: Client):
 
     @bot.on_callback_query()
     async def callback_router(client: Client, query: CallbackQuery):
-        data = query.data
-        user_id = query.from_user.id
+        data = query.data or ""
+        user_id = query.from_user.id if query.from_user else 0
+
+        # Force-sub buttons — handle BEFORE anything else
+        if data.startswith("fs_mode:") or data.startswith("fs_refresh") or data == "fs_noop":
+            try:
+                from handlers.force_sub_handler import handle_fs_callback
+                await handle_fs_callback(client, query)
+            except Exception as e:
+                logger.error(f"fs callback: {e}", exc_info=True)
+                try:
+                    await query.answer(f"Error: {e}", show_alert=True)
+                except Exception:
+                    pass
+            return
 
         # 0. Direct Channel Msg ID Download: f_{channel_msg_id}
         if data.startswith("f_"):
@@ -76,93 +87,55 @@ def register_callback_handlers(bot: Client):
                 [InlineKeyboardButton("❌ Cancel Session", callback_data="session_cancel")]
             ])
             try:
-                await query.message.edit(text, reply_markup=markup)
+                await query.message.edit_text(text, reply_markup=markup)
             except Exception:
                 pass
-            await query.answer("Send next quality file!")
+            await query.answer()
             return
 
-        # 4. Session Generate Links Button
+        # 4. Session Generate Links
         elif data == "session_generate":
             if user_id not in Config.ADMINS:
                 return
-            await handle_generate_links_action(client, query.message.chat.id, user_id, query)
+            await query.answer("Generating links...")
+            await handle_generate_links_action(client, query.message.chat.id, user_id)
             return
 
-        # 5. Session Cancel Button
+        # 5. Session Cancel
         elif data == "session_cancel":
             if user_id not in Config.ADMINS:
                 return
             await session_mgr.cancel_session(user_id)
             try:
-                await query.message.edit("❌ <b>Movie upload session cancelled.</b> (No new files will be added)")
+                await query.message.edit_text("❌ <b>Movie upload session cancelled.</b>")
             except Exception:
                 pass
-            await query.answer("Session cancelled!")
+            await query.answer("Session cancelled")
             return
 
-        # 6. Duplicate Quality Handling
-        elif data.startswith("dup_replace_"):
-            if user_id not in Config.ADMINS:
-                return
-            parts = data.split("_")
-            movie_id = parts[2]
-            quality = parts[3]
-            pending = session_mgr.get_pending_mismatch(user_id)
-            if pending:
-                quality_data = {
-                    "file_id": pending["media_file_id"],
-                    "channel_msg_id": pending["message_id"],
-                    "file_name": pending["filename"],
-                    "file_size": pending["filesize"],
-                    "file_size_formatted": pending["filesize_str"],
-                }
-                await db.add_quality_to_movie(movie_id, quality, quality_data)
-                session_mgr.clear_pending_mismatch(user_id)
-                movie = await db.get_movie(movie_id)
-                saved_q_list = list(movie.get("qualities", {}).keys())
-                text = (
-                    f"🔄 <b>Quality '{quality}' replaced successfully!</b>\n\n"
-                    f"🎬 Movie: <b>{movie.get('title')}</b>\n"
-                    f"📁 Saved Qualities: <code>[{', '.join(saved_q_list)}]</code>"
-                )
-                markup = InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("➕ Continue Upload", callback_data="session_continue"),
-                        InlineKeyboardButton("🔗 Generate Links", callback_data="session_generate")
-                    ],
-                    [InlineKeyboardButton("❌ Cancel Session", callback_data="session_cancel")]
-                ])
-                await query.message.edit(text, reply_markup=markup)
-                await query.answer("Quality replaced!")
-            return
-
-        elif data == "dup_cancel":
-            session_mgr.clear_pending_mismatch(user_id)
-            try:
-                await query.message.edit("❌ <b>Duplicate upload cancelled.</b> Existing file preserved.")
-            except Exception:
-                pass
-            await query.answer("Cancelled duplicate!")
-            return
-
-        # 7. Navigation & Info
+        # 6. About bot / dev / close / back
         elif data == "about_bot":
-            await query.message.edit(
-                Config.ABOUT_BOT_TEXT,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Back", callback_data="back_home")]
-                ])
-            )
+            try:
+                await query.message.edit_text(
+                    Config.ABOUT_BOT_TEXT,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⬅️ Back", callback_data="back_home")]
+                    ])
+                )
+            except Exception:
+                pass
             await query.answer()
 
         elif data == "about_dev":
-            await query.message.edit(
-                Config.ABOUT_DEV_TEXT,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Back", callback_data="back_home")]
-                ])
-            )
+            try:
+                await query.message.edit_text(
+                    Config.ABOUT_DEV_TEXT,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⬅️ Back", callback_data="back_home")]
+                    ])
+                )
+            except Exception:
+                pass
             await query.answer()
 
         elif data == "back_home":
@@ -183,11 +156,17 @@ def register_callback_handlers(bot: Client):
                     InlineKeyboardButton("❌ Close", callback_data="close_card")
                 ]
             ])
-            await query.message.edit(welcome_text, reply_markup=markup, disable_web_page_preview=True)
+            try:
+                await query.message.edit(welcome_text, reply_markup=markup, disable_web_page_preview=True)
+            except Exception:
+                pass
             await query.answer()
 
         elif data == "close_card":
-            await query.message.delete()
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
 
         try:
             await query.answer()
