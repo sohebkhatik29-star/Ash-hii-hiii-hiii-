@@ -7,7 +7,16 @@
 import asyncio
 import logging
 from pyrogram import Client, filters, idle
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeDefault,
+)
 
 from configs import Config
 from handlers.database import db
@@ -119,7 +128,54 @@ register_callback_handlers(Bot)
 register_group_filter_handlers(Bot)
 register_moderation_handlers(Bot)
 
-# 5. Application Lifecycle & Startup Notification
+# 5. Bot command menu — group menu ONLY for admins/owners
+async def setup_bot_commands(bot: Client):
+    """
+    Group / menu:
+      - Normal members: empty (koi command menu nahi dikhega)
+      - Chat admins + owners: full moderation menu
+    Private chat: basic user commands.
+    """
+    try:
+        await bot.set_bot_commands([], scope=BotCommandScopeDefault())
+
+        # Private chats — basic user commands
+        await bot.set_bot_commands(
+            [
+                BotCommand("start", "Bot start / welcome"),
+                BotCommand("help", "Help & how to use"),
+            ],
+            scope=BotCommandScopeAllPrivateChats(),
+        )
+
+        # ALL group members (non-admin) — EMPTY menu
+        await bot.set_bot_commands(
+            [],
+            scope=BotCommandScopeAllGroupChats(),
+        )
+
+        # ONLY group admins + owners — full moderation menu
+        admin_group_cmds = [
+            BotCommand("warn", "User ko warning (3 = ban)"),
+            BotCommand("sp", "Spelling galat + Google button"),
+            BotCommand("rls", "Movie abhi release nahi hui"),
+            BotCommand("n_available", "Telegram pe available nahi"),
+            BotCommand("prm", "Sirf Premium pe available"),
+            BotCommand("dl", "Poster pe reply → filter delete"),
+            BotCommand("dl_all_filters", "Saare filters delete"),
+            BotCommand("unban", "User unban (reply / user_id)"),
+            BotCommand("done", "Not-found session close"),
+        ]
+        await bot.set_bot_commands(
+            admin_group_cmds,
+            scope=BotCommandScopeAllChatAdministrators(),
+        )
+        logger.info("✅ Bot command menus set: group menu = admins only")
+    except Exception as e:
+        logger.warning(f"setup_bot_commands failed (non-fatal): {e}")
+
+
+# 6. Application Lifecycle & Startup Notification
 async def main():
     logger.info("Initializing Ash Movie Store Bot...")
     await Bot.start()
@@ -130,6 +186,8 @@ async def main():
         logger.info("MongoDB indexes, active sessions, and group movie catalog synced successfully!")
     except Exception as e:
         logger.error(f"Startup warning: {e}")
+
+    await setup_bot_commands(Bot)
 
     if Config.LOG_CHANNEL:
         try:
