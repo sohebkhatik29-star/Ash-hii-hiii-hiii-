@@ -98,44 +98,51 @@ class MovieSessionManager:
         session = await self.get_session(admin_id)
         if not session:
             return
-        quals = session.get("qualities", [])
-        if old_quality in quals:
-            quals[quals.index(old_quality)] = new_quality
-            session["qualities"] = quals
-            self.active_sessions[admin_id] = session
-            await db.set_active_session(admin_id, session)
+        qualities = session.get("qualities", [])
+        if old_quality in qualities:
+            idx = qualities.index(old_quality)
+            qualities[idx] = new_quality
+        elif new_quality not in qualities:
+            qualities.append(new_quality)
+        session["qualities"] = qualities
+        self.active_sessions[admin_id] = session
+        await db.set_active_session(admin_id, session)
 
-    async def validate_incoming_upload(self, admin_id: int, incoming_title: str) -> Tuple[bool, str, Optional[str]]:
-        session = await self.get_session(admin_id)
-        if not session or not session.get("title"):
-            return True, "no_active_title", None
-        active = session["title"]
-        if is_title_match(active, incoming_title):
-            return True, "matched", active
-        return False, "title_mismatch", active
-
-    def set_awaiting_next(self, admin_id: int, value: bool = True):
+    def set_awaiting_next(self, admin_id: int, state: bool = True):
         if admin_id in self.active_sessions:
-            self.active_sessions[admin_id]["awaiting_next"] = value
+            self.active_sessions[admin_id]["awaiting_next"] = state
 
     async def finish_session(self, admin_id: int) -> Optional[Dict[str, Any]]:
         session = await self.get_session(admin_id)
         if admin_id in self.active_sessions:
             del self.active_sessions[admin_id]
+        if admin_id in self.pending_files:
+            del self.pending_files[admin_id]
         await db.clear_active_session(admin_id)
         return session
 
     async def cancel_session(self, admin_id: int) -> Optional[Dict[str, Any]]:
-        session = await self.get_session(admin_id)
-        if admin_id in self.active_sessions:
-            del self.active_sessions[admin_id]
-        await db.clear_active_session(admin_id)
-        if admin_id in self.pending_files:
-            del self.pending_files[admin_id]
-        return session
+        return await self.finish_session(admin_id)
 
-    def store_pending_mismatch(self, admin_id: int, data: Dict[str, Any]):
-        self.pending_files[admin_id] = data
+    async def validate_incoming_upload(self, admin_id: int, incoming_title: str) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        session = await self.get_session(admin_id)
+        if not session:
+            return False, "NO_ACTIVE_SESSION", None
+
+        # If admin started /addmovie and this is the first file:
+        if session.get("status") == "AWAITING_FIRST_FILE" or not session.get("title"):
+            return True, "FIRST_FILE", session
+
+        # Active movie already set (e.g. "Jaat")
+        active_title = session.get("title", "")
+        if is_title_match(active_title, incoming_title):
+            return True, "SESSION_MATCH", session
+
+        # Strict mismatch! E.g. KGF sent when Jaat is active
+        return False, "SESSION_MISMATCH", session
+
+    def store_pending_mismatch(self, admin_id: int, pending_data: Dict[str, Any]):
+        self.pending_files[admin_id] = pending_data
 
     def get_pending_mismatch(self, admin_id: int) -> Optional[Dict[str, Any]]:
         return self.pending_files.get(admin_id)
