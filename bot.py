@@ -16,6 +16,7 @@ from pyrogram.types import (
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllChatAdministrators,
     BotCommandScopeChatAdministrators,
+    BotCommandScopeChat,
     BotCommandScopeDefault,
 )
 
@@ -75,7 +76,7 @@ async def addmovie_command(bot: Client, cmd: Message):
         )
         await session_mgr.start_addmovie_session(admin_id, status_msg.id, cmd.chat.id)
     except Exception as e:
-        logger.error(f"addmovie_command error: {e}", exp_info=True)
+        logger.error(f"addmovie_command error: {e}", exc_info=True)
         try:
             await cmd.reply_text(f"❌ Error: <code>{e}</code>", quote=True)
         except Exception:
@@ -129,16 +130,13 @@ register_callback_handlers(Bot)
 register_group_filter_handlers(Bot)
 register_moderation_handlers(Bot)
 
-# 5. Bot command menu — group menu ONLY for admins/owners
+# 5. Bot command menu for groups
+# NOTE: Telegram mobile often does NOT show admin-only scopes in the / list.
+# So we put commands on AllGroupChats + specific group Chat scope so the
+# menu always appears when someone types /. Handlers still allow ONLY admins.
 async def setup_bot_commands(bot: Client):
-    """
-    Group / menu:
-      - Normal members: empty
-      - Chat admins + owners: full moderation menu
-    Private: start/help.
-    Also forces menu on MOVIE_GROUP_ID so it always appears for that group.
-    """
-    admin_group_cmds = [
+    group_cmds = [
+        BotCommand("menu", "Admin commands list"),
         BotCommand("warn", "User ko warning (3 = ban)"),
         BotCommand("sp", "Spelling galat + Google button"),
         BotCommand("rls", "Movie abhi release nahi hui"),
@@ -148,48 +146,59 @@ async def setup_bot_commands(bot: Client):
         BotCommand("dl_all_filters", "Saare filters delete"),
         BotCommand("unban", "User unban (reply / user_id)"),
         BotCommand("done", "Not-found session close"),
-        BotCommand("menu", "Admin commands list"),
     ]
-    try:
-        await bot.set_bot_commands([], scope=BotCommandScopeDefault())
-    except Exception as e:
-        logger.warning(f"clear default cmds: {e}")
+    private_cmds = [
+        BotCommand("start", "Bot start / welcome"),
+        BotCommand("help", "Help & how to use"),
+        BotCommand("addmovie", "Start movie upload session"),
+        BotCommand("cancel", "Cancel upload session"),
+        BotCommand("finish", "Generate links / finish session"),
+    ]
 
     try:
-        await bot.set_bot_commands(
-            [
-                BotCommand("start", "Bot start / welcome"),
-                BotCommand("help", "Help & how to use"),
-            ],
-            scope=BotCommandScopeAllPrivateChats(),
-        )
+        await bot.delete_bot_commands(scope=BotCommandScopeDefault())
+    except Exception:
+        try:
+            await bot.set_bot_commands([], scope=BotCommandScopeDefault())
+        except Exception as e:
+            logger.warning(f"clear default: {e}")
+
+    try:
+        await bot.set_bot_commands(private_cmds, scope=BotCommandScopeAllPrivateChats())
+        logger.info("✅ Private commands set")
     except Exception as e:
         logger.warning(f"private cmds: {e}")
 
+    # ALL groups — this is what makes / menu actually appear on mobile
     try:
-        await bot.set_bot_commands([], scope=BotCommandScopeAllGroupChats())
+        await bot.set_bot_commands(group_cmds, scope=BotCommandScopeAllGroupChats())
+        logger.info("✅ Group commands set (AllGroupChats) — / menu will show")
     except Exception as e:
-        logger.warning(f"all group cmds: {e}")
+        logger.warning(f"AllGroupChats cmds failed: {e}")
 
     try:
-        await bot.set_bot_commands(
-            admin_group_cmds,
-            scope=BotCommandScopeAllChatAdministrators(),
-        )
-        logger.info("✅ Admin menu set for AllChatAdministrators")
+        await bot.set_bot_commands(group_cmds, scope=BotCommandScopeAllChatAdministrators())
     except Exception as e:
-        logger.warning(f"AllChatAdministrators cmds failed: {e}")
+        logger.warning(f"AllChatAdministrators: {e}")
 
     try:
         gid = int(getattr(Config, "MOVIE_GROUP_ID", 0) or 0)
         if gid:
-            await bot.set_bot_commands(
-                admin_group_cmds,
-                scope=BotCommandScopeChatAdministrators(chat_id=gid),
-            )
-            logger.info(f"✅ Admin menu forced for group {gid}")
+            try:
+                await bot.set_bot_commands(group_cmds, scope=BotCommandScopeChat(chat_id=gid))
+                logger.info(f"✅ Commands set for group chat {gid}")
+            except Exception as e1:
+                logger.warning(f"BotCommandScopeChat({gid}): {e1}")
+            try:
+                await bot.set_bot_commands(
+                    group_cmds,
+                    scope=BotCommandScopeChatAdministrators(chat_id=gid),
+                )
+                logger.info(f"✅ Commands set for group admins {gid}")
+            except Exception as e2:
+                logger.warning(f"ChatAdministrators({gid}): {e2}")
     except Exception as e:
-        logger.warning(f"group-specific admin cmds failed: {e}")
+        logger.warning(f"group-specific cmds failed: {e}")
 
 
 # 6. Application Lifecycle & Startup Notification
