@@ -4,6 +4,7 @@
 # Purpose: Universal Movie Search & Group AutoFilter (Rose / AutoFilter style).
 #          Works in Groups, Supergroups, and Private Chat.
 #          When user types movie name → shows group post links (jump to existing post).
+#          Auto-deletes search messages after 24h. /done marks fulfilled requests.
 # ==============================================================================
 
 import asyncio
@@ -20,6 +21,8 @@ from handlers.send_file import send_movie_card
 logger = logging.getLogger("GroupFilter")
 
 PAGE_SIZE = 8
+# Group search messages auto-delete after 24 hours
+AUTO_DELETE_SECONDS = 24 * 60 * 60  # 86400
 
 # Common noise words – ignore these so chat stays clean
 IGNORED_WORDS = {
@@ -27,7 +30,7 @@ IGNORED_WORDS = {
     "ha", "haa", "nahi", "no", "yes", "haan", "admin", "thanks", "thank you",
     "thx", "tq", "good", "nice", "please", "plz", "pls", "link", "bot", "movie",
     "film", "bhai", "bro", "sir", "ji", "kya", "hai", "ho", "ka", "ki", "ke",
-    "aur", "or", "the", "a", "an", "to", "of", "in", "on", "for"
+    "aur", "or", "the", "a", "an", "to", "of", "in", "on", "for", "done"
 }
 
 
@@ -82,6 +85,26 @@ def build_filter_results(query: str, results: list, page: int = 1, is_group: boo
     return text, None
 
 
+async def _safe_delete(client: Client, chat_id: int, message_ids: list):
+    """Delete messages; ignore errors (already deleted / no permission)."""
+    for mid in message_ids:
+        if not mid:
+            continue
+        try:
+            await client.delete_messages(chat_id, mid)
+        except Exception:
+            pass
+
+
+async def _schedule_delete(client: Client, chat_id: int, message_ids: list, delay: int = AUTO_DELETE_SECONDS):
+    """Background task: wait then delete the given messages."""
+    try:
+        await asyncio.sleep(delay)
+        await _safe_delete(client, chat_id, message_ids)
+    except Exception as e:
+        logger.debug(f"schedule_delete: {e}")
+
+
 def register_group_filter_handlers(bot: Client):
 
     # 1. Explicit commands: /find /filter /search
@@ -99,12 +122,63 @@ def register_group_filter_handlers(bot: Client):
         is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
         await execute_movie_search(client, message, query, is_group=is_group)
 
-    # 2. Direct text search (auto-filter style) – works only when Group Privacy is OFF
+    # 2. /done — admin replies to a user's movie request after uploading
+    @bot.on_message(filters.command("done") & filters.group)
+    async def done_request_handler(client: Client, message: Message):
+        """
+        Admin: reply to user's movie-name message with /done
+        → delete /done command
+        → reply to user: request uploaded
+        → auto-delete user msg + bot reply after 24h
+        """
+        admin_id = message.from_user.id if message.from_user else 0
+        if admin_id not in Config.ADMINS:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            return
+
+        if not message.reply_to_message:
+            tip = await message.reply_text(
+                "⚠️ <b>/done</b> ko user ke request message pe <b>reply</b> karke bhejo.",
+                quote=True
+            )
+            await asyncio.sleep(15)
+            await _safe_delete(client, message.chat.id, [message.id, tip.id])
+            return
+
+        user_req = message.reply_to_message
+
+        # Delete admin's /done command immediately
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        # Reply to the original user request
+        confirm = await user_req.reply_text(
+            "✅ <b>Your request has been uploaded.</b>\n"
+            "Please check it in the group / search the movie name again.",
+            quote=True
+        )
+
+        # Schedule 24h delete: user's original request + bot confirmation
+        asyncio.create_task(
+            _schedule_delete(
+                client,
+                message.chat.id,
+                [user_req.id, confirm.id],
+                AUTO_DELETE_SECONDS
+            )
+        )
+
+    # 3. Direct text search (auto-filter style) – works only when Group Privacy is OFF
     @bot.on_message(
         filters.text
         & ~filters.command(["start", "help", "find", "filter", "search", "addmovie",
                             "newmovie", "finish", "cancel", "status", "movies",
-                            "delete", "stats", "broadcast", "generatelink"])
+                            "delete", "stats", "broadcast", "generatelink", "done"])
         & ~filters.via_bot
     )
     async def direct_text_search_handler(client: Client, message: Message):
@@ -144,15 +218,21 @@ def register_group_filter_handlers(bot: Client):
                 if len(query) >= 3:
                     not_found = await message.reply_text(
                         f"❌ <b>'{query}'</b> group / database mein nahi mila!\n\n"
-                        f"🔍 Spelling check karein ya thoda short name try karein.",
+                        f"🔍 Spelling check karein ya thoda short name try karein.\n"
+                        f"⏳ Request save hai — upload hone ke baad admin /done se notify karega.",
                         quote=True
                     )
+                    # Only auto-delete the bot's not-found reply after 24h.
+                    # Keep user's request message so admin can /done reply on it.
                     if is_group:
-                        await asyncio.sleep(25)
-                        try:
-                            await not_found.delete()
-                        except Exception:
-                            pass
+                        asyncio.create_task(
+                            _schedule_delete(
+                                client,
+                                message.chat.id,
+                                [not_found.id],
+                                AUTO_DELETE_SECONDS
+                            )
+                        )
                 return
 
             # Private chat + single exact match → full card directly
@@ -162,16 +242,27 @@ def register_group_filter_handlers(bot: Client):
                 return
 
             result_text, result_markup = build_filter_results(query, results, page=1, is_group=is_group)
-            await message.reply_text(
+            bot_msg = await message.reply_text(
                 text=result_text,
                 reply_markup=result_markup,
                 disable_web_page_preview=True,
                 quote=True
             )
+
+            # Group: auto-delete user search + bot results after 24h
+            if is_group:
+                asyncio.create_task(
+                    _schedule_delete(
+                        client,
+                        message.chat.id,
+                        [message.id, bot_msg.id],
+                        AUTO_DELETE_SECONDS
+                    )
+                )
         except Exception as e:
             logger.error(f"Error in execute_movie_search: {e}")
 
-    # 3. Pagination callbacks (kept for compatibility; no buttons now)
+    # 4. Pagination callbacks (kept for compatibility; no buttons now)
     @bot.on_callback_query(filters.regex(r"^flt_(\d+)_(.+)"))
     async def filter_pagination_callback(client: Client, query: CallbackQuery):
         match = query.matches[0]
@@ -196,7 +287,7 @@ def register_group_filter_handlers(bot: Client):
             logger.debug(f"Pagination edit: {e}")
             await query.answer()
 
-    # 4. Close button
+    # 5. Close button
     @bot.on_callback_query(filters.regex(r"^close_card$"))
     async def close_card_callback(client: Client, query: CallbackQuery):
         try:
