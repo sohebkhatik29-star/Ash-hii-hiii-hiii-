@@ -158,8 +158,9 @@ def register_group_filter_handlers(bot: Client):
 
         # Reply to the original user request
         confirm = await user_req.reply_text(
-            "✅ <b>Your request has been uploaded.</b>\n"
-            "Please check it in the group / search the movie name again.",
+            "✅ <b>Request Uploaded Successfully!</b>\n\n"
+            "🎬 Aapki requested movie ab group me available hai.\n"
+            "🔍 Movie ka naam search karke dekh lo.",
             quote=True
         )
 
