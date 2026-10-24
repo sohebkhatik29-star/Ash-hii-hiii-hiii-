@@ -86,7 +86,6 @@ async def _delete_cmd_and_reply(
             quote=True,
             disable_web_page_preview=True,
         )
-        # 24h baad: bot ka reply + user ka original message dono ek sath delete
         ids_to_delete = [bot_msg.id]
         if target and getattr(target, "id", None) and target.id != bot_msg.id:
             ids_to_delete.append(target.id)
@@ -101,9 +100,6 @@ async def _delete_cmd_and_reply(
 
 def register_moderation_handlers(bot: Client):
 
-    # ------------------------------------------------------------------
-    # /dl_all_filters  — wipe every movie filter from DB
-    # ------------------------------------------------------------------
     @bot.on_message(filters.command(["dl_all_filters", "deleteallfilters"]) & filters.group)
     async def dl_all_filters_cmd(client: Client, message: Message):
         if not message.from_user or not await _is_admin(client, message):
@@ -126,9 +122,6 @@ def register_moderation_handlers(bot: Client):
         except Exception as e:
             logger.error(f"dl_all_filters: {e}")
 
-    # ------------------------------------------------------------------
-    # /warn [reason]  — reply to user. 3 warns → ban
-    # ------------------------------------------------------------------
     @bot.on_message(filters.command("warn") & filters.group)
     async def warn_cmd(client: Client, message: Message):
         if not message.from_user or not await _is_admin(client, message):
@@ -150,7 +143,6 @@ def register_moderation_handlers(bot: Client):
             return
 
         target = replied.from_user
-        # Bot owners, bots, aur group admins ko warn/ban nahi
         if target.is_bot or target.id in Config.ADMINS:
             try:
                 await message.delete()
@@ -196,9 +188,6 @@ def register_moderation_handlers(bot: Client):
 
         await _delete_cmd_and_reply(client, message, text, quote_to=replied)
 
-    # ------------------------------------------------------------------
-    # /sp  — spelling wrong + Google search button (uses replied text)
-    # ------------------------------------------------------------------
     @bot.on_message(filters.command("sp") & filters.group)
     async def spelling_cmd(client: Client, message: Message):
         if not message.from_user or not await _is_admin(client, message):
@@ -228,9 +217,6 @@ def register_moderation_handlers(bot: Client):
         ])
         await _delete_cmd_and_reply(client, message, text, reply_markup=markup, quote_to=replied)
 
-    # ------------------------------------------------------------------
-    # /rls  — movie not released yet
-    # ------------------------------------------------------------------
     @bot.on_message(filters.command("rls") & filters.group)
     async def not_released_cmd(client: Client, message: Message):
         if not message.from_user or not await _is_admin(client, message):
@@ -249,9 +235,6 @@ def register_moderation_handlers(bot: Client):
         )
         await _delete_cmd_and_reply(client, message, text, quote_to=replied)
 
-    # ------------------------------------------------------------------
-    # /n_available  — not available on Telegram
-    # ------------------------------------------------------------------
     @bot.on_message(filters.command(["n_available", "navail", "notavailable"]) & filters.group)
     async def not_available_cmd(client: Client, message: Message):
         if not message.from_user or not await _is_admin(client, message):
@@ -269,9 +252,6 @@ def register_moderation_handlers(bot: Client):
         )
         await _delete_cmd_and_reply(client, message, text, quote_to=replied)
 
-    # ------------------------------------------------------------------
-    # /prm  — premium only
-    # ------------------------------------------------------------------
     @bot.on_message(filters.command(["prm", "premium"]) & filters.group)
     async def premium_only_cmd(client: Client, message: Message):
         if not message.from_user or not await _is_admin(client, message):
@@ -289,9 +269,6 @@ def register_moderation_handlers(bot: Client):
         )
         await _delete_cmd_and_reply(client, message, text, quote_to=replied)
 
-    # ------------------------------------------------------------------
-    # /unban  — owner/admin unban (reply or /unban <user_id>)
-    # ------------------------------------------------------------------
     @bot.on_message(filters.command("unban") & filters.group)
     async def unban_cmd(client: Client, message: Message):
         if not message.from_user or not await _is_admin(client, message):
@@ -322,4 +299,31 @@ def register_moderation_handlers(bot: Client):
         )
         asyncio.create_task(
             _schedule_delete(client, message.chat.id, [bot_msg.id], MOD_DELETE_SECONDS)
+        )
+
+    @bot.on_message(filters.command(["menu", "mod", "adminpanel"]) & filters.group)
+    async def admin_menu_cmd(client: Client, message: Message):
+        if not message.from_user or not await _is_admin(client, message):
+            return
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        text = (
+            "🛠 <b>Admin Moderation Menu</b>\n\n"
+            "User ke message pe <b>reply</b> karke ye commands use karo:\n\n"
+            "⚠️ <code>/warn [reason]</code> — warning (3 = ban)\n"
+            "📝 <code>/sp</code> — spelling galat + Google\n"
+            "📅 <code>/rls</code> — movie not released\n"
+            "❌ <code>/n_available</code> — not on Telegram\n"
+            "⭐ <code>/prm</code> — premium only\n"
+            "🗑 <code>/dl</code> — poster pe reply → filter delete\n"
+            "🧹 <code>/dl_all_filters</code> — saare filters delete\n"
+            "✅ <code>/unban</code> — user unban (reply / user_id)\n"
+            "✔️ <code>/done</code> — not-found close\n\n"
+            "📌 Normal members ko ye menu / commands nahi dikhte."
+        )
+        bot_msg = await client.send_message(message.chat.id, text)
+        asyncio.create_task(
+            _schedule_delete(client, message.chat.id, [bot_msg.id], 120)
         )
