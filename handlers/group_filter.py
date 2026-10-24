@@ -214,6 +214,29 @@ def register_group_filter_handlers(bot: Client):
             msg = await client.send_message(message.chat.id, "\u274c Is poster ka filter database me nahi mila.")
             asyncio.create_task(_schedule_delete(client, message.chat.id, [msg.id], AUTO_DELETE_SECONDS))
 
+    # ------------------------------------------------------------------
+    # When a movie post is deleted from the group → remove it from filter DB
+    # (same effect as /dl)
+    # ------------------------------------------------------------------
+    @bot.on_deleted_messages(filters.group)
+    async def on_movie_post_deleted(client: Client, messages):
+        try:
+            deleted_ids = {m.id for m in messages if m and m.id}
+            if not deleted_ids:
+                return
+            all_movies = await _get_all_movies()
+            for mid, m in list(all_movies.items()):
+                gmsg = m.get("group_msg_id")
+                if gmsg and gmsg in deleted_ids:
+                    title = m.get("title", "?")
+                    await db.delete_movie(mid)
+                    logger.info(f"[AUTO-DL] Post deleted → filter removed: {title} (msg_id={gmsg})")
+                    # Also clear from in-memory cache if present
+                    if getattr(db, "_mem_movies", None) and mid in db._mem_movies:
+                        db._mem_movies.pop(mid, None)
+        except Exception as e:
+            logger.error(f"on_movie_post_deleted error: {e}")
+
     @bot.on_message(
         filters.text
         & ~filters.command(["start", "help", "addmovie", "newmovie", "cancel", "finish",
