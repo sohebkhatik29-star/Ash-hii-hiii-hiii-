@@ -71,7 +71,12 @@ async def check_user_in_channel(bot: Client, channel_id: int, user_id: int) -> s
     try:
         member = await bot.get_chat_member(channel_id, user_id)
         status = member.status
-        if status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED):
+        if status in (
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+            ChatMemberStatus.RESTRICTED,
+        ):
             return "ok"
         if status == ChatMemberStatus.BANNED:
             return "kicked"
@@ -103,7 +108,11 @@ async def get_missing_channels(bot: Client, user_id: int) -> List[dict]:
 async def build_force_sub_prompt(bot, user_name, missing, pending_query=""):
     custom = await db.get_force_sub_message()
     if custom:
-        text = custom.replace("{name}", user_name).replace("{username}", user_name).replace("{user}", user_name)
+        text = (
+            custom.replace("{name}", user_name)
+            .replace("{username}", user_name)
+            .replace("{user}", user_name)
+        )
     else:
         text = DEFAULT_FORCE_MSG.format(name=user_name)
     text += "\n\n📢 <b>Join these channel(s):</b>\n"
@@ -148,19 +157,122 @@ async def enforce_force_sub_in_group(bot, message, query=""):
     if not missing:
         return False
     name = message.from_user.first_name or "User"
-    text, markup = await build_force_sub_prompt(bot, name, missing, pending_query=query or (message.text or ""))
+    text, markup = await build_force_sub_prompt(
+        bot, name, missing, pending_query=query or (message.text or "")
+    )
     try:
-        prompt = await message.reply_text(text, reply_markup=markup, quote=True, disable_web_page_preview=True)
+        prompt = await message.reply_text(
+            text, reply_markup=markup, quote=True, disable_web_page_preview=True
+        )
+
         async def _later():
             await asyncio.sleep(300)
             try:
                 await bot.delete_messages(message.chat.id, [prompt.id])
             except Exception:
                 pass
+
         asyncio.create_task(_later())
     except Exception as e:
         logger.warning(f"force sub prompt: {e}")
     return True
+
+
+# ------------------------------------------------------------------
+# Backward-compat for start_handler.py (private /start force-sub)
+# ------------------------------------------------------------------
+async def handle_force_sub(bot: Client, cmd: Message) -> int:
+    """
+    Legacy API used by start_handler.
+    Returns 200 = allowed, 400 = blocked (prompt already sent).
+    """
+    try:
+        if not cmd.from_user:
+            return 200
+        uid = cmd.from_user.id
+        if uid in Config.ADMINS:
+            return 200
+
+        try:
+            channels = await db.list_force_channels()
+        except Exception:
+            channels = []
+
+        if channels:
+            missing = await get_missing_channels(bot, uid)
+            if not missing:
+                return 200
+            name = cmd.from_user.first_name or "User"
+            text, markup = await build_force_sub_prompt(bot, name, missing)
+            try:
+                await bot.send_message(
+                    chat_id=cmd.chat.id,
+                    text=text,
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.warning(f"handle_force_sub prompt: {e}")
+            return 400
+
+        if not Config.UPDATES_CHANNEL:
+            return 200
+        try:
+            channel_chat_id = (
+                int(Config.UPDATES_CHANNEL)
+                if str(Config.UPDATES_CHANNEL).startswith("-100")
+                else Config.UPDATES_CHANNEL
+            )
+        except Exception:
+            channel_chat_id = Config.UPDATES_CHANNEL
+
+        cid = channel_chat_id
+        try:
+            if str(cid).lstrip("-").isdigit():
+                cid = int(cid)
+        except Exception:
+            pass
+
+        status = await check_user_in_channel(bot, cid, uid)
+        if status == "ok":
+            return 200
+        if status == "kicked":
+            try:
+                await bot.send_message(cmd.chat.id, "🚫 **Sorry, you are banned from using this bot.**")
+            except Exception:
+                pass
+            return 400
+
+        try:
+            invite = await get_invite_link(bot, cid)
+            channel_url = invite.invite_link if invite else (
+                f"https://t.me/{Config.UPDATES_CHANNEL}"
+                if not str(Config.UPDATES_CHANNEL).startswith("-")
+                else f"https://t.me/{Config.BOT_USERNAME}"
+            )
+        except Exception:
+            channel_url = f"https://t.me/{Config.BOT_USERNAME}"
+
+        try:
+            await bot.send_message(
+                chat_id=cmd.chat.id,
+                text=(
+                    "📢 **Please Join Our Updates Channel To Use This Bot!**\n\n"
+                    "Due to heavy load, only channel subscribers can access movies."
+                ),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 Join Updates Channel", url=channel_url)],
+                    [InlineKeyboardButton("🔄 Refresh / Try Again", callback_data="refreshForceSub")],
+                ]),
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.warning(f"legacy force sub: {e}")
+            return 200
+        return 400
+    except Exception as e:
+        logger.warning(f"handle_force_sub error (allowing user): {e}")
+        return 200
 
 
 def register_force_sub_handlers(bot: Client):
@@ -195,7 +307,8 @@ def register_force_sub_handlers(bot: Client):
                         return
         if channel_id is None:
             await message.reply_text(
-                "📢 <b>Usage:</b>\n• Channel message forward + reply <code>/add_force_chnl</code>\n• Ya <code>/add_force_chnl -100xxx</code>\n• Ya <code>/add_force_chnl @username</code>",
+                "📢 <b>Usage:</b>\n• Channel message forward + reply <code>/add_force_chnl</code>\n"
+                "• Ya <code>/add_force_chnl -100xxx</code>\n• Ya <code>/add_force_chnl @username</code>",
                 quote=True,
             )
             return
@@ -203,10 +316,15 @@ def register_force_sub_handlers(bot: Client):
             me = await client.get_me()
             member = await client.get_chat_member(channel_id, me.id)
             if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-                await message.reply_text("❌ <b>Is channel me bot admin nahi hai.</b>\nPehle bot ko channel me Admin banao.", quote=True)
+                await message.reply_text(
+                    "❌ <b>Is channel me bot admin nahi hai.</b>\nPehle bot ko channel me Admin banao.",
+                    quote=True,
+                )
                 return
         except Exception as e:
-            await message.reply_text(f"❌ Bot is channel me admin nahi / access nahi.\n<code>{e}</code>", quote=True)
+            await message.reply_text(
+                f"❌ Bot is channel me admin nahi / access nahi.\n<code>{e}</code>", quote=True
+            )
             return
         if not title:
             try:
@@ -216,9 +334,14 @@ def register_force_sub_handlers(bot: Client):
             except Exception:
                 title = str(channel_id)
         count = await db.count_force_channels()
-        exists = any(int(c.get("channel_id", 0)) == int(channel_id) for c in await db.list_force_channels())
+        exists = any(
+            int(c.get("channel_id", 0)) == int(channel_id)
+            for c in await db.list_force_channels()
+        )
         if not exists and count >= MAX_FORCE_CHANNELS:
-            await message.reply_text(f"❌ Max {MAX_FORCE_CHANNELS} channels. /del_force_chnl se hatao.", quote=True)
+            await message.reply_text(
+                f"❌ Max {MAX_FORCE_CHANNELS} channels. /del_force_chnl se hatao.", quote=True
+            )
             return
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔹 Normal (direct join)", callback_data=f"fs_mode:normal:{channel_id}")],
@@ -229,8 +352,10 @@ def register_force_sub_handlers(bot: Client):
             db._fs_pending = {}
         db._fs_pending[int(channel_id)] = {"title": title, "username": username or ""}
         await message.reply_text(
-            f"✅ Bot admin hai.\n\n📢 <b>{title}</b>\nID: <code>{channel_id}</code>\n\n<b>Mode choose karo:</b>",
-            reply_markup=markup, quote=True,
+            f"✅ Bot admin hai.\n\n📢 <b>{title}</b>\nID: <code>{channel_id}</code>\n\n"
+            f"<b>Mode choose karo:</b>",
+            reply_markup=markup,
+            quote=True,
         )
         try:
             await message.delete()
@@ -260,13 +385,19 @@ def register_force_sub_handlers(bot: Client):
         channel_id = int(cid_s)
         meta = getattr(db, "_fs_pending", {}).pop(channel_id, {}) or {}
         try:
-            doc = await db.add_force_channel(channel_id, title=meta.get("title") or str(channel_id), username=meta.get("username") or "", mode=mode)
+            doc = await db.add_force_channel(
+                channel_id,
+                title=meta.get("title") or str(channel_id),
+                username=meta.get("username") or "",
+                mode=mode,
+            )
         except ValueError:
             await query.message.edit_text(f"❌ Max {MAX_FORCE_CHANNELS} channels.")
             await query.answer()
             return
         await query.message.edit_text(
-            f"✅ Force-sub add!\n\n📢 <b>{doc.get('title')}</b>\nID: <code>{doc.get('channel_id')}</code>\nMode: <b>{doc.get('mode')}</b>"
+            f"✅ Force-sub add!\n\n📢 <b>{doc.get('title')}</b>\n"
+            f"ID: <code>{doc.get('channel_id')}</code>\nMode: <b>{doc.get('mode')}</b>"
         )
         await query.answer("Added!")
 
@@ -290,7 +421,9 @@ def register_force_sub_handlers(bot: Client):
                     except Exception:
                         pass
         if channel_id is None:
-            await message.reply_text("🗑 Usage: <code>/del_force_chnl -100xxx</code> ya forward + reply", quote=True)
+            await message.reply_text(
+                "🗑 Usage: <code>/del_force_chnl -100xxx</code> ya forward + reply", quote=True
+            )
             return
         ok = await db.remove_force_channel(channel_id)
         await message.reply_text(
@@ -298,13 +431,18 @@ def register_force_sub_handlers(bot: Client):
             quote=True,
         )
 
-    @bot.on_message(filters.command(["see_force_sub_chnl", "seeforce", "list_force", "force_channels"]) & filters.group)
+    @bot.on_message(
+        filters.command(["see_force_sub_chnl", "seeforce", "list_force", "force_channels"])
+        & filters.group
+    )
     async def see_force_cmd(client: Client, message: Message):
         if not await _is_group_admin(client, message):
             return
         channels = await db.list_force_channels()
         if not channels:
-            await message.reply_text("📭 No force-sub channels. /add_force_chnl se add karo.", quote=True)
+            await message.reply_text(
+                "📭 No force-sub channels. /add_force_chnl se add karo.", quote=True
+            )
             return
         lines = ["📢 <b>Force-Sub Channels</b>\n"]
         for i, ch in enumerate(channels, 1):
@@ -316,13 +454,18 @@ def register_force_sub_handlers(bot: Client):
         lines.append(f"\nTotal: <b>{len(channels)}</b> / {MAX_FORCE_CHANNELS}")
         await message.reply_text("\n".join(lines), quote=True)
 
-    @bot.on_message(filters.command(["set_force_sub_message", "seth_force_sub_message", "set_force_msg"]) & filters.group)
+    @bot.on_message(
+        filters.command(["set_force_sub_message", "seth_force_sub_message", "set_force_msg"])
+        & filters.group
+    )
     async def set_force_msg_cmd(client: Client, message: Message):
         if not await _is_group_admin(client, message):
             return
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) < 2:
-            await message.reply_text("✏️ <code>/set_force_sub_message Hello {name} please join</code>", quote=True)
+            await message.reply_text(
+                "✏️ <code>/set_force_sub_message Hello {name} please join</code>", quote=True
+            )
             return
         await db.set_force_sub_message(parts[1].strip())
         await message.reply_text(f"✅ Message set:\n\n{parts[1].strip()}", quote=True)
@@ -357,7 +500,10 @@ def register_force_sub_handlers(bot: Client):
         await query.answer("Verified! ✅")
         if pending_q and query.message:
             try:
-                tip = await client.send_message(query.message.chat.id, f"✅ Verified. Dubara search: <b>{pending_q}</b>")
+                tip = await client.send_message(
+                    query.message.chat.id,
+                    f"✅ Verified. Dubara search: <b>{pending_q}</b>",
+                )
                 await asyncio.sleep(8)
                 await tip.delete()
             except Exception:
