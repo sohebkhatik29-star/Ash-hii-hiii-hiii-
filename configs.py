@@ -38,7 +38,7 @@ class Config(object):
     # MongoDB Atlas Database Configuration
     DATABASE_URL = os.environ.get(
         "DATABASE_URL",
-        "mongodb+srv://sohebkhatik29_db_user:3E3bPvJH8ECFtpBq@cluster0.z6gan8b.mongodb.net/moviefilterbot?retryWrites=true&w=majority&appName=Cluster0"
+        "mongodb+srv://sohebkhataik25:ash980@cluster0.ewksnis.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
     )
     DATABASE_NAME = os.environ.get("DATABASE_NAME", "moviefilterbot")
 
@@ -71,21 +71,21 @@ Yeh ek **Automatic Movie File Store Bot** hai. Yahan aapko latest movies, multip
 
 ⚠️ **Note:** Copyright protection ke liye files 30 minutes baad auto-delete ho jayengi, isliye save ya forward kar lein!"""
 
-    ABOUT_BOT_TEXT = f"""╭────[ 🎬 **{BRAND_NAME} BOT** ]────⍟
+    ABOUT_BOT_TEXT = f"""╭───[🎬 **{BRAND_NAME} BOT** ]────⍟
 │
-├🔸 **Bot Name:** {BRAND_NAME} Store (@{BOT_USERNAME})
-├🔸 **Library:** Pyrogram / Pyrofork (Python 3)
-├🔸 **Database:** MongoDB Atlas
-├🔸 **Features:** 
+├🔵 **Bot Name:** {BRAND_NAME} Store (@{BOT_USERNAME})
+├🔵 **Library:** Pyrogram / Pyrofork (Python 3)
+├🔵 **Database:** MongoDB Atlas
+├🔵 **Features:** 
 │  • Auto Movie Indexing
 │  • Active Movie Session Manager
 │  • Multiple Quality Grouping
 │  • Auto Video Poster Extraction
 │  • Netflix-Inspired Cards
 │
-╰──────[ 🍿 Enjoy Streaming ]───────────⍟"""
+╰──────[ 🍿 Enjoy Streaming ]──────────⍟"""
 
-    ABOUT_DEV_TEXT = f"""🧑🏻‍💻 **Developer & Owner Info**
+    ABOUT_DEV_TEXT = f"""🧑‍💻 **Developer & Owner Info**
 
 ⚡ **Bot System:** {BRAND_NAME} Automatic File Store
 👑 **Owner:** @{OWNER_USERNAME}
