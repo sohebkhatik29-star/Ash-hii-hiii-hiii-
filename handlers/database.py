@@ -2,6 +2,7 @@
 # ASH AUTOMATIC MOVIE FILE STORE BOT 🎬
 # Module: handlers/database.py
 # Purpose: Dual-Persistent Database Engine (MongoDB Atlas + Local Safe Storage)
+#          Ensures zero data loss, survives restarts, and never fails links.
 # ==============================================================================
 
 import datetime
@@ -35,6 +36,7 @@ class Database:
         self.movies_col = None
         self.sessions_col = None
         self.has_mongo = False
+        self._mem_user_meta = {}
 
         if uri:
             try:
@@ -133,7 +135,115 @@ class Database:
         return False
 
     async def get_ban_status(self, user_id: int) -> dict:
-        return {"is_banned": False, "ban_reason": ""}
+        uid = int(user_id)
+        if self.has_mongo and self.users_col is not None:
+            try:
+                doc = await self.users_col.find_one({"user_id": uid})
+                if doc:
+                    return {
+                        "is_banned": bool(doc.get("is_banned", False)),
+                        "ban_reason": doc.get("ban_reason") or "",
+                        "warn_count": int(doc.get("warn_count") or 0),
+                    }
+            except Exception as e:
+                logger.warning(f"[DB] get_ban_status: {e}")
+        mem = self._mem_user_meta.get(uid) or {}
+        return {
+            "is_banned": bool(mem.get("is_banned", False)),
+            "ban_reason": mem.get("ban_reason") or "",
+            "warn_count": int(mem.get("warn_count") or 0),
+        }
+
+    async def add_warning(self, user_id: int, reason: str = "", admin_id: int = 0) -> dict:
+        uid = int(user_id)
+        meta = self._mem_user_meta.get(uid) or {"warn_count": 0, "is_banned": False, "ban_reason": "", "warnings": []}
+        if self.has_mongo and self.users_col is not None:
+            try:
+                doc = await self.users_col.find_one({"user_id": uid})
+                if doc:
+                    meta["warn_count"] = int(doc.get("warn_count") or 0)
+                    meta["is_banned"] = bool(doc.get("is_banned", False))
+                    meta["ban_reason"] = doc.get("ban_reason") or ""
+                    meta["warnings"] = list(doc.get("warnings") or [])
+            except Exception as e:
+                logger.warning(f"[DB] add_warning load: {e}")
+
+        meta["warn_count"] = int(meta.get("warn_count") or 0) + 1
+        meta.setdefault("warnings", []).append({
+            "reason": reason or "Rule break",
+            "admin_id": admin_id,
+            "at": datetime.datetime.utcnow().isoformat(),
+        })
+        if meta["warn_count"] >= 3:
+            meta["is_banned"] = True
+            meta["ban_reason"] = reason or "3 warnings — 1 request per day rule broken"
+
+        self._mem_user_meta[uid] = meta
+        if self.has_mongo and self.users_col is not None:
+            try:
+                await self.users_col.update_one(
+                    {"user_id": uid},
+                    {"$set": {
+                        "user_id": uid,
+                        "warn_count": meta["warn_count"],
+                        "is_banned": meta["is_banned"],
+                        "ban_reason": meta["ban_reason"],
+                        "warnings": meta["warnings"],
+                        "updated_at": datetime.datetime.utcnow().isoformat(),
+                    }},
+                    upsert=True,
+                )
+            except Exception as e:
+                logger.warning(f"[DB] add_warning save: {e}")
+        return {
+            "warn_count": meta["warn_count"],
+            "is_banned": meta["is_banned"],
+            "ban_reason": meta["ban_reason"],
+        }
+
+    async def set_user_ban(self, user_id: int, banned: bool = True, reason: str = "") -> bool:
+        uid = int(user_id)
+        meta = self._mem_user_meta.get(uid) or {"warn_count": 0}
+        meta["is_banned"] = bool(banned)
+        meta["ban_reason"] = reason if banned else ""
+        if not banned:
+            meta["warn_count"] = 0
+            meta["warnings"] = []
+        self._mem_user_meta[uid] = meta
+        if self.has_mongo and self.users_col is not None:
+            try:
+                await self.users_col.update_one(
+                    {"user_id": uid},
+                    {"$set": {
+                        "user_id": uid,
+                        "is_banned": meta["is_banned"],
+                        "ban_reason": meta["ban_reason"],
+                        "warn_count": meta["warn_count"],
+                        "warnings": meta.get("warnings", []),
+                        "updated_at": datetime.datetime.utcnow().isoformat(),
+                    }},
+                    upsert=True,
+                )
+            except Exception as e:
+                logger.warning(f"[DB] set_user_ban: {e}")
+                return False
+        return True
+
+    async def unban_user(self, user_id: int) -> bool:
+        return await self.set_user_ban(user_id, banned=False, reason="")
+
+    async def delete_all_filters(self) -> int:
+        count = len(self._mem_movies)
+        self._mem_movies = {}
+        self._save_local_movies()
+        if self.has_mongo and self.movies_col is not None:
+            try:
+                result = await self.movies_col.delete_many({})
+                count = max(count, result.deleted_count)
+            except Exception as e:
+                logger.error(f"[DB] delete_all_filters: {e}")
+        logger.info(f"[DB] delete_all_filters → {count} removed")
+        return count
 
     async def total_users_count(self) -> int:
         if self.has_mongo:
@@ -151,8 +261,8 @@ class Database:
                 pass
         return list(self._mem_users)
 
-    async def ban_user(self, user_id: int):
-        pass
+    async def ban_user(self, user_id: int, reason: str = "Banned by admin"):
+        return await self.set_user_ban(user_id, banned=True, reason=reason)
 
     def generate_movie_id(self) -> str:
         return str(uuid.uuid4())[:8]
@@ -449,47 +559,48 @@ class Database:
         return deleted_titles
 
     async def list_movies(self, limit: int = 10, skip: int = 0):
-        return list(self._mem_movies.values())[skip:skip + limit]
+        all_movies = list(self._mem_movies.values())
+        return all_movies[skip:skip + limit]
 
     async def total_movies_count(self) -> int:
         return len(self._mem_movies)
 
     async def get_active_session(self, admin_id: int) -> dict:
-        sid = int(admin_id)
-        if sid in self._mem_sessions:
-            return self._mem_sessions[sid]
+        if admin_id in self._mem_sessions:
+            return self._mem_sessions[admin_id]
         if self.has_mongo:
             try:
-                doc = await self.sessions_col.find_one({"admin_id": sid})
+                doc = await self.sessions_col.find_one({"admin_id": admin_id})
                 if doc:
                     doc.pop("_id", None)
-                    self._mem_sessions[sid] = doc
+                    self._mem_sessions[admin_id] = doc
                     return doc
             except Exception as e:
                 logger.warning(f"[DB] get_active_session: {e}")
         return None
 
     async def set_active_session(self, admin_id: int, session: dict):
-        sid = int(admin_id)
-        session["admin_id"] = sid
-        self._mem_sessions[sid] = session
+        self._mem_sessions[admin_id] = session
         self._save_local_sessions()
         if self.has_mongo:
             try:
+                session = dict(session)
+                session["admin_id"] = admin_id
                 await self.sessions_col.update_one(
-                    {"admin_id": sid}, {"$set": session}, upsert=True
+                    {"admin_id": admin_id},
+                    {"$set": session},
+                    upsert=True,
                 )
             except Exception as e:
                 logger.warning(f"[DB] set_active_session: {e}")
 
     async def clear_active_session(self, admin_id: int):
-        sid = int(admin_id)
-        if sid in self._mem_sessions:
-            del self._mem_sessions[sid]
+        if admin_id in self._mem_sessions:
+            del self._mem_sessions[admin_id]
             self._save_local_sessions()
         if self.has_mongo:
             try:
-                await self.sessions_col.delete_one({"admin_id": sid})
+                await self.sessions_col.delete_one({"admin_id": admin_id})
             except Exception as e:
                 logger.warning(f"[DB] clear_active_session: {e}")
 
@@ -497,11 +608,11 @@ class Database:
         return list(self._mem_sessions.values())
 
     async def sync_from_group_and_channel(self, bot, limit: int = 500):
-        group_id = getattr(Config, "MOVIE_GROUP_ID", None)
-        if not group_id:
-            return 0
         count = 0
         try:
+            group_id = Config.MOVIE_GROUP_ID
+            if not group_id:
+                return 0
             async for msg in bot.get_chat_history(group_id, limit=limit):
                 text = (msg.caption or msg.text or "")
                 if "🎬" in text and "Available Downloads" in text:
