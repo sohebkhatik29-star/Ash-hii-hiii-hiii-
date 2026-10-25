@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 from motor.motor_asyncio import AsyncIOMotorClient
-from config import Config
+from configs import Config
 
 STOPWORDS = {
     "the","a","an","and","or","of","in","on","to","for","is","it","me","my","you",
