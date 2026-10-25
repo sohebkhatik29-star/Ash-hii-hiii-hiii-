@@ -41,7 +41,8 @@ def build_filter_results(query: str, results: list, page: int = 1, is_group: boo
         if link:
             buttons.append([InlineKeyboardButton(f"🎬 {label}", url=link)])
         else:
-            buttons.append([InlineKeyboardButton(f"🎬 {label}", callback_data=f"flt_info_{m.get('movie_id','')}")])
+            mid = m.get("movie_id") or ""
+            buttons.append([InlineKeyboardButton(f"🎬 {label}", callback_data=f"flt_info_{mid}")])
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("⬅️", callback_data=f"flt_{page-1}_{query[:40]}"))
