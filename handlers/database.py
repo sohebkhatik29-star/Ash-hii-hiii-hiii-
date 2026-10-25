@@ -1,4 +1,4 @@
-# handlers/database.py — compact working version
+# handlers/database.py — compact working version (movies_col compatible)
 from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
@@ -15,11 +15,13 @@ class Database:
     def __init__(self, url: str, name: str):
         self.client = AsyncIOMotorClient(url)
         self.db = self.client[name]
-        self.movies = self.db.movies
+        self.movies_col = self.db.movies
+        self.movies = self.movies_col
         self.force_sub = self.db.force_sub
         self.warns = self.db.warns
         self.users = self.db.users
         self.settings = self.db.settings
+        self.has_mongo = True
 
     async def search_movies(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         q = (query or "").strip().lower()
@@ -29,7 +31,7 @@ class Database:
         if not tokens:
             tokens = [q]
         regexes = [{"title": {"$regex": re.escape(t), "$options": "i"}} for t in tokens]
-        cursor = self.movies.find({"$or": regexes}).sort("created_at", -1).limit(limit * 3)
+        cursor = self.movies_col.find({"$or": regexes}).sort("created_at", -1).limit(limit * 3)
         rows = await cursor.to_list(length=limit * 3)
         scored = []
         for r in rows:
@@ -41,34 +43,34 @@ class Database:
         return [r for _, r in scored[:limit]]
 
     async def add_movie(self, doc: Dict[str, Any]) -> str:
-        res = await self.movies.insert_one(doc)
+        res = await self.movies_col.insert_one(doc)
         return str(res.inserted_id)
 
     async def get_movie(self, movie_id: str) -> Optional[Dict[str, Any]]:
         from bson import ObjectId
         try:
-            return await self.movies.find_one({"_id": ObjectId(movie_id)})
+            return await self.movies_col.find_one({"_id": ObjectId(movie_id)})
         except Exception:
-            return await self.movies.find_one({"_id": movie_id})
+            return await self.movies_col.find_one({"movie_id": movie_id})
 
     async def update_movie(self, movie_id: str, data: Dict[str, Any]) -> bool:
         from bson import ObjectId
         try:
-            res = await self.movies.update_one({"_id": ObjectId(movie_id)}, {"$set": data})
+            res = await self.movies_col.update_one({"_id": ObjectId(movie_id)}, {"$set": data})
         except Exception:
-            res = await self.movies.update_one({"_id": movie_id}, {"$set": data})
+            res = await self.movies_col.update_one({"movie_id": movie_id}, {"$set": data})
         return res.modified_count > 0
 
     async def delete_movie(self, movie_id: str) -> bool:
         from bson import ObjectId
         try:
-            res = await self.movies.delete_one({"_id": ObjectId(movie_id)})
+            res = await self.movies_col.delete_one({"_id": ObjectId(movie_id)})
         except Exception:
-            res = await self.movies.delete_one({"_id": movie_id})
+            res = await self.movies_col.delete_one({"movie_id": movie_id})
         return res.deleted_count > 0
 
     async def count_movies(self) -> int:
-        return await self.movies.count_documents({})
+        return await self.movies_col.count_documents({})
 
     async def get_force_channels(self) -> List[Dict[str, Any]]:
         return await self.force_sub.find({}).to_list(length=20)
