@@ -1,0 +1,63 @@
+# ==============================================================================
+# ASH AUTOMATIC MOVIE FILE STORE BOT
+# Module: handlers/group_filter.py
+# ==============================================================================
+
+import asyncio
+import logging
+import re
+from pyrogram import Client, filters
+from pyrogram.enums import ChatType, ChatMemberStatus
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from configs import Config
+from handlers.database import db
+from handlers.force_sub_handler import enforce_force_sub_in_group
+
+logger = logging.getLogger("GroupFilter")
+
+AUTO_DELETE_SECONDS = int(getattr(Config, "AUTO_DELETE_TIME", 1800) or 1800)
+_pending_not_found = {}
+
+
+def _safe_text(s) -> str:
+    if s is None:
+        return ""
+    if not isinstance(s, str):
+        try:
+            s = str(s)
+        except Exception:
+            return ""
+    s = re.sub(r"[\ud800-\udfff]", "", s)
+    try:
+        s = s.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    except Exception:
+        s = "".join(ch for ch in s if ord(ch) < 0xD800 or ord(ch) > 0xDFFF)
+    return s
+
+
+async def _schedule_delete(client: Client, chat_id: int, message_ids, delay: int = None):
+    delay = delay if delay is not None else AUTO_DELETE_SECONDS
+    try:
+        await asyncio.sleep(delay)
+        for mid in message_ids:
+            try:
+                await client.delete_messages(chat_id, mid)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("schedule_delete: %s", e)
+
+
+def _get_post_link(m: dict) -> str:
+    """Return ONLY direct group post link (t.me/c/...). Never bot deep-link."""
+    post_link = m.get("group_post_link") or ""
+    if post_link and "t.me/c/" in str(post_link):
+        return post_link
+    group_id = m.get("group_chat_id") or getattr(Config, "MOVIE_GROUP_ID", None)
+    msg_id = m.get("group_msg_id")
+    if msg_id and group_id:
+        try:
+            return db.make_telegram_post_link(group_id, msg_id)
+        except Exception:
+            pass
+    return ""
