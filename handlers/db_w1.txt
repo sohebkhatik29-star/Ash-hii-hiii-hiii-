@@ -1,1 +1,264 @@
-PLACEHOLDER
+# ==============================================================================
+# ASH AUTOMATIC MOVIE FILE STORE BOT
+# Module: handlers/database.py  (PLAIN full version — no b64/zlib)
+# ==============================================================================
+
+import logging
+import re
+import time
+import uuid
+from typing import List, Optional, Dict, Any
+
+import motor.motor_asyncio
+from configs import Config
+
+logger = logging.getLogger("Database")
+
+STOPWORDS = {
+    "movie", "movies", "film", "films", "full", "hd", "bluray", "webrip", "web-dl",
+    "dvdrip", "brrip", "hdtv", "x264", "x265", "hevc", "aac", "mp4", "mkv",
+    "dual", "audio", "hindi", "english", "tamil", "telugu", "malayalam",
+    "480p", "720p", "1080p", "2160p", "4k", "uhd", "cam", "ts", "tc",
+    "the", "a", "an", "of", "and", "or", "in", "on", "to", "for", "with",
+}
+
+
+class MovieDatabase:
+    def __init__(self):
+        self.has_mongo = False
+        self.client = None
+        self.db = None
+        self.movies_col = None
+        self.users_col = None
+        self.warns_col = None
+        self.force_sub_col = None
+        self.settings_col = None
+        self.sessions_col = None
+        self._mem_force_channels: List[dict] = []
+        self._mem_force_msg = None
+        self._mem_movies: List[dict] = []
+        self._mem_sessions: Dict[int, dict] = {}
+        try:
+            url = getattr(Config, "DATABASE_URL", None) or getattr(Config, "DB_URL", None)
+            name = getattr(Config, "DATABASE_NAME", None) or getattr(Config, "DB_NAME", "moviefilterbot")
+            if url:
+                self.client = motor.motor_asyncio.AsyncIOMotorClient(url, serverSelectionTimeoutMS=8000)
+                self.db = self.client[name]
+                self.movies_col = self.db["movies"]
+                self.users_col = self.db["users"]
+                self.warns_col = self.db["warns"]
+                self.force_sub_col = self.db["force_sub_channels"]
+                self.settings_col = self.db["bot_settings"]
+                self.sessions_col = self.db["sessions"]
+                self.has_mongo = True
+                logger.info("MongoDB connected: %s", name)
+        except Exception as e:
+            logger.error("Mongo init failed: %s", e)
+            self.has_mongo = False
+
+    async def init_indexes(self):
+        if not self.has_mongo:
+            return
+        try:
+            await self.movies_col.create_index([("title", "text"), ("file_name", "text"), ("normalized_title", "text")])
+            await self.movies_col.create_index("movie_id", unique=True)
+            await self.movies_col.create_index("message_id")
+            await self.movies_col.create_index("file_unique_id")
+            await self.users_col.create_index("user_id", unique=True)
+            await self.warns_col.create_index("user_id")
+            await self.force_sub_col.create_index("channel_id", unique=True)
+        except Exception as e:
+            logger.warning("init_indexes: %s", e)
+
+    def generate_movie_id(self) -> str:
+        return uuid.uuid4().hex[:12]
+
+    async def create_movie(
+        self,
+        title: str = "",
+        normalized_title: str = "",
+        year: str = "",
+        languages: list = None,
+        poster_file_id: str = None,
+        admin_id: int = 0,
+        movie_id: str = None,
+        **kwargs,
+    ) -> dict:
+        mid = movie_id or self.generate_movie_id()
+        doc = {
+            "movie_id": mid,
+            "title": title or "",
+            "normalized_title": normalized_title or (title or "").lower(),
+            "year": year or "",
+            "languages": languages or [],
+            "poster_file_id": poster_file_id,
+            "admin_id": admin_id,
+            "qualities": {},
+            "group_msg_id": None,
+            "group_chat_id": None,
+            "added_at": int(time.time()),
+            **kwargs,
+        }
+        if self.has_mongo and self.movies_col is not None:
+            try:
+                await self.movies_col.update_one(
+                    {"movie_id": mid},
+                    {"$set": doc},
+                    upsert=True,
+                )
+            except Exception as e:
+                logger.error("create_movie: %s", e)
+        else:
+            self._mem_movies = [m for m in self._mem_movies if m.get("movie_id") != mid]
+            self._mem_movies.append(doc)
+        return doc
+
+    async def add_quality_to_movie(self, movie_id: str, quality_key: str, quality_data: dict) -> bool:
+        if not movie_id or not quality_key:
+            return False
+        quality_data = dict(quality_data or {})
+        quality_data.setdefault("added_at", int(time.time()))
+        if self.has_mongo and self.movies_col is not None:
+            try:
+                await self.movies_col.update_one(
+                    {"movie_id": movie_id},
+                    {"$set": {f"qualities.{quality_key}": quality_data}},
+                    upsert=True,
+                )
+                return True
+            except Exception as e:
+                logger.error("add_quality_to_movie: %s", e)
+                return False
+        for m in self._mem_movies:
+            if m.get("movie_id") == movie_id:
+                m.setdefault("qualities", {})[quality_key] = quality_data
+                return True
+        self._mem_movies.append({"movie_id": movie_id, "qualities": {quality_key: quality_data}, "added_at": int(time.time())})
+        return True
+
+    async def get_movie(self, movie_id: str) -> Optional[dict]:
+        if not movie_id:
+            return None
+        if self.has_mongo and self.movies_col is not None:
+            try:
+                doc = await self.movies_col.find_one({"movie_id": movie_id})
+                if doc:
+                    doc["_id"] = str(doc.get("_id", ""))
+                    return doc
+            except Exception as e:
+                logger.warning("get_movie: %s", e)
+        for m in self._mem_movies:
+            if m.get("movie_id") == movie_id:
+                return m
+        return None
+
+    async def update_movie_group_post(self, movie_id: str, chat_id: int, msg_id: int) -> bool:
+        if self.has_mongo and self.movies_col is not None:
+            try:
+                await self.movies_col.update_one(
+                    {"movie_id": movie_id},
+                    {"$set": {"group_chat_id": int(chat_id), "group_msg_id": int(msg_id)}},
+                )
+                return True
+            except Exception as e:
+                logger.error("update_movie_group_post: %s", e)
+        for m in self._mem_movies:
+            if m.get("movie_id") == movie_id:
+                m["group_chat_id"] = int(chat_id)
+                m["group_msg_id"] = int(msg_id)
+                return True
+        return False
+
+    async def update_movie_poster(self, movie_id: str, poster_file_id: str) -> bool:
+        if self.has_mongo and self.movies_col is not None:
+            try:
+                await self.movies_col.update_one(
+                    {"movie_id": movie_id},
+                    {"$set": {"poster_file_id": poster_file_id}},
+                )
+                return True
+            except Exception as e:
+                logger.error("update_movie_poster: %s", e)
+        for m in self._mem_movies:
+            if m.get("movie_id") == movie_id:
+                m["poster_file_id"] = poster_file_id
+                return True
+        return False
+
+    async def delete_movie(self, movie_id: str) -> bool:
+        if self.has_mongo and self.movies_col is not None:
+            try:
+                res = await self.movies_col.delete_one({"movie_id": movie_id})
+                return res.deleted_count > 0
+            except Exception as e:
+                logger.error("delete_movie: %s", e)
+        before = len(self._mem_movies)
+        self._mem_movies = [m for m in self._mem_movies if m.get("movie_id") != movie_id]
+        return len(self._mem_movies) < before
+
+    async def delete_by_group_msg_id(self, chat_id: int, msg_id: int) -> bool:
+        if self.has_mongo and self.movies_col is not None:
+            try:
+                res = await self.movies_col.delete_one(
+                    {"group_chat_id": int(chat_id), "group_msg_id": int(msg_id)}
+                )
+                return res.deleted_count > 0
+            except Exception as e:
+                logger.error("delete_by_group_msg_id: %s", e)
+        before = len(self._mem_movies)
+        self._mem_movies = [
+            m for m in self._mem_movies
+            if not (m.get("group_chat_id") == int(chat_id) and m.get("group_msg_id") == int(msg_id))
+        ]
+        return len(self._mem_movies) < before
+
+    async def delete_all_filters(self) -> int:
+        count = 0
+        if self.has_mongo and self.movies_col is not None:
+            try:
+                res = await self.movies_col.delete_many({})
+                count = res.deleted_count
+            except Exception as e:
+                logger.error("delete_all_filters: %s", e)
+        else:
+            count = len(self._mem_movies)
+            self._mem_movies = []
+        return count
+
+    async def list_movies(self, page: int = 1, per_page: int = 20) -> List[dict]:
+        out = []
+        if self.has_mongo and self.movies_col is not None:
+            try:
+                cursor = self.movies_col.find({}).sort("added_at", -1).skip(max(0, (page - 1) * per_page)).limit(per_page)
+                async for doc in cursor:
+                    doc["_id"] = str(doc.get("_id", ""))
+                    out.append(doc)
+            except Exception as e:
+                logger.error("list_movies: %s", e)
+        else:
+            out = self._mem_movies[(page - 1) * per_page: page * per_page]
+        return out
+
+    async def total_movies_count(self) -> int:
+        if self.has_mongo and self.movies_col is not None:
+            try:
+                return await self.movies_col.count_documents({})
+            except Exception:
+                pass
+        return len(self._mem_movies)
+
+    async def total_users_count(self) -> int:
+        if self.has_mongo and self.users_col is not None:
+            try:
+                return await self.users_col.count_documents({})
+            except Exception:
+                pass
+        return 0
+
+    def make_telegram_post_link(self, chat_id: int, msg_id: int) -> str:
+        cid = str(chat_id)
+        if cid.startswith("-100"):
+            cid = cid[4:]
+        elif cid.startswith("-"):
+            cid = cid[1:]
+        return f"https://t.me/c/{cid}/{msg_id}"
