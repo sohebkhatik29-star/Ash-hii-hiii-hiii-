@@ -12,6 +12,7 @@ from typing import Tuple, Optional
 from pyrogram import Client
 from pyrogram.types import Message
 from configs import Config
+from handlers.parser import sanitize_text
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,8 @@ async def extract_poster_from_message(bot: Client, message: Message) -> Tuple[Op
             return None, "none"
 
         # Download small thumbnail (~20-50 KB) locally
-        logger.info(f"Downloading embedded thumbnail for {getattr(media, 'file_name', 'media')}...")
+        safe_name = sanitize_text(getattr(media, "file_name", "") or "media")
+        logger.info(f"Downloading embedded thumbnail for {safe_name}...")
         thumb_path = await bot.download_media(thumb)
 
         if thumb_path and os.path.exists(thumb_path):
@@ -52,7 +54,7 @@ async def extract_poster_from_message(bot: Client, message: Message) -> Tuple[Op
                 sent_photo = await bot.send_photo(
                     chat_id=target_channel,
                     photo=thumb_path,
-                    caption=f"🖼 Poster extracted for {getattr(media, 'file_name', 'Movie')}"
+                    caption=f"Poster extracted for {sanitize_text(getattr(media, 'file_name', '') or 'Movie')}"
                 )
                 if sent_photo and sent_photo.photo:
                     photo_file_id = sent_photo.photo.file_id
@@ -67,6 +69,6 @@ async def extract_poster_from_message(bot: Client, message: Message) -> Tuple[Op
                         pass
 
     except Exception as e:
-        logger.warning(f"[Poster Extraction Error]: {e}")
+        logger.warning(f"[Poster Extraction Error]: {type(e).__name__}: {e}")
 
     return None, "none"
