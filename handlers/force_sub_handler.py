@@ -1,9 +1,6 @@
-# compressed loader — needs force_sub_handler_src_1.b64 .. _3.b64
+# -*- coding: utf-8 -*-
+# Self-contained force_sub_handler — no external .b64 needed
 import zlib, base64
-from pathlib import Path
-_dir = Path(__file__).parent
-_b64 = ""
-for _i in range(1, 3+1):
-    _b64 += (_dir / f"force_sub_handler_src_{_i}.b64").read_text(encoding="utf-8").strip()
-_src = zlib.decompress(base64.b64decode(_b64)).decode("utf-8")
+_SRC_B64 = """REPLACE_ME"""
+_src = zlib.decompress(base64.b64decode(_SRC_B64)).decode("utf-8")
 exec(compile(_src, __file__, "exec"), globals())
