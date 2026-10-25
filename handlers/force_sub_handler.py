@@ -1,4 +1,4 @@
-"""Force-sub: channel join required before group search. UI = channel name + Joined/Try Again only."""
+"""Force-sub: channel join required. UI = channel name + Joined/Try Again only."""
 import logging
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -15,7 +15,6 @@ try:
 except Exception:
     db = None
 
-# In-memory pending join requests: (user_id, channel_id) -> True
 _PENDING_REQUESTS = {}
 
 DEFAULT_FORCE_MSG = (
@@ -103,7 +102,7 @@ async def get_missing_channels(bot, user_id: int):
         if await check_user_in_channel(bot, user_id, cid):
             continue
         if mode == "request" and await has_pending_join_request(bot, user_id, cid):
-            continue  # pending = ok, skip
+            continue
         missing.append(ch)
     return missing
 
@@ -135,7 +134,7 @@ async def build_force_sub_prompt(bot, user_name, missing, pending_query=""):
             url = f"https://t.me/{str(ch['username']).lstrip('@')}"
         else:
             url = None
-        # ONLY channel name (no Request: prefix, no Maine request bhej diya)
+        # ONLY channel name + Joined/Try Again (no Maine request button)
         label = (title or str(cid))[:60]
         if url:
             buttons.append([InlineKeyboardButton(label, url=url)])
@@ -188,13 +187,52 @@ async def enforce_force_sub_in_group(bot, message, query=""):
         logger.warning("send force prompt: %s", e)
     return True
 
+async def handle_force_sub(bot: Client, cmd: Message) -> int:
+    """Used by /start. Returns 400 if user must join channels first, else 200."""
+    try:
+        if not cmd.from_user:
+            return 200
+        uid = cmd.from_user.id
+        if uid in (Config.ADMINS or []):
+            return 200
+        if not db:
+            return 200
+        try:
+            channels = await db.list_force_channels()
+        except Exception:
+            channels = []
+        if channels:
+            missing = await get_missing_channels(bot, uid)
+            if not missing:
+                return 200
+            name = _display_user(cmd.from_user)
+            text, markup = await build_force_sub_prompt(bot, name, missing)
+            try:
+                await bot.send_message(
+                    chat_id=cmd.chat.id, text=text, reply_markup=markup,
+                    disable_web_page_preview=True
+                )
+            except Exception as e:
+                logger.warning("handle_force_sub prompt: %s", e)
+            return 400
+        return 200
+    except Exception as e:
+        logger.warning("handle_force_sub error (allowing user): %s", e)
+        return 200
+
+async def handle_fs_callback(client: Client, query: CallbackQuery):
+    """Admin force-sub management callbacks. Safe no-op if unused."""
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
 def register_force_sub_handlers(bot: Client):
     @bot.on_callback_query(filters.regex(r"^fs_refresh"))
     async def fs_refresh_cb(client: Client, query: CallbackQuery):
         user = query.from_user
         if not user:
             return
-        data = query.data or "fs_refresh"
         missing = await get_missing_channels(client, user.id)
         if missing:
             try:
