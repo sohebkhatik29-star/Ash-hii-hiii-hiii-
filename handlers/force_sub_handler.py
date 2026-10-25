@@ -27,6 +27,8 @@ DEFAULT_FORCE_MSG = (
     "Pehle join karo, fir aap group me search / use kar sakte ho."
 )
 _FS_PENDING: dict = {}
+# (channel_id, user_id) -> timestamp for users who already sent join-request
+_PENDING_REQUESTS: dict = {}
 
 
 def _safe_text(s) -> str:
@@ -120,6 +122,27 @@ async def check_user_in_channel(bot: Client, channel_id: int, user_id: int) -> s
         return "error"
 
 
+async def has_pending_join_request(bot: Client, channel_id: int, user_id: int) -> bool:
+    """Request-mode: user already sent join-request but admin not approved yet → treat as OK."""
+    try:
+        try:
+            async for req in bot.get_chat_join_requests(channel_id, limit=1, query=str(user_id)):
+                if req.user and req.user.id == user_id:
+                    return True
+                break
+        except TypeError:
+            pass
+        async for req in bot.get_chat_join_requests(channel_id, limit=100):
+            if req.user and req.user.id == user_id:
+                return True
+    except Exception as e:
+        logger.debug("pending join request check %s: %s", channel_id, e)
+    key = (int(channel_id), int(user_id))
+    if key in _PENDING_REQUESTS:
+        return True
+    return False
+
+
 async def get_missing_channels(bot: Client, user_id: int) -> List[dict]:
     try:
         channels = await db.list_force_channels()
@@ -129,8 +152,15 @@ async def get_missing_channels(bot: Client, user_id: int) -> List[dict]:
     missing = []
     for ch in channels:
         try:
-            status = await check_user_in_channel(bot, int(ch["channel_id"]), user_id)
-            if status in ("not_joined", "kicked"):
+            cid = int(ch["channel_id"])
+            status = await check_user_in_channel(bot, cid, user_id)
+            if status == "ok":
+                continue
+            mode = (ch.get("mode") or "normal").lower()
+            if mode == "request" and status in ("not_joined", "error"):
+                if await has_pending_join_request(bot, cid, user_id):
+                    continue
+            if status in ("not_joined", "kicked", "error"):
                 missing.append(ch)
         except Exception:
             missing.append(ch)
@@ -371,7 +401,10 @@ async def handle_fs_callback(client: Client, query: CallbackQuery):
         missing = await get_missing_channels(client, user.id)
         if missing:
             try:
-                await query.answer("Abhi join nahi kiya! Pehle join/request karo.", show_alert=True)
+                await query.answer(
+                    "Abhi join/request complete nahi. Request mode me pehle Request button dabao, phir Try Again.",
+                    show_alert=True,
+                )
             except Exception:
                 pass
             text, markup = await build_force_sub_prompt(client, user.first_name or "User", missing)
@@ -414,6 +447,22 @@ async def handle_fs_callback(client: Client, query: CallbackQuery):
 
 
 def register_force_sub_handlers(bot: Client):
+
+    @bot.on_chat_join_request()
+    async def _on_join_request(client: Client, request):
+        """Mark user as pending so force-sub Try Again works before admin approves."""
+        try:
+            cid = int(request.chat.id)
+            uid = int(request.from_user.id) if request.from_user else None
+            if uid:
+                _PENDING_REQUESTS[(cid, uid)] = asyncio.get_event_loop().time()
+                now = asyncio.get_event_loop().time()
+                stale = [k for k, ts in _PENDING_REQUESTS.items() if now - ts > 86400]
+                for k in stale:
+                    _PENDING_REQUESTS.pop(k, None)
+                logger.info("join-request pending marked ch=%s user=%s", cid, uid)
+        except Exception as e:
+            logger.debug("on_join_request: %s", e)
 
     @bot.on_message(filters.command(["add_force_chnl", "addforce", "add_force_channel"]) & filters.group)
     async def add_force_chnl_cmd(client: Client, message: Message):
