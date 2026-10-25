@@ -96,6 +96,7 @@ class MovieDatabase:
             "qualities": {},
             "group_msg_id": None,
             "group_chat_id": None,
+            "group_post_link": None,
             "added_at": int(time.time()),
             **kwargs,
         }
@@ -153,19 +154,24 @@ class MovieDatabase:
         return None
 
     async def update_movie_group_post(self, movie_id: str, chat_id: int, msg_id: int) -> bool:
+        link = self.make_telegram_post_link(int(chat_id), int(msg_id))
+        payload = {
+            "group_chat_id": int(chat_id),
+            "group_msg_id": int(msg_id),
+            "group_post_link": link,
+        }
         if self.has_mongo and self.movies_col is not None:
             try:
                 await self.movies_col.update_one(
                     {"movie_id": movie_id},
-                    {"$set": {"group_chat_id": int(chat_id), "group_msg_id": int(msg_id)}},
+                    {"$set": payload},
                 )
                 return True
             except Exception as e:
                 logger.error("update_movie_group_post: %s", e)
         for m in self._mem_movies:
             if m.get("movie_id") == movie_id:
-                m["group_chat_id"] = int(chat_id)
-                m["group_msg_id"] = int(msg_id)
+                m.update(payload)
                 return True
         return False
 
