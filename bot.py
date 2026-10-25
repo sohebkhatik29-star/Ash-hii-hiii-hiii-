@@ -63,7 +63,7 @@ async def addmovie_command(bot: Client, cmd: Message):
             await cmd.reply_text("⚠️ Sirf admin /addmovie use kar sakte hain.", quote=True)
             return
         status_msg = await cmd.reply_text(
-            "🎬 <b>Movie Upload Session Started</b>\n\n"
+            "🎬 <b>Movie Upload Session Started</b> (v3)\n\n"
             "Pehli video file abhi bhejo.\n"
             "Uske baad same movie ki aur qualities add kar sakte ho, ya Generate Links dabao.",
             reply_markup=InlineKeyboardMarkup([
@@ -73,9 +73,9 @@ async def addmovie_command(bot: Client, cmd: Message):
         )
         await session_mgr.start_addmovie_session(admin_id, status_msg.id, cmd.chat.id)
     except Exception as e:
-        logger.error(f"addmovie_command error: {e}", exc_info=True)
+        logger.error(f"addmovie_command error: {type(e).__name__}: {e}")
         try:
-            await cmd.reply_text(f"❌ Error: <code>{e}</code>", quote=True)
+            await cmd.reply_text(f"❌ Error: <code>{type(e).__name__}</code>", quote=True)
         except Exception:
             pass
 
@@ -105,7 +105,7 @@ async def auto_movie_upload_listener(bot: Client, message: Message):
             return
         await handle_incoming_movie_file(bot, message)
     except Exception as e:
-        logger.error(f"auto_movie_upload_listener error: {e}", exc_info=True)
+        logger.error(f"auto_movie_upload_listener error: {type(e).__name__}: {e}")
 
 register_start_handlers(Bot)
 register_admin_handlers(Bot)
@@ -189,13 +189,13 @@ async def main():
             await Bot.send_message(
                 chat_id=Config.LOG_CHANNEL,
                 text=f"🎬 <b>@{bot_info.username or Config.BOT_USERNAME} is RESTARTED ✅</b>\n\n"
-                     f"⚡ <b>Status:</b> Live\n"
+                     f"⚡ <b>Status:</b> Live (v3)\n"
                      f"🍿 <b>{Config.BRAND_NAME}</b>\n"
                      f"👑 @{Config.OWNER_USERNAME}"
             )
         except Exception as err:
             logger.warning(f"LOG_CHANNEL: {err}")
-    logger.info("Bot is fully online.")
+    logger.info("Bot is fully online (v3).")
     await idle()
     await Bot.stop()
 
