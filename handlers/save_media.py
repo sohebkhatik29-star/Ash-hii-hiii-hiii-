@@ -1,4 +1,4 @@
-# compressed loader v3.1 link-fix
+# compressed loader v3.2 poster-restored
 import zlib, base64
 from pathlib import Path
 _dir = Path(__file__).parent
