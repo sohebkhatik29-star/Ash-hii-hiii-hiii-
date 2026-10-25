@@ -1,1 +1,156 @@
-# PLACEHOLDER_SM1_WILL_FIX
+# ==============================================================================
+# ASH AUTOMATIC MOVIE FILE STORE BOT
+# Module: handlers/save_media.py
+# Purpose: Instant /addmovie media handling. Surrogate-safe. Poster restored.
+# Version: 2026-10-25-v3.2-poster
+# ==============================================================================
+
+import asyncio
+import logging
+from pyrogram import Client
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait
+from configs import Config
+from handlers.database import db
+from handlers.session_manager import session_mgr
+from handlers.parser import parse_quality_from_filename, sanitize_text
+from handlers.poster import extract_poster_from_message
+
+logger = logging.getLogger("SaveMedia")
+
+
+def _kb_session():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📤 Continue Upload", callback_data="session_continue"),
+            InlineKeyboardButton("🔗 Generate Links", callback_data="session_generate"),
+        ],
+        [InlineKeyboardButton("❌ Cancel Session", callback_data="session_cancel")],
+    ])
+
+
+async def handle_incoming_movie_file(bot: Client, message: Message):
+    """Process one video/document sent during an active /addmovie session."""
+    admin_id = message.from_user.id if message.from_user else 0
+    if admin_id not in Config.ADMINS:
+        return
+    session = await session_mgr.get_session(admin_id)
+    if not session:
+        await message.reply_text("Koi active movie session nahi hai. Pehle /addmovie chalao.", quote=True)
+        return
+
+    try:
+        file_name = ""
+        file_size = 0
+        file_id = None
+        duration = 0
+        if message.video:
+            file_name = message.video.file_name or f"video_{message.video.file_unique_id}.mp4"
+            file_size = message.video.file_size or 0
+            file_id = message.video.file_id
+            duration = message.video.duration or 0
+        elif message.document:
+            file_name = message.document.file_name or f"doc_{message.document.file_unique_id}"
+            file_size = message.document.file_size or 0
+            file_id = message.document.file_id
+        else:
+            await message.reply_text("Sirf video/document support hai.", quote=True)
+            return
+
+        file_name = sanitize_text(file_name)
+        quality_key, quality_label = parse_quality_from_filename(file_name)
+
+        # Forward to DB channel
+        try:
+            forwarded = await message.forward(Config.DB_CHANNEL)
+            db_msg_id = forwarded.id
+            db_chat_id = Config.DB_CHANNEL
+        except Exception as e:
+            logger.error(f"forward DB_CHANNEL: {e}")
+            await message.reply_text(f"File process fail: {type(e).__name__}: {e}", quote=True)
+            return
+
+        # Poster once
+        extracted_poster = None
+        if not session.get("poster_file_id"):
+            try:
+                extracted_poster = await extract_poster_from_message(bot, message)
+                if extracted_poster:
+                    session["poster_file_id"] = extracted_poster
+            except Exception as e:
+                logger.debug(f"poster: {e}")
+
+        # Create movie on first file
+        movie_id = session.get("movie_id")
+        if not movie_id:
+            title = session.get("title") or file_name.rsplit(".", 1)[0]
+            title = sanitize_text(title)[:120]
+            norm = sanitize_text(title.lower())
+            doc = await db.create_movie(
+                title=title,
+                normalized_title=norm,
+                poster_file_id=session.get("poster_file_id"),
+            )
+            movie_id = doc.get("movie_id")
+            session["movie_id"] = movie_id
+            session["title"] = title
+            await session_mgr.update_session(admin_id, session)
+
+        quality_data = {
+            "file_id": file_id,
+            "file_name": file_name,
+            "file_size": file_size,
+            "db_msg_id": db_msg_id,
+            "db_chat_id": db_chat_id,
+            "duration": duration,
+            "label": quality_label or quality_key,
+        }
+        ok = await db.add_quality_to_movie(movie_id, quality_key or "default", quality_data)
+        session.setdefault("qualities", {})[quality_key or "default"] = quality_data
+        await session_mgr.update_session(admin_id, session)
+
+        size_mb = file_size / (1024 * 1024) if file_size else 0
+        size_str = f"{size_mb:.2f} MB" if size_mb < 1024 else f"{size_mb/1024:.2f} GB"
+        await message.reply_text(
+            f"✅ <b>Added:</b> <code>{quality_label or quality_key}</code> ({size_str})\n"
+            f"Movie ID: <code>{movie_id}</code>\n"
+            f"Poster: {'✅' if session.get('poster_file_id') else '❌'}\n\n"
+            f"Aur qualities bhejo ya Generate Links dabao.",
+            reply_markup=_kb_session(),
+            quote=True,
+        )
+    except Exception as e:
+        logger.exception("handle_incoming_movie_file")
+        await message.reply_text(f"File process fail: {type(e).__name__}: {e}", quote=True)
+
+
+async def handle_generate_links_action(bot: Client, chat_id: int, admin_id: int):
+    """Finish session: post movie card in group, save group_msg_id."""
+    session = await session_mgr.get_session(admin_id)
+    if not session or not session.get("movie_id"):
+        try:
+            await bot.send_message(chat_id, "Koi active movie session nahi hai.")
+        except Exception:
+            pass
+        return
+
+    movie_id = session["movie_id"]
+    movie = await db.get_movie(movie_id)
+    if not movie:
+        await bot.send_message(chat_id, "Movie DB me nahi mili.")
+        return
+
+    try:
+        from handlers.movie_card import build_and_send_movie_card
+        msg = await build_and_send_movie_card(bot, movie)
+        if msg:
+            await db.update_movie_group_post(movie_id, msg.chat.id, msg.id)
+            await bot.send_message(
+                chat_id,
+                f"✅ <b>{movie.get('title')}</b> group me post ho gaya!\n"
+                f"Link: https://t.me/c/{str(msg.chat.id)[4:]}/{msg.id}",
+            )
+        await session_mgr.cancel_session(admin_id)
+    except Exception as e:
+        logger.exception("generate_links")
+        await bot.send_message(chat_id, f"Error: {type(e).__name__}: {e}")
