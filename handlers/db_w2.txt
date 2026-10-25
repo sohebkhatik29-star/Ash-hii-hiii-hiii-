@@ -1,9 +1,10 @@
 
     # -------------------- search --------------------
-    async def search_movies(self, query: str, page: int = 1, per_page: int = 10) -> dict:
+    async def search_movies(self, query: str, page: int = 1, per_page: int = 50):
+        """Return a LIST of movie docs (group_filter expects a list, not dict)."""
         q = (query or "").strip()
         if not q:
-            return {"results": [], "total": 0, "page": page, "per_page": per_page}
+            return []
         tokens = [
             t.lower()
             for t in re.split(r"[\s\-_\.]+", q)
@@ -12,7 +13,6 @@
         if not tokens:
             tokens = [q.lower()]
         results = []
-        total = 0
         if self.has_mongo and self.movies_col is not None:
             try:
                 and_clauses = []
@@ -25,8 +25,14 @@
                             {"caption": {"$regex": re.escape(tok), "$options": "i"}},
                         ]
                     })
-                filt = {"$and": and_clauses} if len(and_clauses) > 1 else (and_clauses[0] if and_clauses else {})
-                total = await self.movies_col.count_documents(filt)
+                # majority match: if many tokens, require at least half
+                if len(and_clauses) >= 3:
+                    # use $or of all token matches, score later conceptually — keep AND for precision
+                    filt = {"$and": and_clauses}
+                elif len(and_clauses) > 1:
+                    filt = {"$and": and_clauses}
+                else:
+                    filt = and_clauses[0] if and_clauses else {}
                 cursor = (
                     self.movies_col.find(filt)
                     .sort("added_at", -1)
@@ -35,6 +41,14 @@
                 )
                 async for doc in cursor:
                     doc["_id"] = str(doc.get("_id", ""))
+                    # ensure group_post_link for filter UI
+                    if not doc.get("group_post_link") and doc.get("group_msg_id") and doc.get("group_chat_id"):
+                        try:
+                            doc["group_post_link"] = self.make_telegram_post_link(
+                                doc["group_chat_id"], doc["group_msg_id"]
+                            )
+                        except Exception:
+                            pass
                     results.append(doc)
             except Exception as e:
                 logger.error("search_movies: %s", e)
@@ -43,9 +57,8 @@
                 hay = f"{m.get('title','')} {m.get('normalized_title','')} {m.get('file_name','')} {m.get('caption','')}".lower()
                 if all(t in hay for t in tokens):
                     results.append(m)
-            total = len(results)
             results = results[(page - 1) * per_page: page * per_page]
-        return {"results": results, "total": total, "page": page, "per_page": per_page}
+        return results
 
     # -------------------- users / bans --------------------
     async def add_user(self, user_id: int, name: str = ""):
