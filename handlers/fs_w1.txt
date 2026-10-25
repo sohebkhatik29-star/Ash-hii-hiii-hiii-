@@ -1,1 +1,171 @@
-# PLACEHOLDER_FS_W1
+# ==============================================================================
+# handlers/force_sub_handler.py — multi-channel force-sub (PLAIN)
+# ==============================================================================
+import logging
+from pyrogram import Client, filters
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ChatJoinRequest
+from pyrogram.enums import ChatMemberStatus
+from configs import Config
+
+logger = logging.getLogger("ForceSub")
+
+try:
+    from handlers.force_sub_db import (
+        get_force_channels, add_force_channel, remove_force_channel,
+        fs_mark_req, has_pending_join_request,
+    )
+except Exception:
+    async def get_force_channels():
+        return []
+    async def add_force_channel(*a, **k):
+        return False
+    async def remove_force_channel(*a, **k):
+        return False
+    async def fs_mark_req(*a, **k):
+        pass
+    async def has_pending_join_request(*a, **k):
+        return False
+
+def _display_user(user):
+    if not user:
+        return "User"
+    if user.username:
+        return f"@{user.username}"
+    name = (user.first_name or "") + (" " + (user.last_name or "") if user.last_name else "")
+    return name.strip() or str(user.id)
+
+async def check_user_in_channel(client: Client, user_id: int, channel_id) -> bool:
+    try:
+        m = await client.get_chat_member(channel_id, user_id)
+        return m.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except Exception:
+        return False
+
+async def get_missing_channels(client: Client, user_id: int) -> list:
+    channels = await get_force_channels()
+    missing = []
+    for ch in channels:
+        cid = ch.get("channel_id") or ch.get("id")
+        if not cid:
+            continue
+        ok = await check_user_in_channel(client, user_id, cid)
+        if not ok:
+            pending = await has_pending_join_request(user_id, cid)
+            if not pending:
+                missing.append(ch)
+    return missing
+
+async def build_force_sub_prompt(user, missing_channels):
+    lines = [f"Hello {_display_user(user)}", "", "Join these channel(s):"]
+    keyboard = []
+    for ch in missing_channels:
+        title = ch.get("title") or ch.get("name") or "Channel"
+        link = ch.get("invite_link") or ch.get("link") or ""
+        if link:
+            keyboard.append([InlineKeyboardButton(text=f"{title}", url=link)])
+        else:
+            keyboard.append([InlineKeyboardButton(text=f"{title}", callback_data="force_sub_noop")])
+    keyboard.append([
+        InlineKeyboardButton(text="✅ Joined", callback_data="force_sub_joined"),
+        InlineKeyboardButton(text="🔄 Try Again", callback_data="force_sub_try"),
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+async def enforce_force_sub_in_group(client: Client, message: Message) -> bool:
+    user = message.from_user
+    if not user:
+        return False
+    if user.id in getattr(Config, "ADMINS", []) or user.id == getattr(Config, "BOT_OWNER", 0):
+        return False
+    missing = await get_missing_channels(client, user.id)
+    if not missing:
+        return False
+    text, kb = await build_force_sub_prompt(user, missing)
+    try:
+        await message.reply_text(text, reply_markup=kb, quote=True)
+    except Exception as e:
+        logger.error(f"force_sub prompt: {e}")
+    return True
+
+async def handle_force_sub(client: Client, message: Message):
+    await enforce_force_sub_in_group(client, message)
+
+async def handle_fs_callback(client: Client, query: CallbackQuery):
+    data = query.data or ""
+    user = query.from_user
+    if data in ("force_sub_joined", "force_sub_try"):
+        missing = await get_missing_channels(client, user.id)
+        if not missing:
+            await query.message.edit_text("✅ Thank you! Ab movie search kar sakte ho.")
+            await query.answer("Joined!")
+            return
+        text, kb = await build_force_sub_prompt(user, missing)
+        try:
+            await query.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            pass
+        await query.answer("Abhi channels join nahi hue" if missing else "OK", show_alert=bool(missing))
+    else:
+        await query.answer()
+
+def register_force_sub_handlers(bot: Client):
+    @bot.on_callback_query(filters.regex(r"^force_sub_"))
+    async def _fs_cb(client: Client, query: CallbackQuery):
+        await handle_fs_callback(client, query)
+
+    @bot.on_chat_join_request()
+    async def _on_join_req(client: Client, req: ChatJoinRequest):
+        try:
+            await fs_mark_req(req.from_user.id, req.chat.id)
+        except Exception as e:
+            logger.debug(f"join_req: {e}")
+
+    @bot.on_message(filters.command(["add_force_chnl", "addforce"]) & filters.private)
+    async def add_force_cmd(client: Client, message: Message):
+        if message.from_user.id not in getattr(Config, "ADMINS", []):
+            return
+        parts = (message.text or "").split(None, 2)
+        if len(parts) < 3:
+            await message.reply_text("Usage: /add_force_chnl <channel_id> <invite_link>", quote=True)
+            return
+        try:
+            cid = int(parts[1])
+        except ValueError:
+            await message.reply_text("channel_id number hona chahiye", quote=True)
+            return
+        link = parts[2].strip()
+        title = f"Channel {cid}"
+        try:
+            chat = await client.get_chat(cid)
+            title = chat.title or title
+        except Exception:
+            pass
+        ok = await add_force_channel(channel_id=cid, title=title, invite_link=link)
+        await message.reply_text("✅ Added" if ok else "❌ Fail / already 7 channels", quote=True)
+
+    @bot.on_message(filters.command(["del_force_chnl", "delforce"]) & filters.private)
+    async def del_force_cmd(client: Client, message: Message):
+        if message.from_user.id not in getattr(Config, "ADMINS", []):
+            return
+        parts = (message.text or "").split()
+        if len(parts) < 2:
+            await message.reply_text("Usage: /del_force_chnl <channel_id>", quote=True)
+            return
+        try:
+            cid = int(parts[1])
+        except ValueError:
+            await message.reply_text("channel_id number", quote=True)
+            return
+        ok = await remove_force_channel(cid)
+        await message.reply_text("✅ Removed" if ok else "❌ Not found", quote=True)
+
+    @bot.on_message(filters.command(["force_channels", "listforce"]) & filters.private)
+    async def list_force_cmd(client: Client, message: Message):
+        if message.from_user.id not in getattr(Config, "ADMINS", []):
+            return
+        chs = await get_force_channels()
+        if not chs:
+            await message.reply_text("No force channels.", quote=True)
+            return
+        lines = [f"• {c.get('title')} (`{c.get('channel_id')}`)" for c in chs]
+        await message.reply_text("Force channels:\n" + "\n".join(lines), quote=True)
