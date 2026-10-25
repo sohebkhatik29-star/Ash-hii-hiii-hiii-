@@ -1,55 +1,19 @@
 # ==============================================================================
-# ASH AUTOMATIC MOVIE FILE STORE BOT
-# Module: handlers/group_filter.py
+# handlers/group_filter.py — search / find / filter / direct text (PLAIN)
 # ==============================================================================
-
 import asyncio
 import logging
 import re
 from pyrogram import Client, filters
-from pyrogram.enums import ChatType, ChatMemberStatus
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from configs import Config
 from handlers.database import db
 from handlers.force_sub_handler import enforce_force_sub_in_group
 
 logger = logging.getLogger("GroupFilter")
-
 AUTO_DELETE_SECONDS = int(getattr(Config, "AUTO_DELETE_TIME", 1800) or 1800)
-_pending_not_found = {}
-
-
-def _safe_text(s) -> str:
-    if s is None:
-        return ""
-    if not isinstance(s, str):
-        try:
-            s = str(s)
-        except Exception:
-            return ""
-    s = re.sub(r"[\ud800-\udfff]", "", s)
-    try:
-        s = s.encode("utf-8", "ignore").decode("utf-8", "ignore")
-    except Exception:
-        s = "".join(ch for ch in s if ord(ch) < 0xD800 or ord(ch) > 0xDFFF)
-    return s
-
-
-async def _schedule_delete(client: Client, chat_id: int, message_ids, delay: int = None):
-    delay = delay if delay is not None else AUTO_DELETE_SECONDS
-    try:
-        await asyncio.sleep(delay)
-        for mid in message_ids:
-            try:
-                await client.delete_messages(chat_id, mid)
-            except Exception:
-                pass
-    except Exception as e:
-        logger.debug("schedule_delete: %s", e)
-
 
 def _get_post_link(m: dict) -> str:
-    """Return ONLY direct group post link (t.me/c/...). Never bot deep-link."""
     post_link = m.get("group_post_link") or ""
     if post_link and "t.me/c/" in str(post_link):
         return post_link
@@ -61,3 +25,126 @@ def _get_post_link(m: dict) -> str:
         except Exception:
             pass
     return ""
+
+def build_filter_results(query: str, results: list, page: int = 1, is_group: bool = True):
+    per = 10
+    total = len(results)
+    start = (page - 1) * per
+    chunk = results[start:start + per]
+    lines = [f"🔎 <b>Results for:</b> <code>{query}</code>\n"]
+    buttons = []
+    for i, m in enumerate(chunk, start=1):
+        title = m.get("title") or "Unknown"
+        year = m.get("year")
+        label = f"{title}" + (f" ({year})" if year else "")
+        link = _get_post_link(m)
+        if link:
+            buttons.append([InlineKeyboardButton(f"🎬 {label}", url=link)])
+        else:
+            buttons.append([InlineKeyboardButton(f"🎬 {label}", callback_data=f"flt_info_{m.get('movie_id','')}")])
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"flt_{page-1}_{query[:40]}"))
+    if start + per < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"flt_{page+1}_{query[:40]}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("❌ Close", callback_data="close_card")])
+    text = "\n".join(lines) + f"\nPage {page} · {total} found"
+    return text, InlineKeyboardMarkup(buttons)
+
+async def _schedule_delete(client, chat_id, message_ids, delay=None):
+    delay = delay if delay is not None else AUTO_DELETE_SECONDS
+    await asyncio.sleep(delay)
+    for mid in message_ids:
+        try:
+            await client.delete_messages(chat_id, mid)
+        except Exception:
+            pass
+
+def register_group_filter_handlers(bot: Client):
+    COMMANDS = {"find", "filter", "search", "done", "dl", "start", "help", "addmovie", "newmovie",
+                "cancel", "finish", "generatelink", "warn", "sp", "rls", "n_available", "prm",
+                "add_force_chnl", "del_force_chnl", "force_channels", "broadcast"}
+
+    @bot.on_message(filters.command(["find", "filter", "search"]))
+    async def find_command(client: Client, message: Message):
+        q = message.text.split(None, 1)
+        query = q[1].strip() if len(q) > 1 else ""
+        if not query:
+            await message.reply_text("Usage: /find movie name", quote=True)
+            return
+        await execute_movie_search(client, message, query, is_group=(message.chat.type.name != "PRIVATE"))
+
+    @bot.on_message(
+        filters.text & ~filters.command(list(COMMANDS)) & filters.group,
+        group=5,
+    )
+    async def direct_text_search_handler(client: Client, message: Message):
+        if not message.text or message.text.startswith("/"):
+            return
+        text = message.text.strip()
+        if len(text) < 2:
+            return
+        if len(re.sub(r"\W+", "", text)) < 2:
+            return
+        await execute_movie_search(client, message, text, is_group=True)
+
+    async def execute_movie_search(client: Client, message: Message, query: str, is_group: bool = True):
+        user = message.from_user
+        if not user:
+            return
+        if not is_group or message.chat.type.name == "PRIVATE":
+            link = getattr(Config, "MOVIE_GROUP_LINK", "") or "https://t.me/"
+            await message.reply_text(
+                f"🎬 Movies sirf group me milengi.\nJoin: {link}",
+                quote=True,
+            )
+            return
+        try:
+            blocked = await enforce_force_sub_in_group(client, message)
+            if blocked:
+                return
+        except Exception as e:
+            logger.debug(f"force_sub: {e}")
+        try:
+            ban = await db.get_ban_status(user.id)
+            if ban.get("is_banned"):
+                await message.reply_text("🚫 Aap ban ho. Results nahi milenge.", quote=True)
+                return
+        except Exception:
+            pass
+        results = await db.search_movies(query)
+        if not results:
+            m = await message.reply_text(f"❌ <b>{query}</b> nahi mila.", quote=True)
+            asyncio.create_task(_schedule_delete(client, message.chat.id, [m.id, message.id], 60))
+            return
+        text, markup = build_filter_results(query, results, page=1, is_group=True)
+        sent = await message.reply_text(text, reply_markup=markup, quote=True)
+        asyncio.create_task(_schedule_delete(client, message.chat.id, [sent.id], AUTO_DELETE_SECONDS))
+
+    @bot.on_callback_query(filters.regex(r"^flt_(\d+)_(.+)"))
+    async def filter_pagination_callback(client: Client, query: CallbackQuery):
+        m = re.match(r"^flt_(\d+)_(.+)", query.data or "")
+        if not m:
+            return
+        page = int(m.group(1))
+        search_query = m.group(2)
+        results = await db.search_movies(search_query)
+        if not results:
+            await query.answer("No results", show_alert=True)
+            return
+        text, markup = build_filter_results(search_query, results, page=page, is_group=True)
+        try:
+            await query.message.edit_text(text, reply_markup=markup)
+        except Exception:
+            await query.answer("Updated")
+        await query.answer()
+
+    @bot.on_callback_query(filters.regex(r"^close_card$"))
+    async def close_card_callback(client: Client, query: CallbackQuery):
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await query.answer()
