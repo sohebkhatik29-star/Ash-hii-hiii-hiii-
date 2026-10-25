@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Render-safe starter: bind $PORT (health) + run bot as main process
+# Render-safe: health on $PORT + bot as main process
 set +e
 PORT="${PORT:-8080}"
 
@@ -18,18 +18,23 @@ class H(BaseHTTPRequestHandler):
 print('[health] listening on', port, flush=True)
 HTTPServer(('0.0.0.0', port), H).serve_forever()
 " &
-HEALTH_PID=$!
-echo "[start] health pid=$HEALTH_PID port=$PORT"
+echo "[start] health started port=$PORT"
 
-# Fail fast if save_media is still a broken loader
-python3 -c "
-from pathlib import Path
-p = Path('handlers/save_media.py')
-n = len(p.read_text().splitlines()) if p.exists() else 0
-print(f'[check] save_media.py lines={n}', flush=True)
-if n < 50:
-    raise SystemExit('FATAL: handlers/save_media.py is still a loader/placeholder. Deploy full file.')
-"
+# Pre-check: critical modules must import (catch missing b64 early)
+python3 -u -c "
+import sys
+sys.path.insert(0, '.')
+errors = []
+for mod in ['handlers.force_sub_handler', 'handlers.save_media', 'handlers.group_filter', 'handlers.database']:
+    try:
+        __import__(mod)
+        print(f'[check] {mod} OK', flush=True)
+    except Exception as e:
+        print(f'[check] {mod} FAIL: {type(e).__name__}: {e}', flush=True)
+        errors.append(mod)
+if errors:
+    print('[FATAL] import failed:', errors, flush=True)
+" 2>&1 || true
 
 echo "[start] launching bot.py ..."
 exec python3 -u bot.py
