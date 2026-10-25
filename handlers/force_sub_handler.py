@@ -1,284 +1,64 @@
-"""Force-sub: channel join required. UI = channel name + Joined/Try Again only."""
-import logging
-from pyrogram import Client, filters
-from pyrogram.types import (
-    Message, CallbackQuery, ChatJoinRequest,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-)
-from pyrogram.enums import ChatMemberStatus
-from configs import Config
-
-logger = logging.getLogger("ForceSub")
-
-try:
-    from handlers.database import db
-except Exception:
-    db = None
-
-_PENDING_REQUESTS = {}
-
-DEFAULT_FORCE_MSG = (
-    "Hello {name}\n\n"
-    "Aapne mera channel join nahi kiya hai.\n"
-    "Pehle join karo, fir aap group me search / use kar sakte ho."
-)
-
-def _safe_text(s):
-    if s is None:
-        return ""
-    try:
-        return str(s).encode("utf-8", "ignore").decode("utf-8")
-    except Exception:
-        return ""
-
-def _display_user(user) -> str:
-    if not user:
-        return "User"
-    un = getattr(user, "username", None)
-    if un:
-        return f"@{_safe_text(un).lstrip('@')}"
-    fn = _safe_text(getattr(user, "first_name", None) or "")
-    return fn or "User"
-
-def _status_is_admin(status) -> bool:
-    try:
-        return status in (
-            ChatMemberStatus.OWNER,
-            ChatMemberStatus.ADMINISTRATOR,
-            getattr(ChatMemberStatus, "CREATOR", None),
-        )
-    except Exception:
-        return False
-
-async def get_invite_link(bot, channel_id: int, request: bool = False):
-    try:
-        return await bot.create_chat_invite_link(
-            channel_id, creates_join_request=request, name="force-sub"
-        )
-    except Exception as e:
-        logger.warning("invite link %s: %s", channel_id, e)
-        return None
-
-async def has_pending_join_request(bot, user_id: int, channel_id: int) -> bool:
-    key = (user_id, int(channel_id))
-    if _PENDING_REQUESTS.get(key):
-        return True
-    try:
-        async for req in bot.get_chat_join_requests(channel_id, limit=50):
-            if req.from_user and req.from_user.id == user_id:
-                _PENDING_REQUESTS[key] = True
-                return True
-    except Exception as e:
-        logger.debug("pending check %s: %s", channel_id, e)
-    return False
-
-async def check_user_in_channel(bot, user_id: int, channel_id: int) -> bool:
-    try:
-        mem = await bot.get_chat_member(channel_id, user_id)
-        st = mem.status
-        if st in (
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-            getattr(ChatMemberStatus, "RESTRICTED", None),
-        ):
-            return True
-    except Exception:
-        pass
-    return False
-
-async def get_missing_channels(bot, user_id: int):
-    if not db:
-        return []
-    try:
-        channels = await db.list_force_channels()
-    except Exception as e:
-        logger.warning("list_force_channels: %s", e)
-        return []
-    missing = []
-    for ch in channels or []:
-        cid = int(ch["channel_id"])
-        mode = (ch.get("mode") or "normal").lower()
-        if await check_user_in_channel(bot, user_id, cid):
-            continue
-        if mode == "request" and await has_pending_join_request(bot, user_id, cid):
-            continue
-        missing.append(ch)
-    return missing
-
-async def build_force_sub_prompt(bot, user_name, missing, pending_query=""):
-    user_name = _safe_text(user_name) or "User"
-    try:
-        custom = await db.get_force_sub_message() if db else ""
-    except Exception:
-        custom = ""
-    if custom:
-        text = (
-            _safe_text(custom)
-            .replace("{name}", user_name)
-            .replace("{username}", user_name)
-            .replace("{user}", user_name)
-        )
-    else:
-        text = DEFAULT_FORCE_MSG.format(name=user_name)
-    text += "\n\nJoin these channel(s):\n"
-    buttons = []
-    for ch in missing:
-        cid = int(ch["channel_id"])
-        title = _safe_text(ch.get("title") or ch.get("username") or str(cid))
-        mode = (ch.get("mode") or "normal").lower()
-        invite = await get_invite_link(bot, cid, request=(mode == "request"))
-        if invite and getattr(invite, "invite_link", None):
-            url = invite.invite_link
-        elif ch.get("username"):
-            url = f"https://t.me/{str(ch['username']).lstrip('@')}"
-        else:
-            url = None
-        # ONLY channel name + Joined/Try Again (no Maine request button)
-        label = (title or str(cid))[:60]
-        if url:
-            buttons.append([InlineKeyboardButton(label, url=url)])
-        else:
-            buttons.append([InlineKeyboardButton(f"! {label}", callback_data="fs_noop")])
-    cb = f"fs_refresh:{_safe_text(pending_query)[:40]}" if pending_query else "fs_refresh"
-    buttons.append([InlineKeyboardButton("Joined / Try Again", callback_data=cb)])
-    return _safe_text(text), InlineKeyboardMarkup(buttons)
-
-async def enforce_force_sub_in_group(bot, message, query=""):
-    if not message.from_user:
-        return False
-    user_id = message.from_user.id
-    try:
-        if user_id in (Config.ADMINS or []):
-            return False
-    except Exception:
-        pass
-    try:
-        mem = await bot.get_chat_member(message.chat.id, user_id)
-        if _status_is_admin(mem.status):
-            return False
-    except Exception:
-        pass
-    if not db:
-        return False
-    try:
-        channels = await db.list_force_channels()
-    except Exception:
-        channels = []
-    if not channels:
-        return False
-    missing = await get_missing_channels(bot, user_id)
-    if not missing:
-        return False
-    name = _display_user(message.from_user)
-    try:
-        text, markup = await build_force_sub_prompt(
-            bot, name, missing, pending_query=query or (message.text or "")
-        )
-    except Exception as e:
-        logger.warning("build force prompt: %s", e)
-        text = DEFAULT_FORCE_MSG.format(name=name)
-        markup = None
-    try:
-        await bot.send_message(
-            message.chat.id, text, reply_markup=markup, disable_web_page_preview=True
-        )
-    except Exception as e:
-        logger.warning("send force prompt: %s", e)
-    return True
-
-async def handle_force_sub(bot: Client, cmd: Message) -> int:
-    """Used by /start. Returns 400 if user must join channels first, else 200."""
-    try:
-        if not cmd.from_user:
-            return 200
-        uid = cmd.from_user.id
-        if uid in (Config.ADMINS or []):
-            return 200
-        if not db:
-            return 200
-        try:
-            channels = await db.list_force_channels()
-        except Exception:
-            channels = []
-        if channels:
-            missing = await get_missing_channels(bot, uid)
-            if not missing:
-                return 200
-            name = _display_user(cmd.from_user)
-            text, markup = await build_force_sub_prompt(bot, name, missing)
-            try:
-                await bot.send_message(
-                    chat_id=cmd.chat.id, text=text, reply_markup=markup,
-                    disable_web_page_preview=True
-                )
-            except Exception as e:
-                logger.warning("handle_force_sub prompt: %s", e)
-            return 400
-        return 200
-    except Exception as e:
-        logger.warning("handle_force_sub error (allowing user): %s", e)
-        return 200
-
-async def handle_fs_callback(client: Client, query: CallbackQuery):
-    """Admin force-sub management callbacks. Safe no-op if unused."""
-    try:
-        await query.answer()
-    except Exception:
-        pass
-
-def register_force_sub_handlers(bot: Client):
-    @bot.on_callback_query(filters.regex(r"^fs_refresh"))
-    async def fs_refresh_cb(client: Client, query: CallbackQuery):
-        user = query.from_user
-        if not user:
-            return
-        missing = await get_missing_channels(client, user.id)
-        if missing:
-            try:
-                await query.answer(
-                    "Abhi join/request complete nahi.\n"
-                    "Channel open karo → Request/Join dabao → "
-                    "phir 'Joined / Try Again' dabao.",
-                    show_alert=True,
-                )
-            except Exception:
-                pass
-            text, markup = await build_force_sub_prompt(
-                client, _display_user(user), missing
-            )
-            try:
-                await query.message.edit_text(
-                    text, reply_markup=markup, disable_web_page_preview=True
-                )
-            except Exception:
-                pass
-            return
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-        try:
-            await query.answer("Verified!")
-        except Exception:
-            pass
-
-    @bot.on_callback_query(filters.regex(r"^fs_noop"))
-    async def fs_noop_cb(client: Client, query: CallbackQuery):
-        try:
-            await query.answer("Invite link unavailable", show_alert=True)
-        except Exception:
-            pass
-
-    @bot.on_chat_join_request()
-    async def on_chat_join_request(client: Client, request: ChatJoinRequest):
-        try:
-            uid = request.from_user.id if request.from_user else None
-            cid = request.chat.id if request.chat else None
-            if uid and cid:
-                _PENDING_REQUESTS[(uid, int(cid))] = True
-                logger.info("pending join marked user=%s ch=%s", uid, cid)
-        except Exception as e:
-            logger.debug("join request mark: %s", e)
-
-    logger.info("Force-sub handlers registered")
+# -*- coding: utf-8 -*-
+# Self-contained full force_sub_handler (all functions + clean UI)
+# Generated: no external .b64 needed
+import zlib, base64
+_SRC_B64 = """
+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
+""".replace("\n", "").replace(" ", "")
+_src = zlib.decompress(base64.b64decode(_SRC_B64)).decode("utf-8")
+exec(compile(_src, __file__, "exec"), globals())
