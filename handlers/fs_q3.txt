@@ -1,0 +1,138 @@
+
+    if data.startswith("fs_mark_req:"):
+        user = query.from_user
+        if not user:
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            return
+        try:
+            cid = int(data.split(":", 1)[1])
+        except Exception:
+            try:
+                await query.answer("Invalid channel", show_alert=True)
+            except Exception:
+                pass
+            return
+        uid = int(user.id)
+        _PENDING_REQUESTS[(cid, uid)] = asyncio.get_event_loop().time()
+        try:
+            await query.answer(
+                "✅ Request mark ho gaya. Ab 'Joined / Try Again' dabao.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        missing = await get_missing_channels(client, uid)
+        if missing:
+            text, markup = await build_force_sub_prompt(client, _display_user(user), missing)
+            try:
+                await query.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+            except Exception:
+                pass
+        else:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            try:
+                tip = await client.send_message(
+                    query.message.chat.id,
+                    "✅ Sab channels OK. Ab group me search kar sakte ho.",
+                )
+                await asyncio.sleep(6)
+                await tip.delete()
+            except Exception:
+                pass
+        return
+
+    if data == "fs_noop":
+        try:
+            await query.answer("Invite link nahi bana. Bot ko channel admin banao.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+
+def register_force_sub_handlers(bot: Client):
+
+    @bot.on_callback_query(filters.regex(r"^(fs_|force_sub_)"))
+    async def _fs_cb(client: Client, query: CallbackQuery):
+        await handle_fs_callback(client, query)
+
+    @bot.on_chat_join_request()
+    async def _on_join_req(client: Client, req):
+        try:
+            uid = req.from_user.id if req.from_user else 0
+            cid = req.chat.id if req.chat else 0
+            if uid and cid:
+                _PENDING_REQUESTS[(int(cid), int(uid))] = asyncio.get_event_loop().time()
+                try:
+                    if hasattr(db, "fs_mark_req"):
+                        await db.fs_mark_req(uid, cid)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug("join_req: %s", e)
+
+    @bot.on_message(filters.command(["add_force_chnl", "addforce"]) & (filters.group | filters.private))
+    async def add_force_cmd(client: Client, message: Message):
+        uid = message.from_user.id if message.from_user else 0
+        if uid not in (Config.ADMINS or []):
+            if message.chat and message.chat.type.name in ("GROUP", "SUPERGROUP"):
+                if not await _is_group_admin(client, message.chat.id, uid):
+                    return
+            else:
+                return
+        # Usage: /add_force_chnl  (reply to channel forward) OR /add_force_chnl <id> <link>
+        # Interactive: ask mode normal/request
+        parts = (message.text or "").split()
+        channel_id = None
+        title = ""
+        username = ""
+        if message.reply_to_message and message.reply_to_message.forward_from_chat:
+            ch = message.reply_to_message.forward_from_chat
+            channel_id = ch.id
+            title = ch.title or ""
+            username = ch.username or ""
+        elif len(parts) >= 2:
+            try:
+                channel_id = int(parts[1])
+            except ValueError:
+                await message.reply_text("Usage: /add_force_chnl <channel_id>\nya channel post pe reply karke /add_force_chnl", quote=True)
+                return
+            if len(parts) >= 3:
+                username = parts[2].lstrip("@")
+        else:
+            await message.reply_text(
+                "Usage:\n• Channel ki post pe reply karke /add_force_chnl\n"
+                "• /add_force_chnl <channel_id>\n\nMax 7 channels. Mode: normal / request",
+                quote=True,
+            )
+            return
+        try:
+            chat = await client.get_chat(channel_id)
+            title = title or chat.title or str(channel_id)
+            username = username or (chat.username or "")
+        except Exception as e:
+            logger.warning("get_chat: %s", e)
+            title = title or str(channel_id)
+        _FS_PENDING[int(channel_id)] = {"title": title, "username": username}
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Normal Join", callback_data=f"fs_mode:normal:{int(channel_id)}"),
+                InlineKeyboardButton("Request Join", callback_data=f"fs_mode:request:{int(channel_id)}"),
+            ],
+            [InlineKeyboardButton("Cancel", callback_data=f"fs_mode:cancel:{int(channel_id)}")],
+        ])
+        await message.reply_text(
+            f"Channel: <b>{_safe_text(title)}</b>\nID: <code>{channel_id}</code>\n\nMode select karo:",
+            reply_markup=kb,
+            quote=True,
+        )

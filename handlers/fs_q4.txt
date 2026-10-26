@@ -1,0 +1,77 @@
+
+    @bot.on_message(filters.command(["del_force_chnl", "delforce"]) & (filters.group | filters.private))
+    async def del_force_cmd(client: Client, message: Message):
+        uid = message.from_user.id if message.from_user else 0
+        if uid not in (Config.ADMINS or []):
+            return
+        parts = (message.text or "").split()
+        if len(parts) < 2:
+            await message.reply_text("Usage: /del_force_chnl <channel_id>", quote=True)
+            return
+        try:
+            cid = int(parts[1])
+        except ValueError:
+            await message.reply_text("channel_id number hona chahiye", quote=True)
+            return
+        try:
+            ok = await db.remove_force_channel(cid)
+            await message.reply_text("✅ Removed" if ok else "❌ Not found", quote=True)
+        except Exception as e:
+            await message.reply_text(f"Error: {e}", quote=True)
+
+    @bot.on_message(filters.command(["see_force_sub_chnl", "listforce", "force_channels"]) & (filters.group | filters.private))
+    async def list_force_cmd(client: Client, message: Message):
+        uid = message.from_user.id if message.from_user else 0
+        if uid not in (Config.ADMINS or []):
+            return
+        try:
+            chs = await db.list_force_channels()
+        except Exception:
+            chs = []
+        if not chs:
+            await message.reply_text("No force-sub channels.", quote=True)
+            return
+        lines = []
+        for c in chs:
+            lines.append(
+                f"• <b>{_safe_text(c.get('title') or '')}</b>\n"
+                f"  ID: <code>{c.get('channel_id')}</code> | Mode: <code>{c.get('mode', 'normal')}</code>"
+            )
+        await message.reply_text("Force-sub channels:\n\n" + "\n\n".join(lines), quote=True)
+
+    @bot.on_message(filters.command(["set_force_sub_message"]) & (filters.group | filters.private))
+    async def set_fs_msg(client: Client, message: Message):
+        uid = message.from_user.id if message.from_user else 0
+        if uid not in (Config.ADMINS or []):
+            return
+        text = (message.text or "")
+        # remove command
+        for cmd in ("/set_force_sub_message",):
+            if text.lower().startswith(cmd):
+                text = text[len(cmd):].strip()
+                break
+        if not text and message.reply_to_message:
+            text = message.reply_to_message.text or message.reply_to_message.caption or ""
+        if not text:
+            await message.reply_text(
+                "Usage: /set_force_sub_message Hello {name}\\nJoin channel...\n"
+                "Placeholders: {name} {username} {user}",
+                quote=True,
+            )
+            return
+        try:
+            await db.set_force_sub_message(text)
+            await message.reply_text("✅ Custom force-sub message set.", quote=True)
+        except Exception as e:
+            await message.reply_text(f"Error: {e}", quote=True)
+
+    @bot.on_message(filters.command(["del_force_sub_message"]) & (filters.group | filters.private))
+    async def del_fs_msg(client: Client, message: Message):
+        uid = message.from_user.id if message.from_user else 0
+        if uid not in (Config.ADMINS or []):
+            return
+        try:
+            await db.clear_force_sub_message()
+            await message.reply_text("✅ Custom message deleted. Default use hoga.", quote=True)
+        except Exception as e:
+            await message.reply_text(f"Error: {e}", quote=True)
