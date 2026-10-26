@@ -1,8 +1,7 @@
 # ==============================================================================
-# ASH AUTOMATIC MOVIE FILE STORE BOT 🎬
+# ASH AUTOMATIC MOVIE FILE STORE BOT
 # Module: handlers/parser.py
-# Purpose: Smart movie & web-series title normalization, acronym handling (KGF, RRR),
-#          bracket unboxing, season/episode detection, and quality key generation.
+# Purpose: Clean title (poster), distinct quality keys, metadata extract
 # ==============================================================================
 
 import re
@@ -16,20 +15,23 @@ def sanitize_text(s) -> str:
         return ""
     if not isinstance(s, str):
         s = str(s)
-    # Drop lone surrogates that break utf-8 encode
     return "".join(ch for ch in s if not (0xD800 <= ord(ch) <= 0xDFFF))
 
 
-# Quality mapping with regex patterns
+# Distinct quality keys — never collapse 360 into 480 etc.
 QUALITY_PATTERNS = [
     (r"(?i)\b(2160p|4k|uhd)\b", "2160p"),
-    (r"(?i)\b(1080p|fhd|1080)\b", "1080p"),
-    (r"(?i)\b(720p|hd|720)\b", "720p"),
-    (r"(?i)\b(480p|sd|480)\b", "480p"),
-    (r"(?i)\b(540p|360p)\b", "480p"),
+    (r"(?i)\b(1440p|2k)\b", "1440p"),
+    (r"(?i)\b(1080p|fhd)\b", "1080p"),
+    (r"(?i)\b(720p)\b", "720p"),
+    (r"(?i)\b(540p)\b", "540p"),
+    (r"(?i)\b(480p)\b", "480p"),
+    (r"(?i)\b(360p)\b", "360p"),
+    (r"(?i)\b(240p)\b", "240p"),
+    (r"(?i)\bhd\b", "HD"),
+    (r"(?i)\bsd\b", "SD"),
 ]
 
-# Common audio & language patterns
 LANGUAGE_PATTERNS = [
     (r"(?i)\b(hindi|hin)\b", "Hindi"),
     (r"(?i)\b(english|eng)\b", "English"),
@@ -47,12 +49,10 @@ LANGUAGE_PATTERNS = [
     (r"(?i)\b(multi[\s_-]?audio)\b", "Multi Audio"),
 ]
 
-# Known technical tags to strip from titles
-TECH_TAGS = r"(?i)\b(720p|1080p|2160p|480p|540p|360p|4k|uhd|fhd|hd|hevc|x264|x265|h264|h265|avc|10bit|8bit|aac|ac3|dts|ddp5\.1|eac3|5\.1|esub|esubs|sub|subtitles|bluray|blu-ray|web-dl|webdl|webrip|hdrip|dvdrip|hdtv|camrip|predvd|hdcam|hindi|english|tamil|telugu|malayalam|kannada|marathi|bengali|dual\s*audio|multi\s*audio|org|original|uncut|remastered|clean|mkv|mp4|avi|webm)\b"
+TECH_TAGS = r"(?i)\b(2160p|1440p|1080p|720p|540p|480p|360p|240p|4k|2k|uhd|fhd|hd|sd|hevc|x264|x265|h264|h265|avc|10bit|8bit|aac|ac3|dts|ddp5\.1|ddp|eac3|5\.1|5\s*1|esub|esubs|sub|subtitles|bluray|blu-ray|web-dl|webdl|web\s*rip|webrip|hdrip|dvdrip|hdtv|camrip|predvd|hdcam|hindi|english|tamil|telugu|malayalam|kannada|marathi|bengali|punjabi|dual\s*audio|multi\s*audio|org|original|uncut|remastered|clean|mkv|mp4|avi|webm|webr)\b"
 
 
 def format_size(size_bytes: int) -> str:
-    """Format bytes to human readable string (e.g. 450 MB, 1.25 GB)."""
     if not size_bytes or size_bytes <= 0:
         return "Unknown Size"
     power = 1024
@@ -65,7 +65,6 @@ def format_size(size_bytes: int) -> str:
 
 
 def normalize_title(title: str) -> str:
-    """Normalize a movie title for strict session matching."""
     title = sanitize_text(title)
     if not title:
         return ""
@@ -76,13 +75,8 @@ def normalize_title(title: str) -> str:
 
 
 def extract_episode_or_part(text: str) -> str:
-    """
-    Extracts episode range or part (e.g. 'Ep 01-05', 'Ep 06-10', 'Part 1', 'Ep 1').
-    """
     if not text:
         return ""
-
-    # 1. Ep 01 - 05 or Episode 01 to 05
     ep_match = re.search(r"(?i)\[?\b(?:ep|eps|episode|episodes)\s*0*(\d+\s*(?:[-\u2013to]+\s*0*\d+)?)\]?", text)
     if ep_match:
         raw_ep = ep_match.group(1).strip()
@@ -93,12 +87,9 @@ def extract_episode_or_part(text: str) -> str:
         elif len(parts) == 1 and parts[0].isdigit():
             return f"Ep {int(parts[0]):02d}"
         return f"Ep {raw_ep}"
-
-    # 2. Part 1 / Part 2
     part_match = re.search(r"(?i)\bpart\s*0*(\d+)\b", text)
     if part_match:
         return f"Part {int(part_match.group(1))}"
-
     return ""
 
 
@@ -113,48 +104,52 @@ def extract_season(text: str) -> str:
 
 def clean_movie_title(raw_name: str, year: int = None) -> str:
     """
-    Cleans movie title with special handling for acronyms (KGF, RRR, PK)
-    and bracket unboxing so [KGF] Chapter 1 is never lost.
+    Clean title for poster/card.
+    Example: "Pushpa The Rise 2021 WebRip 720p x265 HEVC Hindi ESub.mkv"
+          -> "Pushpa The Rise"
+    Year is NOT kept inside title (card adds (YEAR) separately).
     """
-    cleaned = sanitize_text(raw_name)
+    cleaned = sanitize_text(raw_name or "")
+    if not cleaned:
+        return "Untitled Movie"
 
-    # 1. Strip telegram usernames e.g. @Movies_1782
     cleaned = re.sub(r"@[\w_]+", " ", cleaned)
-
-    # 2. If year exists, clip before year
-    if year:
-        year_match = re.search(r"\b" + str(year) + r"\b", cleaned)
-        if year_match:
-            up_to_year = cleaned[:year_match.start()]
-            up_to_year = re.sub(r"[\(\[\{\-_.\s]+$", "", up_to_year)
-            if len(up_to_year.strip()) >= 2:
-                cleaned = up_to_year
-
-    # 3. Normalize dotted acronyms: K.G.F. -> KGF, R.R.R. -> RRR
     cleaned = re.sub(r"(?i)\b([a-z])\.([a-z])\.([a-z])\.?\b", r"\1\2\3", cleaned)
     cleaned = re.sub(r"(?i)\b([a-z])\.([a-z])\.?\b", r"\1\2", cleaned)
 
-    # 4. Smart bracket unboxing
-    def bracket_unwrapper(m):
-        content = m.group(1).strip()
+    if year:
+        year_match = re.search(r"\b" + str(year) + r"\b", cleaned)
+        if year_match:
+            before = cleaned[: year_match.start()]
+            before = re.sub(r"[\(\[\{\-_.\s]+$", "", before).strip()
+            if len(before) >= 2:
+                cleaned = before
+
+    def _bracket(m):
+        content = (m.group(1) or "").strip()
+        if not content:
+            return " "
         if re.search(TECH_TAGS, content) or content.startswith("@") or "channel" in content.lower():
+            return " "
+        if re.fullmatch(r"(19\d{2}|20\d{2})", content):
             return " "
         return f" {content} "
 
-    cleaned = re.sub(r"\[(.*?)\]", bracket_unwrapper, cleaned)
+    cleaned = re.sub(r"[\[\(\{](.*?)[\]\)\}]", _bracket, cleaned)
 
-    # 5. Remove junk words
     JUNK = [
-        r"\(.*?\b(yify|rarbg|psa|bolly|vj|codex|ash|tele|channel|unrated|extended|remastered|web series)\b.*?\)",
-        r"(?i)\b(web\s*series|series|unrated|bluray|blu-ray|web-dl|webdl|webrip|hdrip|dvdrip|hdtv|camrip|predvd|hdcam)\b",
-        r"(?i)\b(x264|x265|hevc|h264|h265|avc|10bit|8bit|aac|ac3|dts|ddp5\.1|eac3|5\.1)\b",
-        r"(?i)\b(esub|esubs|sub|subtitles|clean|org|original|uncut|extended|remastered)\b",
-        r"(?i)\b(hindi|english|telugu|tamil|malayalam|kannada|marathi|bengali|dual\s*audio|multi\s*audio)\b",
-        r"(?i)\b(mkv|mp4|avi|webm)\b",
-        r"(?i)\b(?:ep|eps|episode|episodes)\s*0*(\d+\s*(?:[-\u2013to]+\s*0*\d+)?)\b",
-        r"(?i)\b(2160p|1080p|720p|480p|540p|360p|4k)\b",
+        r"(?i)\b(2160p|1440p|1080p|720p|540p|480p|360p|240p|4k|2k|uhd|fhd)\b",
+        r"(?i)\b(hevc|x264|x265|h264|h265|avc|10bit|8bit|aac|ac3|dts|ddp5\.1|ddp|eac3)\b",
+        r"(?i)\b(5\.1|5\s*1|2\.0|atmos)\b",
+        r"(?i)\b(esub|esubs|sub|subs|subtitles)\b",
+        r"(?i)\b(bluray|blu-ray|web-dl|webdl|web\s*rip|webrip|hdrip|dvdrip|hdtv|camrip|predvd|hdcam|webr)\b",
+        r"(?i)\b(uncut|extended|remastered|unrated|clean|org|original)\b",
+        r"(?i)\b(dual\s*audio|multi\s*audio|hindi|english|tamil|telugu|malayalam|kannada|marathi|bengali|punjabi)\b",
+        r"(?i)\b(mkv|mp4|avi|webm|m4v)\b",
+        r"(?i)\b(?:ep|eps|episode|episodes)\s*0*\d+(?:\s*[-\u2013to]+\s*0*\d+)?\b",
+        r"(?i)\b(yify|rarbg|psa|codex|sparks|hdtv)\b",
         r"\b(19\d{2}|20\d{2})\b",
-        r"[:._\-+]+",
+        r"[:._\-+|/\\]+",
     ]
     for p in JUNK:
         cleaned = re.sub(p, " ", cleaned)
@@ -162,58 +157,58 @@ def clean_movie_title(raw_name: str, year: int = None) -> str:
     cleaned = re.sub(r"[\(\)\[\]\{\}]+", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
-    # 6. Format words with proper casing
+    if not cleaned or len(cleaned) < 2:
+        raw = sanitize_text(raw_name or "")
+        raw = re.sub(r"@[\w_]+", " ", raw)
+        m = re.search(
+            r"(?i)\b(2160p|1440p|1080p|720p|480p|360p|4k|hevc|x264|x265|webrip|web-dl|bluray)\b",
+            raw,
+        )
+        chunk = raw[: m.start()] if m else raw
+        chunk = re.sub(r"[\(\)\[\]\{\}._\-+]+", " ", chunk)
+        chunk = re.sub(r"\s+", " ", chunk).strip()
+        cleaned = chunk if len(chunk) >= 2 else "Untitled Movie"
+
     words = []
     for w in cleaned.split():
         w_up = w.upper()
-        if w_up in ("KGF", "RRR", "PK", "DON", "RAW", "CID", "WAR", "DDLJ"):
+        if w_up in ("KGF", "RRR", "PK", "DON", "RAW", "CID", "WAR", "DDLJ", "JFK", "AI"):
             words.append(w_up)
-        elif len(w) <= 3 and w.isalpha() and w.lower() not in ("the", "and", "for", "in", "of", "to"):
+        elif len(w) <= 3 and w.isalpha() and w.lower() not in ("the", "and", "for", "in", "of", "to", "a", "an"):
             words.append(w_up)
         else:
             words.append(w.capitalize())
 
-    final_title = " ".join(words) if words else "Untitled Movie"
-    return final_title
+    return " ".join(words) if words else "Untitled Movie"
 
 
 def extract_movie_metadata(filename: str, caption: str = "") -> Dict[str, Any]:
-    """
-    Extracts movie title, season, episode, release year, quality, and languages.
-    """
     filename = sanitize_text(filename or "")
     caption = sanitize_text(caption or "")
     raw_name = filename or caption or "Untitled_Movie"
     base_name = raw_name
 
-    # 1. Extract Quality
     quality = "HD"
     for pattern, q in QUALITY_PATTERNS:
         if re.search(pattern, base_name):
             quality = q
             break
 
-    # 2. Extract Year
     year = None
     year_match = re.search(r"\b(19\d{2}|20\d{2})\b", base_name)
     if year_match:
         year = int(year_match.group(1))
 
-    # 3. Extract languages
     languages = []
     for pattern, lang in LANGUAGE_PATTERNS:
         if re.search(pattern, base_name):
             if lang not in languages:
                 languages.append(lang)
 
-    # 4. Season / Episode
     season = extract_season(base_name)
     episode = extract_episode_or_part(base_name)
-
-    # 5. Clean title
     title = clean_movie_title(base_name, year)
 
-    # Prefer caption if filename is generic
     if caption and (not filename or filename.lower() in ("video", "video.mp4", "video.mkv")):
         caption_meta_title = clean_movie_title(caption, year)
         if caption_meta_title and caption_meta_title != "Untitled Movie":
@@ -234,18 +229,12 @@ def extract_movie_metadata(filename: str, caption: str = "") -> Dict[str, Any]:
 
 
 def is_title_match(active_title: str, incoming_title: str, threshold: float = 0.72) -> bool:
-    """
-    Fuzzy match between current session title and incoming file title.
-    Prevents mixing different movies in one session.
-    """
     norm_active = normalize_title(active_title)
     norm_incoming = normalize_title(incoming_title)
     if not norm_active or not norm_incoming:
         return False
     if norm_active == norm_incoming:
         return True
-
-    # Token overlap
     a_tokens = set(norm_active.split())
     i_tokens = set(norm_incoming.split())
     if a_tokens and i_tokens:
@@ -253,6 +242,5 @@ def is_title_match(active_title: str, incoming_title: str, threshold: float = 0.
         overlap_incoming = len(a_tokens & i_tokens) / len(i_tokens)
         if overlap_active >= 0.75 or overlap_incoming >= 0.75:
             return True
-
     ratio = difflib.SequenceMatcher(None, norm_active, norm_incoming).ratio()
     return ratio >= threshold
