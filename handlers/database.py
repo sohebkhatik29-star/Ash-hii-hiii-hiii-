@@ -28,42 +28,40 @@ STOPWORDS = {
     "yar", "dost", "friend", "group", "bot", "admin", "thanks", "thank",
     "thx", "tq", "good", "nice", "hello", "hi", "hey", "hii", "hlo",
     "kese", "kaise", "how", "are", "you", "kr", "kar", "dena",
-    "mil", "mile", "mila", "available", "he", "h", "krdo", "kardo",
-    "mujhe", "mujh", "help", "pleasee", "namaste", "namaskar",
-    "bhejdo", "bhejde", "dijiye", "kripya", "krupaya", "kindly",
-    "with", "from", "this", "that", "year", "new", "latest", "old",
-    "free", "paid", "premium",
 }
 
 
 class Database:
     def __init__(self, db_url: str = None, db_name: str = None):
+        self.db_url = db_url or getattr(Config, "DATABASE_URL", None) or getattr(Config, "DB_URI", None)
+        self.db_name = db_name or getattr(Config, "DB_NAME", "AshMovieBot")
+        self._mem_movies = {}
+        self._mem_sessions = {}
+        self._mem_bans = {}
+        self._mem_warns = {}
         self.has_mongo = False
         self.client = None
         self.db = None
         self.movies_col = None
-        self.users_col = None
-        self.warns_col = None
         self.sessions_col = None
-        self._mem_movies = {}
-        self._mem_sessions = {}
-        url = db_url or getattr(Config, "DATABASE_URL", None) or getattr(Config, "DB_URL", None)
-        name = db_name or getattr(Config, "DATABASE_NAME", None) or getattr(Config, "DB_NAME", "AshMovieBot")
-        if motor and url:
+        self.bans_col = None
+        self.warns_col = None
+        self.force_sub_col = None
+
+        if self.db_url and motor is not None:
             try:
-                self.client = motor.motor_asyncio.AsyncIOMotorClient(url)
-                self.db = self.client[name]
+                self.client = motor.motor_asyncio.AsyncIOMotorClient(self.db_url, serverSelectionTimeoutMS=5000)
+                self.db = self.client[self.db_name]
                 self.movies_col = self.db[getattr(Config, "DB_COLLECTION", "movies")]
-                self.users_col = self.db["users"]
-                self.warns_col = self.db["warns"]
                 self.sessions_col = self.db["sessions"]
+                self.bans_col = self.db["bans"]
+                self.warns_col = self.db["warns"]
+                self.force_sub_col = self.db["force_sub"]
                 self.has_mongo = True
-                logger.info("[DB] MongoDB connected")
+                logger.info("[DB] Mongo connected: %s", self.db_name)
             except Exception as e:
-                logger.error(f"[DB] Mongo connect fail: {e}")
+                logger.error("[DB] Mongo connect failed: %s", e)
                 self.has_mongo = False
-        else:
-            logger.warning("[DB] Running in memory mode (no Mongo)")
 
     async def init_indexes(self):
         if not self.has_mongo:
@@ -72,8 +70,9 @@ class Database:
             await self.movies_col.create_index("movie_id", unique=True)
             await self.movies_col.create_index("normalized_title")
             await self.movies_col.create_index("group_msg_id")
+            await self.sessions_col.create_index("admin_id", unique=True)
         except Exception as e:
-            logger.warning(f"[DB] index: {e}")
+            logger.warning("[DB] indexes: %s", e)
 
     def generate_movie_id(self) -> str:
         return uuid.uuid4().hex[:12]
@@ -101,6 +100,61 @@ class Database:
                 logger.error(f"[DB] create_movie: {e}")
         self._mem_movies[mid] = doc
         return doc
+
+    async def find_movie_by_title_year(self, title: str, year=None) -> Optional[dict]:
+        """Same normalized title + same year → existing movie (for merge / no duplicate)."""
+        norm = re.sub(r"[^\w\s]", " ", (title or "").lower())
+        norm = re.sub(r"\s+", " ", norm).strip()
+        if not norm:
+            return None
+        year_val = None
+        if year is not None and str(year).isdigit():
+            year_val = int(year)
+
+        def _match(doc):
+            dnorm = (doc.get("normalized_title") or "")
+            dnorm = re.sub(r"[^\w\s]", " ", dnorm.lower())
+            dnorm = re.sub(r"\s+", " ", dnorm).strip()
+            if dnorm != norm:
+                t2 = re.sub(r"[^\w\s]", " ", (doc.get("title") or "").lower())
+                t2 = re.sub(r"\s+", " ", t2).strip()
+                if t2 != norm:
+                    return False
+            dy = doc.get("year")
+            if year_val is None and (dy is None or dy == "" or dy == "N/A"):
+                return True
+            try:
+                return int(dy) == year_val if dy is not None and str(dy).isdigit() else (year_val is None)
+            except Exception:
+                return year_val is None
+
+        if self.has_mongo and self.movies_col is not None:
+            try:
+                best = None
+                best_ts = ""
+                async for doc in self.movies_col.find({}):
+                    if not _match(doc):
+                        continue
+                    ts = str(doc.get("added_at") or doc.get("updated_at") or "")
+                    if best is None or ts >= best_ts:
+                        best = doc
+                        best_ts = ts
+                if best:
+                    best["_id"] = str(best.get("_id", ""))
+                    return best
+            except Exception as e:
+                logger.error(f"[DB] find_movie_by_title_year: {e}")
+
+        best = None
+        best_ts = ""
+        for doc in self._mem_movies.values():
+            if not _match(doc):
+                continue
+            ts = str(doc.get("added_at") or "")
+            if best is None or ts >= best_ts:
+                best = doc
+                best_ts = ts
+        return best
 
     async def add_quality_to_movie(self, movie_id: str, quality_key: str, quality_data: dict) -> bool:
         if self.has_mongo and self.movies_col is not None:
@@ -185,70 +239,58 @@ class Database:
             candidates = list(self._mem_movies.values())
         results = []
         for m in candidates:
-            title = (m.get("title") or "")
-            norm = (m.get("normalized_title") or re.sub(r"[^\w\s]", "", title.lower())).strip()
-            title_tokens = [t for t in norm.split() if len(t) >= 2]
-            if not title_tokens:
+            mtitle = (m.get("normalized_title") or m.get("title") or "").lower()
+            mtitle = re.sub(r"[^\w\s]", " ", mtitle)
+            mtitle = re.sub(r"\s+", " ", mtitle).strip()
+            m_tokens = set(mtitle.split())
+            if not m_tokens:
                 continue
-            if year_tokens:
-                my = str(m.get("year") or "")
-                if my and my not in year_tokens:
-                    if not any(yt in title.lower() for yt in year_tokens):
-                        continue
-            if not query_title_tokens:
-                results.append(m)
-                continue
-            matched = sum(1 for t in query_title_tokens if t in title_tokens or t in norm)
-            need = max(1, (len(query_title_tokens) + 1) // 2)
-            if len(query_title_tokens) == 1 and len(query_title_tokens[0]) <= 3:
-                if query_title_tokens[0] not in title_tokens:
+            if query_title_tokens:
+                hits = sum(1 for t in query_title_tokens if t in m_tokens or any(t in mt for mt in m_tokens))
+                if hits < max(1, (len(query_title_tokens) + 1) // 2):
                     continue
-                if len(title_tokens) > 3:
+            myear = m.get("year")
+            if year_tokens and myear is not None:
+                if str(myear) not in year_tokens:
                     continue
-            if matched >= need:
-                results.append(m)
-        results.sort(key=lambda x: (0 if x.get("group_msg_id") or x.get("group_post_link") else 1, x.get("title") or ""))
-        return results[:50]
+            results.append(m)
+        results.sort(key=lambda x: str(x.get("added_at") or ""), reverse=True)
+        return results
 
     async def delete_movie(self, movie_id: str) -> bool:
         if self.has_mongo and self.movies_col is not None:
             try:
-                res = await self.movies_col.delete_one({"movie_id": movie_id})
-                self._mem_movies.pop(movie_id, None)
-                return res.deleted_count > 0
+                await self.movies_col.delete_one({"movie_id": movie_id})
             except Exception as e:
                 logger.error(f"[DB] delete_movie: {e}")
-        return self._mem_movies.pop(movie_id, None) is not None
+        self._mem_movies.pop(movie_id, None)
+        return True
 
     async def delete_by_group_msg_id(self, msg_id: int) -> list:
-        deleted_titles = []
+        deleted = []
         if self.has_mongo and self.movies_col is not None:
             try:
-                cursor = self.movies_col.find({"group_msg_id": int(msg_id)})
-                async for doc in cursor:
-                    deleted_titles.append(doc.get("title") or doc.get("movie_id"))
-                    await self.movies_col.delete_one({"_id": doc["_id"]})
-                    self._mem_movies.pop(doc.get("movie_id"), None)
+                async for doc in self.movies_col.find({"group_msg_id": msg_id}):
+                    mid = doc.get("movie_id")
+                    await self.movies_col.delete_one({"movie_id": mid})
+                    deleted.append(mid)
+                    self._mem_movies.pop(mid, None)
             except Exception as e:
                 logger.error(f"[DB] delete_by_group_msg_id: {e}")
-        else:
-            for mid, m in list(self._mem_movies.items()):
-                if m.get("group_msg_id") == int(msg_id):
-                    deleted_titles.append(m.get("title") or mid)
-                    del self._mem_movies[mid]
-        return deleted_titles
+        return deleted
 
     async def get_ban_status(self, user_id: int) -> dict:
-        if user_id in getattr(Config, "BANNED_USERS", []):
-            return {"is_banned": True, "reason": "config"}
-        if self.has_mongo and self.users_col is not None:
+        if self.has_mongo and self.bans_col is not None:
             try:
-                doc = await self.users_col.find_one({"user_id": int(user_id)})
-                if doc and doc.get("is_banned"):
-                    return {"is_banned": True, "reason": doc.get("ban_reason", "")}
+                doc = await self.bans_col.find_one({"user_id": user_id})
+                if doc:
+                    return {"is_banned": True, "reason": doc.get("reason", "")}
             except Exception:
                 pass
-        return {"is_banned": False, "reason": ""}
+        b = self._mem_bans.get(user_id)
+        if b:
+            return {"is_banned": True, "reason": b.get("reason", "")}
+        return {"is_banned": False}
 
     async def is_banned(self, user_id: int) -> bool:
         st = await self.get_ban_status(user_id)
@@ -259,23 +301,24 @@ class Database:
         if self.has_mongo and self.warns_col is not None:
             try:
                 await self.warns_col.insert_one({
-                    "user_id": int(user_id),
-                    "by": int(by),
-                    "reason": reason,
+                    "user_id": user_id, "by": by, "reason": reason,
                     "at": datetime.datetime.utcnow().isoformat(),
                 })
-                count = await self.warns_col.count_documents({"user_id": int(user_id)})
+                count = await self.warns_col.count_documents({"user_id": user_id})
             except Exception as e:
                 logger.error(f"[DB] add_warning: {e}")
+        else:
+            self._mem_warns.setdefault(user_id, []).append({"by": by, "reason": reason})
+            count = len(self._mem_warns[user_id])
         return count
 
     async def get_warnings_count(self, user_id: int) -> int:
         if self.has_mongo and self.warns_col is not None:
             try:
-                return await self.warns_col.count_documents({"user_id": int(user_id)})
+                return await self.warns_col.count_documents({"user_id": user_id})
             except Exception:
                 pass
-        return 0
+        return len(self._mem_warns.get(user_id, []))
 
     def make_telegram_post_link(self, chat_id: int, msg_id: int) -> str:
         cid = str(chat_id)
@@ -294,94 +337,54 @@ class Database:
         return len(self._mem_movies)
 
     async def list_movies(self, page: int = 1, per_page: int = 20) -> List[dict]:
+        skip = max(0, (page - 1) * per_page)
         out = []
         if self.has_mongo and self.movies_col is not None:
             try:
-                cursor = self.movies_col.find({}).sort("added_at", -1).skip(max(0, (page - 1) * per_page)).limit(per_page)
-                async for doc in cursor:
+                async for doc in self.movies_col.find({}).sort("added_at", -1).skip(skip).limit(per_page):
                     doc["_id"] = str(doc.get("_id", ""))
                     out.append(doc)
+                return out
             except Exception as e:
                 logger.error(f"[DB] list_movies: {e}")
-        else:
-            out = list(self._mem_movies.values())[(page - 1) * per_page: page * per_page]
-        return out
+        items = sorted(self._mem_movies.values(), key=lambda x: str(x.get("added_at") or ""), reverse=True)
+        return items[skip: skip + per_page]
 
-    # -------------------- sessions (needed by session_manager /addmovie) --------------------
     async def get_active_session(self, admin_id: int):
-        if admin_id in self._mem_sessions:
-            return self._mem_sessions[admin_id]
         if self.has_mongo and self.sessions_col is not None:
             try:
-                doc = await self.sessions_col.find_one({"admin_id": int(admin_id)})
+                doc = await self.sessions_col.find_one({"admin_id": admin_id})
                 if doc:
-                    doc.pop("_id", None)
-                    self._mem_sessions[admin_id] = doc
-                    return doc
+                    return doc.get("session")
             except Exception as e:
-                logger.warning(f"[DB] get_active_session: {e}")
-        return None
+                logger.error(f"[DB] get_active_session: {e}")
+        return self._mem_sessions.get(admin_id)
 
     async def set_active_session(self, admin_id: int, session: dict):
-        session = dict(session or {})
-        session["admin_id"] = int(admin_id)
         self._mem_sessions[admin_id] = session
         if self.has_mongo and self.sessions_col is not None:
             try:
                 await self.sessions_col.update_one(
-                    {"admin_id": int(admin_id)},
-                    {"$set": session},
+                    {"admin_id": admin_id},
+                    {"$set": {"admin_id": admin_id, "session": session}},
                     upsert=True,
                 )
             except Exception as e:
-                logger.warning(f"[DB] set_active_session: {e}")
+                logger.error(f"[DB] set_active_session: {e}")
 
     async def clear_active_session(self, admin_id: int):
         self._mem_sessions.pop(admin_id, None)
         if self.has_mongo and self.sessions_col is not None:
             try:
-                await self.sessions_col.delete_one({"admin_id": int(admin_id)})
+                await self.sessions_col.delete_one({"admin_id": admin_id})
             except Exception as e:
-                logger.warning(f"[DB] clear_active_session: {e}")
+                logger.error(f"[DB] clear_active_session: {e}")
 
     async def get_all_active_sessions(self) -> list:
-        return list(self._mem_sessions.values())
+        return list(self._mem_sessions.items())
 
     async def sync_from_group_and_channel(self, bot, limit: int = 500):
-        """Optional startup sync — never crash bot."""
-        count = 0
-        try:
-            group_id = getattr(Config, "MOVIE_GROUP_ID", None)
-            if not group_id:
-                return 0
-            async for msg in bot.get_chat_history(group_id, limit=limit):
-                text = (msg.caption or msg.text or "")
-                if "🎬" not in text:
-                    continue
-                already = any(m.get("group_msg_id") == msg.id for m in self._mem_movies.values())
-                if already:
-                    continue
-                title_m = re.search(r"🎬\s*(?:<b>)?([^\n<(]+)(?:</b>)?", text)
-                if not title_m:
-                    continue
-                raw_title = title_m.group(1).strip()
-                year_m = re.search(r"\((\d{4})\)", raw_title)
-                year = int(year_m.group(1)) if year_m else None
-                title = re.sub(r"\(\d{4}\)", "", raw_title).strip()
-                if not title:
-                    continue
-                norm = re.sub(r"[^\w\s]", "", title.lower()).strip()
-                doc = await self.create_movie(title=title, normalized_title=norm, year=year)
-                await self.update_movie_group_post(doc["movie_id"], group_id, msg.id)
-                count += 1
-            if count:
-                logger.info(f"[DB] Synced {count} movies from group")
-        except Exception as e:
-            logger.warning(f"[DB] Group sync notice: {e}")
-        return count
+        return 0
 
 
-db = Database(
-    getattr(Config, "DATABASE_URL", None) or getattr(Config, "DB_URL", None),
-    getattr(Config, "DATABASE_NAME", None) or getattr(Config, "DB_NAME", "AshMovieBot"),
-)
+db = Database()
