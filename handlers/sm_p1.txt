@@ -2,7 +2,7 @@
 # ASH AUTOMATIC MOVIE FILE STORE BOT
 # Module: handlers/save_media.py
 # Purpose: Instant /addmovie media handling. Surrogate-safe. Poster restored.
-# Version: 2026-10-25-v3.2-poster FAST
+# Version: 2026-10-26-v3.3-all-qualities-clean-title
 # ==============================================================================
 
 import asyncio
@@ -122,7 +122,7 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
         meta = {}
     title = _safe(meta.get("title") or session.get("title") or file_name.rsplit(".", 1)[0] or "Unknown")
     year = meta.get("year") or session.get("year")
-    quality_key = meta.get("quality") or meta.get("quality_label") or "720p"
+    quality_key = meta.get("quality") or meta.get("quality_label") or "HD"
     final_quality = quality_key
     filesize_str = format_size(filesize) if filesize else "?"
     file_name = _safe(file_name)
@@ -137,7 +137,7 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
         active_title = session.get("title") or title
         active_year = session.get("year") or year
 
-        # First file → create movie + register session
+        # First file → reuse same title+year movie (no duplicate) OR create new
         if not movie_id:
             poster_file_id = session.get("poster_file_id")
             if not poster_file_id:
@@ -146,13 +146,38 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
                 except Exception:
                     poster_file_id = None
 
-            doc = await db.create_movie(
-                title=active_title,
-                normalized_title=_safe(active_title.lower()),
-                year=active_year,
-                poster_file_id=poster_file_id,
-            )
-            movie_id = doc.get("movie_id")
+            existing = None
+            try:
+                existing = await db.find_movie_by_title_year(active_title, active_year)
+            except Exception:
+                existing = None
+
+            if existing and existing.get("movie_id"):
+                # Same movie already in DB → merge qualities (latest group post wins)
+                movie_id = existing["movie_id"]
+                try:
+                    patch = {"updated_at": __import__("datetime").datetime.utcnow().isoformat()}
+                    # Prefer cleaner (shorter) title over dirty filename-style
+                    if active_title and len(active_title) < len(str(existing.get("title") or "")):
+                        patch["title"] = active_title
+                        patch["normalized_title"] = _safe(active_title.lower())
+                    if poster_file_id:
+                        patch["poster_file_id"] = poster_file_id
+                    if getattr(db, "has_mongo", False) and getattr(db, "movies_col", None) is not None:
+                        await db.movies_col.update_one({"movie_id": movie_id}, {"$set": patch})
+                    if movie_id in getattr(db, "_mem_movies", {}):
+                        db._mem_movies[movie_id].update(patch)
+                except Exception as e:
+                    logger.debug("merge existing movie patch: %s", type(e).__name__)
+            else:
+                doc = await db.create_movie(
+                    title=active_title,
+                    normalized_title=_safe(active_title.lower()),
+                    year=active_year,
+                    poster_file_id=poster_file_id,
+                )
+                movie_id = doc.get("movie_id")
+
             await session_mgr.register_first_movie_file(
                 admin_id, movie_id, active_title,
                 year=active_year, quality=final_quality, poster_file_id=poster_file_id,
@@ -181,7 +206,7 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
         qualities_list = (await db.get_movie(movie_id) or {}).get("qualities", {})
         q_str = ", ".join(qualities_list.keys()) if qualities_list else final_quality
         status_text = (
-            f"🎬 **Movie Session Active** (v3.2)\n\n"
+            f"🎬 **Movie Session Active** (v3.3)\n\n"
             f"**Title:** `{active_title}`\n"
             f"**Year:** `{active_year or 'N/A'}`\n\n"
             f"✅ **Added:** `{final_quality}` ({filesize_str})\n"
@@ -195,13 +220,16 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
                 await bot.edit_message_text(
                     chat_id=status_chat_id,
                     message_id=status_msg_id,
-                    text=status_text,
+                    text=_safe(status_text),
                     reply_markup=_SESSION_MARKUP,
                 )
             else:
-                await message.reply_text(status_text, reply_markup=_SESSION_MARKUP, quote=True)
-        except Exception:
-            try:
-                await message.reply_text(status_text, reply_markup=_SESSION_MARKUP, quote=True)
-            except Exception:
-                pass
+                sent = await message.reply_text(_safe(status_text), quote=True, reply_markup=_SESSION_MARKUP)
+                session["status_msg_id"] = sent.id
+                session["status_chat_id"] = message.chat.id
+                try:
+                    await session_mgr.update_session(admin_id, session)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug("status edit: %s", type(e).__name__)
