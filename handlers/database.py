@@ -172,7 +172,6 @@ class Database:
         query_title_tokens = [t for t in q_tokens if t not in year_tokens]
         if not query_title_tokens and not year_tokens:
             return []
-
         candidates = []
         if self.has_mongo and self.movies_col is not None:
             try:
@@ -184,7 +183,6 @@ class Database:
                 candidates = list(self._mem_movies.values())
         else:
             candidates = list(self._mem_movies.values())
-
         results = []
         for m in candidates:
             title = (m.get("title") or "")
@@ -195,23 +193,20 @@ class Database:
             if year_tokens:
                 my = str(m.get("year") or "")
                 if my and my not in year_tokens:
-                    # allow if year not in title tokens either
                     if not any(yt in title.lower() for yt in year_tokens):
                         continue
             if not query_title_tokens:
                 results.append(m)
                 continue
             matched = sum(1 for t in query_title_tokens if t in title_tokens or t in norm)
-            need = max(1, (len(query_title_tokens) + 1) // 2)  # majority
+            need = max(1, (len(query_title_tokens) + 1) // 2)
             if len(query_title_tokens) == 1 and len(query_title_tokens[0]) <= 3:
-                # short single token must be exact title word of short title
                 if query_title_tokens[0] not in title_tokens:
                     continue
                 if len(title_tokens) > 3:
                     continue
             if matched >= need:
                 results.append(m)
-        # prefer ones with group_msg_id / post link
         results.sort(key=lambda x: (0 if x.get("group_msg_id") or x.get("group_post_link") else 1, x.get("title") or ""))
         return results[:50]
 
@@ -312,6 +307,81 @@ class Database:
             out = list(self._mem_movies.values())[(page - 1) * per_page: page * per_page]
         return out
 
+    # -------------------- sessions (needed by session_manager /addmovie) --------------------
+    async def get_active_session(self, admin_id: int):
+        if admin_id in self._mem_sessions:
+            return self._mem_sessions[admin_id]
+        if self.has_mongo and self.sessions_col is not None:
+            try:
+                doc = await self.sessions_col.find_one({"admin_id": int(admin_id)})
+                if doc:
+                    doc.pop("_id", None)
+                    self._mem_sessions[admin_id] = doc
+                    return doc
+            except Exception as e:
+                logger.warning(f"[DB] get_active_session: {e}")
+        return None
 
-db = Database(getattr(Config, "DATABASE_URL", None) or getattr(Config, "DB_URL", None),
-             getattr(Config, "DATABASE_NAME", None) or getattr(Config, "DB_NAME", "AshMovieBot"))
+    async def set_active_session(self, admin_id: int, session: dict):
+        session = dict(session or {})
+        session["admin_id"] = int(admin_id)
+        self._mem_sessions[admin_id] = session
+        if self.has_mongo and self.sessions_col is not None:
+            try:
+                await self.sessions_col.update_one(
+                    {"admin_id": int(admin_id)},
+                    {"$set": session},
+                    upsert=True,
+                )
+            except Exception as e:
+                logger.warning(f"[DB] set_active_session: {e}")
+
+    async def clear_active_session(self, admin_id: int):
+        self._mem_sessions.pop(admin_id, None)
+        if self.has_mongo and self.sessions_col is not None:
+            try:
+                await self.sessions_col.delete_one({"admin_id": int(admin_id)})
+            except Exception as e:
+                logger.warning(f"[DB] clear_active_session: {e}")
+
+    async def get_all_active_sessions(self) -> list:
+        return list(self._mem_sessions.values())
+
+    async def sync_from_group_and_channel(self, bot, limit: int = 500):
+        """Optional startup sync — never crash bot."""
+        count = 0
+        try:
+            group_id = getattr(Config, "MOVIE_GROUP_ID", None)
+            if not group_id:
+                return 0
+            async for msg in bot.get_chat_history(group_id, limit=limit):
+                text = (msg.caption or msg.text or "")
+                if "🎬" not in text:
+                    continue
+                already = any(m.get("group_msg_id") == msg.id for m in self._mem_movies.values())
+                if already:
+                    continue
+                title_m = re.search(r"🎬\s*(?:<b>)?([^\n<(]+)(?:</b>)?", text)
+                if not title_m:
+                    continue
+                raw_title = title_m.group(1).strip()
+                year_m = re.search(r"\((\d{4})\)", raw_title)
+                year = int(year_m.group(1)) if year_m else None
+                title = re.sub(r"\(\d{4}\)", "", raw_title).strip()
+                if not title:
+                    continue
+                norm = re.sub(r"[^\w\s]", "", title.lower()).strip()
+                doc = await self.create_movie(title=title, normalized_title=norm, year=year)
+                await self.update_movie_group_post(doc["movie_id"], group_id, msg.id)
+                count += 1
+            if count:
+                logger.info(f"[DB] Synced {count} movies from group")
+        except Exception as e:
+            logger.warning(f"[DB] Group sync notice: {e}")
+        return count
+
+
+db = Database(
+    getattr(Config, "DATABASE_URL", None) or getattr(Config, "DB_URL", None),
+    getattr(Config, "DATABASE_NAME", None) or getattr(Config, "DB_NAME", "AshMovieBot"),
+)
