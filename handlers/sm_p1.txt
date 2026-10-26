@@ -1,0 +1,201 @@
+# ==============================================================================
+# ASH AUTOMATIC MOVIE FILE STORE BOT
+# Module: handlers/save_media.py
+# Purpose: Instant /addmovie media handling. Surrogate-safe. Poster restored.
+# Version: 2026-10-25-v3.2-poster FAST
+# ==============================================================================
+
+import asyncio
+import logging
+from pyrogram import Client
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait
+
+from configs import Config
+from handlers.database import db
+from handlers.parser import extract_movie_metadata, format_size, sanitize_text
+from handlers.session_manager import session_mgr
+from handlers.movie_card import build_final_movie_card_text, build_final_movie_card_buttons
+from handlers.poster import extract_poster_from_message
+
+logger = logging.getLogger(__name__)
+
+_SESSION_MARKUP = InlineKeyboardMarkup([
+    [
+        InlineKeyboardButton("Continue Upload", callback_data="session_continue"),
+        InlineKeyboardButton("Generate Links", callback_data="session_generate"),
+    ],
+    [InlineKeyboardButton("Cancel Session", callback_data="session_cancel")],
+])
+
+
+def _safe(s, default=""):
+    try:
+        return sanitize_text(s) if s is not None else default
+    except Exception:
+        return default
+
+
+async def forward_to_db_channel(bot: Client, message: Message) -> Message:
+    try:
+        sent = await message.copy(Config.DB_CHANNEL)
+        return sent
+    except FloodWait as sl:
+        await asyncio.sleep(sl.value)
+        return await forward_to_db_channel(bot, message)
+    except Exception as e:
+        logger.error("Failed to forward media to DB channel: %s", type(e).__name__)
+        raise
+
+
+async def _bg_copy_and_patch(bot, message, movie_id, quality_key, quality_data):
+    """Background: copy file to DB channel, then patch quality with channel_msg_id. FAST path."""
+    try:
+        channel_msg = await forward_to_db_channel(bot, message)
+        quality_data = dict(quality_data)
+        quality_data["channel_msg_id"] = channel_msg.id
+        await db.add_quality_to_movie(movie_id, quality_key, quality_data)
+        logger.info("[BG] channel copy done movie=%s q=%s", movie_id, quality_key)
+    except Exception as e:
+        logger.error("[BG] channel copy failed: %s", type(e).__name__)
+
+
+async def _quick_status_edit(bot, session, text, markup=None):
+    status_msg_id = session.get("status_msg_id")
+    status_chat_id = session.get("status_chat_id")
+    if not status_msg_id or not status_chat_id:
+        return
+    try:
+        await bot.edit_message_text(
+            chat_id=status_chat_id,
+            message_id=status_msg_id,
+            text=_safe(text, "Processing..."),
+            reply_markup=markup or _SESSION_MARKUP,
+        )
+    except Exception:
+        pass
+
+
+async def handle_incoming_movie_file(bot: Client, message: Message):
+    try:
+        await _handle_incoming_movie_file_inner(bot, message)
+    except Exception as e:
+        logger.exception("handle_incoming_movie_file")
+        try:
+            await message.reply_text(f"File process fail: {type(e).__name__}: {e}", quote=True)
+        except Exception:
+            pass
+
+
+async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
+    admin_id = message.from_user.id if message.from_user else 0
+    if admin_id not in getattr(Config, "ADMINS", set()):
+        return
+
+    session = await session_mgr.get_session(admin_id)
+    if not session:
+        await message.reply_text("⚠️ Koi active movie session nahi hai.\nPehle /addmovie chalao.", quote=True)
+        return
+
+    # Parse metadata FAST from filename/caption
+    meta = extract_movie_metadata(message)
+    title = _safe(meta.get("title") or session.get("title") or "Unknown")
+    year = meta.get("year") or session.get("year")
+    quality_key = meta.get("quality") or "default"
+    final_quality = quality_key
+    filesize = meta.get("file_size") or 0
+    filesize_str = format_size(filesize) if filesize else "?"
+    file_id = meta.get("file_id")
+    file_name = _safe(meta.get("file_name") or "")
+
+    if not file_id:
+        if message.video:
+            file_id = message.video.file_id
+            filesize = message.video.file_size or 0
+            file_name = message.video.file_name or file_name
+        elif message.document:
+            file_id = message.document.file_id
+            filesize = message.document.file_size or 0
+            file_name = message.document.file_name or file_name
+        filesize_str = format_size(filesize) if filesize else "?"
+
+    if not file_id:
+        await message.reply_text("Sirf video/document support hai.", quote=True)
+        return
+
+    async with session_mgr.get_lock(admin_id):
+        session = await session_mgr.get_session(admin_id)
+        if not session:
+            await message.reply_text("⚠️ Session expire ho gaya. /addmovie dobara chalao.", quote=True)
+            return
+
+        movie_id = session.get("movie_id")
+        active_title = session.get("title") or title
+        active_year = session.get("year") or year
+
+        # First file → create movie + register session
+        if not movie_id:
+            # Poster extract (once)
+            poster_file_id = session.get("poster_file_id")
+            if not poster_file_id:
+                try:
+                    poster_file_id = await extract_poster_from_message(bot, message)
+                except Exception:
+                    poster_file_id = None
+
+            doc = await db.create_movie(
+                title=active_title,
+                normalized_title=_safe(active_title.lower()),
+                year=active_year,
+                poster_file_id=poster_file_id,
+            )
+            movie_id = doc.get("movie_id")
+            await session_mgr.register_first_movie_file(
+                admin_id, movie_id, active_title,
+                year=active_year, poster_file_id=poster_file_id,
+            )
+            session = await session_mgr.get_session(admin_id) or session
+            session["movie_id"] = movie_id
+            session["title"] = active_title
+            session["year"] = active_year
+            if poster_file_id:
+                session["poster_file_id"] = poster_file_id
+
+        quality_data = {
+            "file_id": file_id,
+            "file_name": file_name,
+            "file_size": filesize,
+            "label": final_quality,
+        }
+        # Save quality immediately (FAST), channel copy in background
+        await db.add_quality_to_movie(movie_id, final_quality, quality_data)
+        await session_mgr.register_additional_quality(admin_id, final_quality)
+        asyncio.create_task(_bg_copy_and_patch(bot, message, movie_id, final_quality, quality_data))
+
+        qualities_list = (await db.get_movie(movie_id) or {}).get("qualities", {})
+        q_str = ", ".join(qualities_list.keys()) if qualities_list else final_quality
+        status_text = (
+            f"🎬 **Movie Session Active** (v3.2)\n\n"
+            f"**Title:** `{active_title}`\n"
+            f"**Year:** `{active_year or 'N/A'}`\n\n"
+            f"✅ **Added:** `{final_quality}` ({filesize_str})\n"
+            f"**All qualities:** `{q_str}`\n\n"
+            f"Aur quality bhejo ya Generate Links dabaao."
+        )
+        status_msg_id = session.get("status_msg_id")
+        status_chat_id = session.get("status_chat_id", message.chat.id)
+        try:
+            if status_msg_id:
+                await bot.edit_message_text(
+                    chat_id=status_chat_id,
+                    message_id=status_msg_id,
+                    text=status_text,
+                    reply_markup=_SESSION_MARKUP,
+                )
+            else:
+                await message.reply_text(status_text, reply_markup=_SESSION_MARKUP, quote=True)
+        except Exception:
+            try:
+                await message.reply_text(status_text, reply_markup=_SESSION_MARKUP, quote=True)
+            except Exception:
+                pass
