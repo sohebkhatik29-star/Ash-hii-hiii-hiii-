@@ -1,74 +1,99 @@
-# ==============================================================================
-# ASH AUTOMATIC MOVIE FILE STORE BOT 🎬
-# Module: handlers/poster.py
-# Purpose: Robust, permanent video poster extraction.
-#          Downloads the embedded video thumbnail and converts it to a genuine
-#          Telegram photo.file_id so Telegram never rejects it with PHOTO_INVALID.
-# ==============================================================================
+# ============================================================================
+# handlers/poster.py  — ONLY poster extraction (alg file)
+# Video/document se thumbnail nikaal ke permanent Telegram photo.file_id banata hai
+# ============================================================================
 
 import os
 import logging
-from typing import Tuple, Optional
+from typing import Optional
 from pyrogram import Client
 from pyrogram.types import Message
 from configs import Config
-from handlers.parser import sanitize_text
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("Poster")
 
-async def extract_poster_from_message(bot: Client, message: Message) -> Tuple[Optional[str], str]:
+
+def _safe_name(s) -> str:
+    if not s:
+        return "media"
+    try:
+        from handlers.parser import sanitize_text
+        return sanitize_text(str(s)) or "media"
+    except Exception:
+        return str(s)[:80]
+
+
+async def extract_poster_from_message(bot: Client, message: Message) -> Optional[str]:
     """
-    Extracts poster from incoming video/document by downloading the embedded
-    thumbnail and uploading it as a valid Telegram photo into DB_CHANNEL.
-    Returns: (photo_file_id_or_none, source_description)
+    Incoming video/document se poster nikaalta hai.
+    Returns: photo file_id (str) ya None.
+
+    IMPORTANT: sirf file_id string return karta hai (tuple nahi),
+    taaki save_media me poster_file_id = await extract_poster... seedha kaam kare.
     """
     try:
-        # 1. If message is already a photo (e.g. admin sent photo)
+        # 1) Admin ne seedha photo bheja
         if message.photo:
-            return message.photo.file_id, "manual_photo"
+            fid = message.photo.file_id
+            logger.info("Poster source=manual_photo")
+            return fid
 
-        # 2. Extract embedded thumbnail from video or document
         media = message.video or message.document
         if not media:
-            return None, "none"
+            return None
 
+        # 2) Embedded thumbnail (largest)
         thumb = None
-        if hasattr(media, "thumbs") and media.thumbs:
+        if getattr(media, "thumbs", None):
             thumb = media.thumbs[-1]
-        elif hasattr(media, "thumb") and media.thumb:
+        elif getattr(media, "thumb", None):
             thumb = media.thumb
 
         if not thumb:
-            logger.info("No embedded thumbnail found on media.")
-            return None, "none"
+            logger.info("No embedded thumbnail on media")
+            return None
 
-        # Download small thumbnail (~20-50 KB) locally
-        safe_name = sanitize_text(getattr(media, "file_name", "") or "media")
-        logger.info(f"Downloading embedded thumbnail for {safe_name}...")
-        thumb_path = await bot.download_media(thumb)
+        target = getattr(Config, "DB_CHANNEL", None) or message.chat.id
+        safe = _safe_name(getattr(media, "file_name", None))
 
-        if thumb_path and os.path.exists(thumb_path):
+        # 3a) Pehle thumb.file_id se direct send_photo try (fast, no download)
+        thumb_fid = getattr(thumb, "file_id", None)
+        if thumb_fid:
             try:
-                # Upload to DB_CHANNEL as a REAL Telegram Photo to get a permanent photo.file_id
-                target_channel = Config.DB_CHANNEL or message.chat.id
-                sent_photo = await bot.send_photo(
-                    chat_id=target_channel,
-                    photo=thumb_path,
-                    caption=f"Poster extracted for {sanitize_text(getattr(media, 'file_name', '') or 'Movie')}"
+                sent = await bot.send_photo(
+                    chat_id=target,
+                    photo=thumb_fid,
+                    caption=f"Poster: {safe}",
                 )
-                if sent_photo and sent_photo.photo:
-                    photo_file_id = sent_photo.photo.file_id
-                    logger.info(f"Successfully created permanent photo file_id: {photo_file_id[:15]}...")
-                    return photo_file_id, "video_thumbnail"
-            finally:
-                # Always remove local temp file
+                if sent and sent.photo:
+                    logger.info("Poster source=thumb_file_id ok")
+                    return sent.photo.file_id
+            except Exception as e:
+                logger.debug("thumb_file_id send failed: %s", type(e).__name__)
+
+        # 3b) Download thumb -> re-upload as real photo (permanent file_id)
+        logger.info("Downloading thumbnail for %s...", safe)
+        thumb_path = await bot.download_media(thumb)
+        if not thumb_path or not os.path.exists(thumb_path):
+            return None
+
+        try:
+            sent = await bot.send_photo(
+                chat_id=target,
+                photo=thumb_path,
+                caption=f"Poster: {safe}",
+            )
+            if sent and sent.photo:
+                logger.info("Poster source=video_thumbnail ok")
+                return sent.photo.file_id
+        finally:
+            try:
                 if os.path.exists(thumb_path):
-                    try:
-                        os.remove(thumb_path)
-                    except Exception:
-                        pass
+                    os.remove(thumb_path)
+            except Exception:
+                pass
 
     except Exception as e:
-        logger.warning(f"[Poster Extraction Error]: {type(e).__name__}: {e}")
+        logger.warning("[Poster] %s: %s", type(e).__name__, e)
 
-    return None, "none"
+    return None
