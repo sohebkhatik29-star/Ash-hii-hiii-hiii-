@@ -1,7 +1,7 @@
 # ============================================================================
 # handlers/group_filter.py  — ONLY filter / search
 # Style: movie name + Link 🔗 https://t.me/c/... (group poster post)
-# Same title+year = ek; alag year = alag line
+# Query: noise hatao, pura title strict match (search_query.py)
 # ============================================================================
 import asyncio
 import logging
@@ -11,6 +11,7 @@ from pyrogram.types import Message, CallbackQuery
 from configs import Config
 from handlers.database import db
 from handlers.force_sub_handler import enforce_force_sub_in_group
+from handlers.search_query import clean_search_query, filter_strict_matches
 
 logger = logging.getLogger("GroupFilter")
 AUTO_DELETE_SECONDS = int(getattr(Config, "AUTO_DELETE_TIME", 1800) or 1800)
@@ -54,11 +55,6 @@ def _get_post_link(m: dict) -> str:
 
 
 def build_link_results_text(query: str, results: list) -> str:
-    """
-    Format jaise dusre group:
-    1. Movie Name (Year)
-    Link 🔗 https://t.me/c/..../msg_id
-    """
     lines = [f"🔎 <b>Results for:</b> <code>{query}</code>", f"📄 Total: {len(results)}", ""]
     for i, m in enumerate(results, start=1):
         title = m.get("title") or "Unknown"
@@ -131,9 +127,21 @@ def register_group_filter_handlers(bot: Client):
         except Exception:
             pass
 
-        results = await db.search_movies(query)
+        # 1) Noise hatao — message se movie name extract
+        cleaned = clean_search_query(query)
+        search_q = cleaned if cleaned else query.strip()
+
+        if not search_q or len(search_q) < 2:
+            m = await message.reply_text(f"❌ Movie name samajh nahi aaya.", quote=True)
+            asyncio.create_task(_schedule_delete(client, message.chat.id, [m.id, message.id], 60))
+            return
+
+        results = await db.search_movies(search_q)
         if not isinstance(results, list):
             results = list(results or [])
+
+        # 2) Strict full-name match — short partial reject
+        results = filter_strict_matches(search_q, results)
         results = dedupe_by_title_year(results)
 
         if not results:
@@ -141,7 +149,6 @@ def register_group_filter_handlers(bot: Client):
             asyncio.create_task(_schedule_delete(client, message.chat.id, [m.id, message.id], 60))
             return
 
-        # Plain text + group poster link only (no buttons)
         text = build_link_results_text(query, results[:20])
         sent = await message.reply_text(
             text,
