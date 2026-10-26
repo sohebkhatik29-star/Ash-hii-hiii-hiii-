@@ -97,31 +97,35 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
         await message.reply_text("⚠️ Koi active movie session nahi hai.\nPehle /addmovie chalao.", quote=True)
         return
 
-    # Parse metadata FAST from filename/caption
-    meta = extract_movie_metadata(message)
-    title = _safe(meta.get("title") or session.get("title") or "Unknown")
-    year = meta.get("year") or session.get("year")
-    quality_key = meta.get("quality") or "default"
-    final_quality = quality_key
-    filesize = meta.get("file_size") or 0
-    filesize_str = format_size(filesize) if filesize else "?"
-    file_id = meta.get("file_id")
-    file_name = _safe(meta.get("file_name") or "")
-
-    if not file_id:
-        if message.video:
-            file_id = message.video.file_id
-            filesize = message.video.file_size or 0
-            file_name = message.video.file_name or file_name
-        elif message.document:
-            file_id = message.document.file_id
-            filesize = message.document.file_size or 0
-            file_name = message.document.file_name or file_name
-        filesize_str = format_size(filesize) if filesize else "?"
+    # Extract file info first
+    file_id = None
+    filesize = 0
+    file_name = ""
+    if message.video:
+        file_id = message.video.file_id
+        filesize = message.video.file_size or 0
+        file_name = message.video.file_name or ""
+    elif message.document:
+        file_id = message.document.file_id
+        filesize = message.document.file_size or 0
+        file_name = message.document.file_name or ""
 
     if not file_id:
         await message.reply_text("Sirf video/document support hai.", quote=True)
         return
+
+    # Parse metadata FAST from filename + caption
+    caption = message.caption or ""
+    try:
+        meta = extract_movie_metadata(file_name, caption)
+    except Exception:
+        meta = {}
+    title = _safe(meta.get("title") or session.get("title") or file_name.rsplit(".", 1)[0] or "Unknown")
+    year = meta.get("year") or session.get("year")
+    quality_key = meta.get("quality") or meta.get("quality_label") or "720p"
+    final_quality = quality_key
+    filesize_str = format_size(filesize) if filesize else "?"
+    file_name = _safe(file_name)
 
     async with session_mgr.get_lock(admin_id):
         session = await session_mgr.get_session(admin_id)
@@ -135,7 +139,6 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
 
         # First file → create movie + register session
         if not movie_id:
-            # Poster extract (once)
             poster_file_id = session.get("poster_file_id")
             if not poster_file_id:
                 try:
@@ -152,7 +155,7 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
             movie_id = doc.get("movie_id")
             await session_mgr.register_first_movie_file(
                 admin_id, movie_id, active_title,
-                year=active_year, poster_file_id=poster_file_id,
+                year=active_year, quality=final_quality, poster_file_id=poster_file_id,
             )
             session = await session_mgr.get_session(admin_id) or session
             session["movie_id"] = movie_id
@@ -169,7 +172,10 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
         }
         # Save quality immediately (FAST), channel copy in background
         await db.add_quality_to_movie(movie_id, final_quality, quality_data)
-        await session_mgr.register_additional_quality(admin_id, final_quality)
+        try:
+            await session_mgr.register_additional_quality(admin_id, final_quality)
+        except Exception:
+            pass
         asyncio.create_task(_bg_copy_and_patch(bot, message, movie_id, final_quality, quality_data))
 
         qualities_list = (await db.get_movie(movie_id) or {}).get("qualities", {})
