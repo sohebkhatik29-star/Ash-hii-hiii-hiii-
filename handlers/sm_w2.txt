@@ -1,80 +1,73 @@
 async def handle_generate_links_action(bot: Client, chat_id: int, admin_id: int):
-    """Finish the movie session: build card, post to group, save links."""
+    """Generate final movie card with poster + links."""
     session = await session_mgr.get_session(admin_id)
-    if not session:
-        try:
-            await bot.send_message(chat_id, "⚠️ Koi active movie session nahi hai.")
-        except Exception:
-            pass
+    if not session or not session.get("movie_id"):
+        await bot.send_message(chat_id, "⚠️ Koi active movie session nahi hai.")
         return
 
-    movie_id = session.get("movie_id")
-    if not movie_id:
-        try:
-            await bot.send_message(chat_id, "⚠️ Session me movie_id nahi mili. Pehle file bhejo.")
-        except Exception:
-            pass
-        return
-
+    movie_id = session["movie_id"]
     movie = await db.get_movie(movie_id)
     if not movie:
-        try:
-            await bot.send_message(chat_id, "⚠️ Movie DB me nahi mili.")
-        except Exception:
-            pass
+        await bot.send_message(chat_id, "⚠️ Movie data nahi mili.")
         return
 
-    title = _safe(movie.get("title") or session.get("title") or "Movie")
     try:
-        # Build caption + buttons from stored qualities
-        caption = build_final_movie_card_text(movie)
-        buttons = build_final_movie_card_buttons(movie)
-        poster_id = movie.get("poster_file_id") or session.get("poster_file_id")
-
-        group_id = getattr(Config, "MOVIE_GROUP_ID", None)
-        if not group_id:
-            await bot.send_message(chat_id, "❌ MOVIE_GROUP_ID set nahi hai.")
-            return
+        card_text = build_final_movie_card_text(movie)
+        buttons = build_final_movie_card_buttons(movie, for_group=True)
+        target_chat = Config.MOVIE_GROUP_ID or chat_id
+        poster_id = movie.get("poster_file_id")
+        sent = None
 
         if poster_id:
             try:
-                msg = await bot.send_photo(
-                    chat_id=group_id,
+                sent = await bot.send_photo(
+                    chat_id=target_chat,
                     photo=poster_id,
-                    caption=caption,
+                    caption=_safe(card_text),
                     reply_markup=buttons,
                 )
+            except Exception as pe:
+                logger.warning("send_photo failed (%s), fallback to text", type(pe).__name__)
+                sent = None
+
+        if not sent:
+            try:
+                sent = await bot.send_message(
+                    chat_id=target_chat,
+                    text=_safe(card_text),
+                    reply_markup=buttons,
+                    disable_web_page_preview=True,
+                )
+            except Exception as send_err:
+                logger.error("send card to group failed: %s", type(send_err).__name__)
+                sent = await bot.send_message(
+                    chat_id=chat_id,
+                    text=_safe(card_text),
+                    reply_markup=buttons,
+                    disable_web_page_preview=True,
+                )
+
+        if sent and Config.MOVIE_GROUP_ID:
+            try:
+                await db.update_movie_group_post(movie_id, int(Config.MOVIE_GROUP_ID), sent.id)
+            except Exception as up_err:
+                logger.error("update_movie_group_post: %s", type(up_err).__name__)
+
+        try:
+            await session_mgr.finish_session(admin_id)
+        except Exception:
+            try:
+                await session_mgr.cancel_session(admin_id)
             except Exception:
-                msg = await bot.send_message(
-                    chat_id=group_id,
-                    text=caption,
-                    reply_markup=buttons,
-                )
-        else:
-            msg = await bot.send_message(
-                chat_id=group_id,
-                text=caption,
-                reply_markup=buttons,
-            )
+                pass
 
-        post_link = await db.update_movie_group_post(movie_id, msg.chat.id, msg.id)
-        await session_mgr.finish_session(admin_id)
-
+        title = _safe(movie.get("title"), "Movie")
+        poster_ok = "✅ Poster ke sath" if poster_id else "⚠️ Poster nahi mila"
         await bot.send_message(
             chat_id,
-            f"✅ <b>Links generate ho gaye!</b>\n\n"
-            f"🎬 Movie: <b>{title}</b>\n"
-            f"Group me card post ho gaya. ✅\n"
-            f"Poster ke sath\n"
-            f"Link: {post_link or ''}",
+            f"✅ Links generate ho gaye!\n\n🎬 **Movie:** `{title}`\n"
+            f"Group me card post ho gaya. {poster_ok}",
         )
     except Exception as e:
-        logger.exception("handle_generate_links_action")
-        try:
-            await bot.send_message(chat_id, f"❌ Error: <code>{type(e).__name__}: {e}</code>")
-        except Exception:
-            pass
-        try:
-            await session_mgr.cancel_session(admin_id)
-        except Exception:
-            pass
+        logger.error("generate links error: %s: %s", type(e).__name__, e)
+        await bot.send_message(chat_id, f"❌ Link generate fail: {type(e).__name__}: {_safe(str(e))[:80]}")
