@@ -1,1 +1,184 @@
-# end fs part2
+async def handle_force_sub(bot: Client, cmd: Message) -> int:
+    try:
+        if not cmd.from_user:
+            return 200
+        uid = cmd.from_user.id
+        if uid in (Config.ADMINS or []):
+            return 200
+        try:
+            channels = await db.list_force_channels()
+        except Exception:
+            channels = []
+        if channels:
+            missing = await get_missing_channels(bot, uid)
+            if not missing:
+                return 200
+            name = _display_user(cmd.from_user)
+            text, markup = await build_force_sub_prompt(bot, name, missing)
+            try:
+                await bot.send_message(
+                    chat_id=cmd.chat.id, text=text, reply_markup=markup, disable_web_page_preview=True
+                )
+            except Exception as e:
+                logger.warning("handle_force_sub prompt: %s", e)
+            return 400
+        return 200
+    except Exception as e:
+        logger.warning("handle_force_sub error (allowing user): %s", e)
+        return 200
+
+
+async def handle_fs_callback(client: Client, query: CallbackQuery):
+    data = query.data or ""
+    if data.startswith("fs_mode:"):
+        if not query.from_user or not query.message:
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            return
+        chat_id = query.message.chat.id
+        uid = query.from_user.id
+        is_admin = await _is_group_admin(client, chat_id, uid)
+        if not is_admin and uid not in (Config.ADMINS or []):
+            try:
+                await query.answer("Sirf admin use kar sakte hain.", show_alert=True)
+            except Exception:
+                pass
+            return
+        parts = data.split(":")
+        if len(parts) < 3:
+            try:
+                await query.answer("Invalid", show_alert=True)
+            except Exception:
+                pass
+            return
+        mode, channel_id = parts[1], int(parts[2])
+        if mode == "cancel":
+            _FS_PENDING.pop(channel_id, None)
+            try:
+                await query.message.delete()
+            except Exception:
+                try:
+                    await query.message.edit_text("Cancelled.")
+                except Exception:
+                    pass
+            try:
+                await query.answer("Cancelled")
+            except Exception:
+                pass
+            return
+        pending = _FS_PENDING.pop(channel_id, {}) or {}
+        title = _safe_text(pending.get("title") or str(channel_id))
+        username = pending.get("username") or ""
+        try:
+            await db.add_force_channel(channel_id, title=title, username=username, mode=mode)
+            await query.message.edit_text(
+                f"✅ Force-sub channel add ho gaya.\n\n"
+                f"Channel: <b>{title}</b>\n"
+                f"Mode: <code>{mode}</code>\n"
+                f"ID: <code>{channel_id}</code>"
+            )
+            await query.answer("Added!")
+        except ValueError as ve:
+            if str(ve) == "MAX_7":
+                await query.answer("Max 7 channels", show_alert=True)
+            else:
+                await query.answer(str(ve)[:80], show_alert=True)
+        except Exception as e:
+            logger.error("fs_mode add: %s", e)
+            await query.answer("Error", show_alert=True)
+        return
+
+    if data in ("force_sub_joined", "force_sub_try", "fs_try", "fs_joined"):
+        user = query.from_user
+        if not user:
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            return
+        missing = await get_missing_channels(client, user.id)
+        if not missing:
+            try:
+                await query.message.edit_text("✅ Thank you! Ab movie search kar sakte ho.")
+            except Exception:
+                try:
+                    await query.message.delete()
+                except Exception:
+                    pass
+            try:
+                await query.answer("Joined!")
+            except Exception:
+                pass
+            return
+        text, markup = await build_force_sub_prompt(client, _display_user(user), missing)
+        try:
+            await query.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+        except Exception:
+            pass
+        try:
+            await query.answer("Abhi channels join nahi hue" if missing else "OK", show_alert=bool(missing))
+        except Exception:
+            pass
+        return
+
+    if data.startswith("fs_mark_req:"):
+        user = query.from_user
+        if not user:
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            return
+        try:
+            cid = int(data.split(":", 1)[1])
+        except Exception:
+            try:
+                await query.answer("Invalid channel", show_alert=True)
+            except Exception:
+                pass
+            return
+        uid = int(user.id)
+        _PENDING_REQUESTS[(cid, uid)] = asyncio.get_event_loop().time()
+        try:
+            await query.answer(
+                "✅ Request mark ho gaya. Ab 'Joined / Try Again' dabao.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        missing = await get_missing_channels(client, uid)
+        if missing:
+            text, markup = await build_force_sub_prompt(client, _display_user(user), missing)
+            try:
+                await query.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+            except Exception:
+                pass
+        else:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            try:
+                tip = await client.send_message(
+                    query.message.chat.id,
+                    "✅ Sab channels OK. Ab group me search kar sakte ho.",
+                )
+                await asyncio.sleep(6)
+                await tip.delete()
+            except Exception:
+                pass
+        return
+
+    if data == "fs_noop":
+        try:
+            await query.answer("Invite link nahi bana. Bot ko channel admin banao.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
