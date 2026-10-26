@@ -186,30 +186,35 @@ def extract_movie_metadata(filename: str, caption: str = "") -> Dict[str, Any]:
     filename = sanitize_text(filename or "")
     caption = sanitize_text(caption or "")
     raw_name = filename or caption or "Untitled_Movie"
+    # Combine both so quality/year/lang tags in caption are never missed
+    combined = (filename + " " + caption).strip() or raw_name
     base_name = raw_name
 
     quality = "HD"
     for pattern, q in QUALITY_PATTERNS:
-        if re.search(pattern, base_name):
+        if re.search(pattern, combined):
             quality = q
             break
 
     year = None
-    year_match = re.search(r"\b(19\d{2}|20\d{2})\b", base_name)
+    year_match = re.search(r"\b(19\d{2}|20\d{2})\b", combined)
     if year_match:
         year = int(year_match.group(1))
 
     languages = []
     for pattern, lang in LANGUAGE_PATTERNS:
-        if re.search(pattern, base_name):
+        if re.search(pattern, combined):
             if lang not in languages:
                 languages.append(lang)
 
-    season = extract_season(base_name)
-    episode = extract_episode_or_part(base_name)
-    title = clean_movie_title(base_name, year)
-
-    if caption and (not filename or filename.lower() in ("video", "video.mp4", "video.mkv")):
+    season = extract_season(combined)
+    episode = extract_episode_or_part(combined)
+    # Title prefer filename, fall back to caption
+    title = clean_movie_title(base_name if filename else combined, year)
+    if (not title or title == "Untitled Movie") and caption:
+        title = clean_movie_title(caption, year)
+    # If filename is generic (video.mkv etc), always prefer caption title
+    if caption and (not filename or filename.lower() in ("video", "video.mp4", "video.mkv", "document", "document.mkv")):
         caption_meta_title = clean_movie_title(caption, year)
         if caption_meta_title and caption_meta_title != "Untitled Movie":
             title = caption_meta_title
