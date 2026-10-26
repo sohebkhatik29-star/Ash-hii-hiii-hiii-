@@ -1,0 +1,200 @@
+# Force-Sub multi-channel system (max 7)
+
+import asyncio
+import logging
+import re
+from typing import List
+
+from pyrogram import Client, filters
+from pyrogram.errors import FloodWait, UserNotParticipant
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+
+from configs import Config
+from handlers.database import db
+
+try:
+    from handlers import force_sub_db  # noqa: F401
+except Exception:
+    pass
+
+logger = logging.getLogger("ForceSub")
+MAX_FORCE_CHANNELS = 7
+DEFAULT_FORCE_MSG = (
+    "Hello <b>{name}</b>\n\n"
+    "Aapne mera channel join nahi kiya hai.\n"
+    "Pehle join karo, fir aap group me search / use kar sakte ho."
+)
+_FS_PENDING: dict = {}
+_PENDING_REQUESTS: dict = {}
+
+
+def _display_user(user) -> str:
+    if not user:
+        return "User"
+    un = getattr(user, "username", None)
+    if un:
+        return f"@{_safe_text(un).lstrip('@')}"
+    fn = _safe_text(getattr(user, "first_name", None) or "")
+    return fn or "User"
+
+
+def _safe_text(s) -> str:
+    if s is None:
+        return ""
+    if not isinstance(s, str):
+        try:
+            s = str(s)
+        except Exception:
+            return ""
+    s = re.sub(r"[\ud800-\udfff]", "", s)
+    try:
+        s = s.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    except Exception:
+        s = "".join(ch for ch in s if ord(ch) < 0xD800 or ord(ch) > 0xDFFF)
+    return s
+
+
+def _status_is_admin(status) -> bool:
+    s = str(getattr(status, "value", status) or status).lower()
+    return s in (
+        "administrator", "owner", "creator",
+        "chatmemberstatus.administrator", "chatmemberstatus.owner",
+        "chatmemberstatus.creator",
+    )
+
+
+async def _is_group_admin(client: Client, chat_id: int, user_id: int) -> bool:
+    try:
+        if user_id in (Config.ADMINS or []):
+            return True
+    except Exception:
+        pass
+    try:
+        m = await client.get_chat_member(chat_id, user_id)
+        if _status_is_admin(m.status):
+            return True
+        if getattr(m, "privileges", None) is not None:
+            return True
+    except Exception as e:
+        logger.warning("admin check: %s", e)
+    return False
+
+
+async def _safe_reply(message: Message, text: str, **kwargs):
+    text = _safe_text(text)
+    try:
+        return await message.reply_text(text, **kwargs)
+    except Exception as e:
+        logger.warning("safe_reply: %s", e)
+        return None
+
+
+async def check_user_in_channel(bot: Client, channel_id: int, user_id: int) -> str:
+    try:
+        m = await bot.get_chat_member(channel_id, user_id)
+        st = str(getattr(m.status, "value", m.status) or m.status).lower()
+        if "left" in st or st == "chatmemberstatus.left":
+            return "not_joined"
+        if "kick" in st or "ban" in st:
+            return "kicked"
+        return "ok"
+    except UserNotParticipant:
+        return "not_joined"
+    except Exception as e:
+        logger.debug("check_user_in_channel %s: %s", channel_id, e)
+        return "error"
+
+
+async def has_pending_join_request(bot: Client, channel_id: int, user_id: int) -> bool:
+    key = (int(channel_id), int(user_id))
+    if key in _PENDING_REQUESTS:
+        return True
+    try:
+        # force_sub_db may track
+        if hasattr(db, "has_pending_join_request"):
+            return bool(await db.has_pending_join_request(user_id, channel_id))
+    except Exception:
+        pass
+    return False
+
+
+async def get_invite_link(bot: Client, channel_id: int, request: bool = False):
+    try:
+        if request:
+            return await bot.create_chat_invite_link(channel_id, creates_join_request=True)
+        return await bot.create_chat_invite_link(channel_id)
+    except Exception as e:
+        logger.debug("invite link %s: %s", channel_id, e)
+        return None
+
+
+async def get_missing_channels(bot: Client, user_id: int) -> list:
+    try:
+        channels = await db.list_force_channels()
+    except Exception:
+        channels = []
+    missing = []
+    for ch in channels:
+        try:
+            cid = int(ch.get("channel_id") or 0)
+            if not cid:
+                continue
+            status = await check_user_in_channel(bot, cid, user_id)
+            mode = (ch.get("mode") or "normal").lower()
+            if mode == "request" and status in ("not_joined", "error"):
+                if await has_pending_join_request(bot, cid, user_id):
+                    continue
+            if status in ("not_joined", "kicked", "error"):
+                missing.append(ch)
+        except Exception:
+            missing.append(ch)
+    return missing
+
+
+async def build_force_sub_prompt(bot, user_name, missing, pending_query=""):
+    user_name = _safe_text(user_name) or "User"
+    try:
+        custom = await db.get_force_sub_message()
+    except Exception:
+        custom = ""
+    if custom:
+        text = (
+            _safe_text(custom)
+            .replace("{name}", user_name)
+            .replace("{username}", user_name)
+            .replace("{user}", user_name)
+        )
+    else:
+        text = DEFAULT_FORCE_MSG.format(name=user_name)
+    text += "\n\nJoin these channel(s):\n"
+    buttons = []
+    for ch in missing:
+        cid = int(ch["channel_id"])
+        title = _safe_text(ch.get("title") or ch.get("username") or str(cid))
+        mode = (ch.get("mode") or "normal").lower()
+        invite = await get_invite_link(bot, cid, request=(mode == "request"))
+        if invite and getattr(invite, "invite_link", None):
+            url = invite.invite_link
+        elif ch.get("username"):
+            url = f"https://t.me/{str(ch['username']).lstrip('@')}"
+        else:
+            url = None
+        if mode == "request":
+            label = f"Request: {title}"[:60]
+            if url:
+                buttons.append([InlineKeyboardButton(label, url=url)])
+            buttons.append([
+                InlineKeyboardButton(
+                    f"✅ Maine request bhej diya — {title}"[:60],
+                    callback_data=f"fs_mark_req:{cid}",
+                )
+            ])
+        else:
+            label = f"Join: {title}"[:60]
+            if url:
+                buttons.append([InlineKeyboardButton(label, url=url)])
+            else:
+                buttons.append([InlineKeyboardButton(f"! {title}"[:60], callback_data="fs_noop")])
+    cb = f"fs_refresh:{_safe_text(pending_query)[:40]}" if pending_query else "fs_refresh"
+    buttons.append([InlineKeyboardButton("Joined / Try Again", callback_data=cb)])
+    return _safe_text(text), InlineKeyboardMarkup(buttons)
