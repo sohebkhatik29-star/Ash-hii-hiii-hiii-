@@ -1,7 +1,7 @@
 # ==============================================================================
-# ASH AUTOMATIC MOVIE FILE STORE BOT 🎬
+# ASH AUTOMATIC MOVIE FILE STORE BOT
 # Module: handlers/movie_card.py
-# Purpose: Final Movie Cards, Episode Sorting, Bulletproof Download Buttons, and Deep Links.
+# Purpose: Final Movie Cards, quality buttons, clean title on poster
 # ==============================================================================
 
 import re
@@ -28,8 +28,8 @@ def shorten_url_if_enabled(original_url: str) -> str:
     return original_url
 
 def quality_sort_key(q_name: str):
-    """Sorts 480p [Ep 01-05], 480p [Ep 06-10], 720p [Ep 01-05], etc."""
-    order = {"480p": 1, "540p": 2, "720p": 3, "1080p": 4, "2160p": 5}
+    """Sorts qualities low → high."""
+    order = {"240p": 0, "360p": 1, "480p": 2, "540p": 3, "SD": 4, "720p": 5, "HD": 6, "1080p": 7, "1440p": 8, "2160p": 9}
     res_rank = 99
     for r, rank in order.items():
         if r in q_name:
@@ -41,65 +41,66 @@ def quality_sort_key(q_name: str):
     return (res_rank, ep_num)
 
 def make_quality_slug(q_name: str) -> str:
-    """Creates a Telegram-safe start payload slug without spaces or brackets."""
     slug = re.sub(r"[^a-zA-Z0-9_\-]", "_", q_name).strip("_")
     slug = re.sub(r"_+", "_", slug)
     return slug
 
 def build_final_movie_card_text(movie: Dict[str, Any]) -> str:
     """
-    Builds the clean, professional final movie card text.
-    Includes plain title + hashtags so group auto-filter / search can match easily.
+    Clean professional card text.
+    Title = clean name only + (YEAR). Quality/codec NOT in title.
     """
-    title = movie.get("title", "Untitled")
-    title_upper = title.upper()
-    year = movie.get("year")
+    title = movie.get("title", "Untitled") or "Untitled"
+    # defensive: strip leftover tech tokens + year so card stays clean
+    _year = movie.get("year")
+    _t = re.sub(
+        r"(?i)\b(2160p|1440p|1080p|720p|540p|480p|360p|240p|4k|hevc|x264|x265|webrip|web-dl|bluray|uncut|dual\s*audio|"
+        r"hindi|english|esub|10bit|8bit|mkv|mp4)\b",
+        " ",
+        str(title),
+    )
+    _t = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", _t)
+    _t = re.sub(r"\s+", " ", _t).strip() or str(title)
+    title_upper = _t.upper()
+    year = _year
     year_str = f" ({year})" if year else ""
     languages = movie.get("languages", ["Hindi"])
     lang_str = " • ".join(languages) if languages else "Hindi"
 
-    qualities = movie.get("qualities", {})
-    # Extract unique base qualities (e.g. 480p | 720p)
-    base_qualities = []
-    order = ["480p", "540p", "720p", "1080p", "2160p"]
-    for bq in order:
-        if any(bq in q for q in qualities.keys()):
-            base_qualities.append(bq)
-    q_str = " | ".join(base_qualities) if base_qualities else "Standard"
+    qualities = movie.get("qualities", {}) or {}
+    # Primary quality label for display
+    q_names = list(qualities.keys()) if qualities else []
+    primary_q = q_names[0] if q_names else "HD"
 
-    # Clean hashtag from title (remove spaces / special chars)
-    tag = re.sub(r"[^a-zA-Z0-9]", "", title)
-    year_tag = f" #{year}" if year else ""
+    tag = re.sub(r"[^a-zA-Z0-9]", "", title_upper)
+    year_tag = f"{year}" if year else ""
 
     text = f"🎬 <b>{title_upper}{year_str}</b>\n\n"
     text += f"🌐 <b>Language:</b> {lang_str}\n"
-    text += f"🎬 <b>Quality:</b> {q_str}\n\n"
+    text += f"🎞 <b>Quality:</b> {primary_q}\n\n"
     text += "🍿 <b>Available Downloads:</b>\n\n"
-    # Searchable keywords for auto-filter + group history sync
     text += f"#{tag}{year_tag} #movie"
     return text
 
 def build_final_movie_card_buttons(movie: Dict[str, Any], for_group: bool = False) -> InlineKeyboardMarkup:
-    """
-    Creates individual download buttons for each saved quality / episode batch.
-    Uses direct DB channel message IDs for 100% instant, bulletproof delivery!
-    """
     movie_id = movie.get("movie_id", "")
     qualities = movie.get("qualities", {})
     sorted_qualities = sorted(qualities.items(), key=lambda item: quality_sort_key(item[0]))
 
     buttons = []
     for q_name, q_data in sorted_qualities:
-        size_str = q_data.get("file_size_formatted", "")
-        if size_str and size_str in q_name:
-            label = f"⬇️ Download {q_name}"
-        else:
-            label = f"⬇️ Download {q_name}" + (f" ({size_str})" if size_str else "")
+        size_str = q_data.get("file_size_formatted", "") or ""
+        if not size_str and q_data.get("file_size"):
+            try:
+                from handlers.parser import format_size
+                size_str = format_size(int(q_data["file_size"]))
+            except Exception:
+                size_str = ""
+        label = f"⬇️ Download {q_name}" + (f" ({size_str})" if size_str else "")
         channel_msg_id = q_data.get("channel_msg_id")
         q_slug = make_quality_slug(q_name)
 
         if for_group:
-            # DIRECT REDIRECT URL: Takes the user out of the group and opens the bot!
             if channel_msg_id:
                 redirect_url = f"https://t.me/{Config.BOT_USERNAME}?start=f_{channel_msg_id}"
             else:
@@ -126,7 +127,6 @@ def build_final_movie_card_buttons(movie: Dict[str, Any], for_group: bool = Fals
     return InlineKeyboardMarkup(buttons)
 
 def generate_movie_links(movie_id: str) -> Tuple[str, str]:
-    """Generates Telegram deep link and shortened version."""
     raw_link = f"https://t.me/{Config.BOT_USERNAME}?start=mov_{movie_id}"
     short_link = shorten_url_if_enabled(raw_link)
     return short_link, raw_link
