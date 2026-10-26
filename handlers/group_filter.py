@@ -1,7 +1,7 @@
 # ============================================================================
 # handlers/group_filter.py  — ONLY filter / search (alg file)
 # - Same title + same year → ek hi result (naya wala)
-# - Result = purna movie card (text + Download links), na ki sirf buttons list
+# - Result = text card + Download / Open links (NO poster photo)
 # ============================================================================
 import asyncio
 import logging
@@ -78,6 +78,7 @@ def _card_text(movie: dict) -> str:
 
 
 def _card_buttons(movie: dict) -> InlineKeyboardMarkup:
+    """Download links + Open — NO poster, sirf URL buttons."""
     try:
         from handlers.movie_card import build_final_movie_card_buttons
         return build_final_movie_card_buttons(movie, for_group=True)
@@ -165,26 +166,17 @@ def register_group_filter_handlers(bot: Client):
             asyncio.create_task(_schedule_delete(client, message.chat.id, [m.id, message.id], 60))
             return
 
-        # Purna link-style card(s) — list of name buttons nahi
+        # Sirf text + link buttons — poster photo NAHI
         sent_ids = []
         for movie in results[:5]:
             text = _card_text(movie)
             markup = _card_buttons(movie)
-            poster_id = movie.get("poster_file_id")
-            sent = None
-            if poster_id and isinstance(poster_id, str):
-                try:
-                    sent = await message.reply_photo(
-                        photo=poster_id,
-                        caption=text,
-                        reply_markup=markup,
-                        quote=True,
-                    )
-                except Exception as pe:
-                    logger.warning("filter poster fail: %s", type(pe).__name__)
-                    sent = None
-            if not sent:
-                sent = await message.reply_text(text, reply_markup=markup, quote=True, disable_web_page_preview=True)
+            sent = await message.reply_text(
+                text,
+                reply_markup=markup,
+                quote=True,
+                disable_web_page_preview=True,
+            )
             if sent:
                 sent_ids.append(sent.id)
 
