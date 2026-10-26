@@ -1,13 +1,13 @@
 # ============================================================================
-# handlers/group_filter.py  — ONLY filter / search (alg file)
-# - Same title + same year → ek hi result (naya wala)
-# - Result = text card + Download / Open links (NO poster photo)
+# handlers/group_filter.py  — ONLY filter / search
+# Style: movie name + Link 🔗 https://t.me/c/... (group poster post)
+# Same title+year = ek; alag year = alag line
 # ============================================================================
 import asyncio
 import logging
 import re
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import Message, CallbackQuery
 from configs import Config
 from handlers.database import db
 from handlers.force_sub_handler import enforce_force_sub_in_group
@@ -24,7 +24,7 @@ def _norm_title(t) -> str:
 
 
 def dedupe_by_title_year(results: list) -> list:
-    """Same title + same year → sirf ek (latest added_at)."""
+    """Same title + same year → sirf ek (latest). Alag year alag rahe."""
     best = {}
     for m in results or []:
         key = (_norm_title(m.get("title")), str(m.get("year") or ""))
@@ -42,61 +42,36 @@ def dedupe_by_title_year(results: list) -> list:
 def _get_post_link(m: dict) -> str:
     post_link = m.get("group_post_link") or ""
     if post_link and "t.me" in str(post_link):
-        return str(post_link)
+        return str(post_link).strip()
     group_id = m.get("group_chat_id") or getattr(Config, "MOVIE_GROUP_ID", None)
     msg_id = m.get("group_msg_id")
     if msg_id and group_id:
         try:
-            return db.make_telegram_post_link(group_id, msg_id)
+            return db.make_telegram_post_link(int(group_id), int(msg_id))
         except Exception:
             pass
     return ""
 
 
-def _card_text(movie: dict) -> str:
-    try:
-        from handlers.movie_card import build_final_movie_card_text
-        return build_final_movie_card_text(movie)
-    except Exception:
-        title = movie.get("title") or "Unknown"
-        year = movie.get("year")
-        qs = movie.get("qualities") or {}
-        qlist = ", ".join(sorted(qs.keys())) if qs else "—"
-        langs = movie.get("languages") or []
-        if isinstance(langs, list):
-            lang_s = ", ".join(langs) if langs else "Hindi"
-        else:
-            lang_s = str(langs) or "Hindi"
-        head = f"🎬 <b>{title}</b>" + (f" ({year})" if year else "")
-        return (
-            f"{head}\n"
-            f"🌐 Language: {lang_s}\n"
-            f"🎬 Quality: {qlist}\n"
-            f"🍿 Available Downloads:\n"
-            f"#{re.sub(r'[^\w]', '', title)}{year or ''} #movie"
-        )
-
-
-def _card_buttons(movie: dict) -> InlineKeyboardMarkup:
-    """Download links + Open — NO poster, sirf URL buttons."""
-    try:
-        from handlers.movie_card import build_final_movie_card_buttons
-        return build_final_movie_card_buttons(movie, for_group=True)
-    except Exception:
-        movie_id = movie.get("movie_id") or ""
-        bot = getattr(Config, "BOT_USERNAME", "") or ""
-        rows = []
-        for q_name in sorted((movie.get("qualities") or {}).keys()):
-            url = f"https://t.me/{bot}?start=dl_{movie_id}_{q_name}" if bot else None
-            if url:
-                rows.append([InlineKeyboardButton(f"⬇️ Download {q_name}", url=url)])
-        link = _get_post_link(movie)
+def build_link_results_text(query: str, results: list) -> str:
+    """
+    Format jaise dusre group:
+    1. Movie Name (Year)
+    Link 🔗 https://t.me/c/..../msg_id
+    """
+    lines = [f"🔎 <b>Results for:</b> <code>{query}</code>", f"📄 Total: {len(results)}", ""]
+    for i, m in enumerate(results, start=1):
+        title = m.get("title") or "Unknown"
+        year = m.get("year")
+        name = f"{title}" + (f" ({year})" if year else "")
+        link = _get_post_link(m)
+        lines.append(f"{i}. <b>{name}</b>")
         if link:
-            rows.append([InlineKeyboardButton("🔗 Open Full Post", url=link)])
-        if bot and movie_id:
-            rows.append([InlineKeyboardButton("🎬 Open Movie Bot", url=f"https://t.me/{bot}?start=mov_{movie_id}")])
-        rows.append([InlineKeyboardButton("❌ Close", callback_data="close_card")])
-        return InlineKeyboardMarkup(rows)
+            lines.append(f"Link 🔗 {link}")
+        else:
+            lines.append("Link 🔗 (post abhi available nahi)")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 async def _schedule_delete(client, chat_id, message_ids, delay=None):
@@ -166,22 +141,17 @@ def register_group_filter_handlers(bot: Client):
             asyncio.create_task(_schedule_delete(client, message.chat.id, [m.id, message.id], 60))
             return
 
-        # Sirf text + link buttons — poster photo NAHI
-        sent_ids = []
-        for movie in results[:5]:
-            text = _card_text(movie)
-            markup = _card_buttons(movie)
-            sent = await message.reply_text(
-                text,
-                reply_markup=markup,
-                quote=True,
-                disable_web_page_preview=True,
+        # Plain text + group poster link only (no buttons)
+        text = build_link_results_text(query, results[:20])
+        sent = await message.reply_text(
+            text,
+            quote=True,
+            disable_web_page_preview=True,
+        )
+        if sent:
+            asyncio.create_task(
+                _schedule_delete(client, message.chat.id, [sent.id], AUTO_DELETE_SECONDS)
             )
-            if sent:
-                sent_ids.append(sent.id)
-
-        if sent_ids:
-            asyncio.create_task(_schedule_delete(client, message.chat.id, sent_ids, AUTO_DELETE_SECONDS))
 
     @bot.on_callback_query(filters.regex(r"^close_card$"))
     async def close_card_callback(client: Client, query: CallbackQuery):
