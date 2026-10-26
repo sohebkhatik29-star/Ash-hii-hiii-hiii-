@@ -2,8 +2,8 @@
 # handlers/group_filter.py  — ONLY filter / search
 # Style: movie name + Link 🔗 https://t.me/c/... (group poster post)
 # Query: noise hatao, pura title strict match (search_query.py)
+# Delete: auto_delete.py (testing 2 min)
 # ============================================================================
-import asyncio
 import logging
 import re
 from pyrogram import Client, filters
@@ -12,9 +12,9 @@ from configs import Config
 from handlers.database import db
 from handlers.force_sub_handler import enforce_force_sub_in_group
 from handlers.search_query import clean_search_query, filter_strict_matches
+from handlers.auto_delete import schedule_result_delete, schedule_not_found_delete
 
 logger = logging.getLogger("GroupFilter")
-AUTO_DELETE_SECONDS = int(getattr(Config, "AUTO_DELETE_TIME", 1800) or 1800)
 
 
 def _norm_title(t) -> str:
@@ -70,16 +70,6 @@ def build_link_results_text(query: str, results: list) -> str:
     return "\n".join(lines).strip()
 
 
-async def _schedule_delete(client, chat_id, message_ids, delay=None):
-    delay = delay if delay is not None else AUTO_DELETE_SECONDS
-    await asyncio.sleep(delay)
-    for mid in message_ids:
-        try:
-            await client.delete_messages(chat_id, mid)
-        except Exception:
-            pass
-
-
 def register_group_filter_handlers(bot: Client):
 
     @bot.on_message(filters.command(["find", "search", "filter"]) & filters.group)
@@ -133,7 +123,8 @@ def register_group_filter_handlers(bot: Client):
 
         if not search_q or len(search_q) < 2:
             m = await message.reply_text(f"❌ Movie name samajh nahi aaya.", quote=True)
-            asyncio.create_task(_schedule_delete(client, message.chat.id, [m.id, message.id], 60))
+            # not-found style → 2 min (testing)
+            schedule_not_found_delete(client, message.chat.id, [m.id, message.id])
             return
 
         results = await db.search_movies(search_q)
@@ -146,7 +137,8 @@ def register_group_filter_handlers(bot: Client):
 
         if not results:
             m = await message.reply_text(f"❌ <b>{query}</b> nahi mila.", quote=True)
-            asyncio.create_task(_schedule_delete(client, message.chat.id, [m.id, message.id], 60))
+            # not found → 2 min testing (baad me 48h)
+            schedule_not_found_delete(client, message.chat.id, [m.id, message.id])
             return
 
         text = build_link_results_text(query, results[:20])
@@ -156,9 +148,8 @@ def register_group_filter_handlers(bot: Client):
             disable_web_page_preview=True,
         )
         if sent:
-            asyncio.create_task(
-                _schedule_delete(client, message.chat.id, [sent.id], AUTO_DELETE_SECONDS)
-            )
+            # result mila → 2 min testing (baad me 24h)
+            schedule_result_delete(client, message.chat.id, [sent.id])
 
     @bot.on_callback_query(filters.regex(r"^close_card$"))
     async def close_card_callback(client: Client, query: CallbackQuery):
