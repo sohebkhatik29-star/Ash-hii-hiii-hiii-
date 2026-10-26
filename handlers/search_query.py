@@ -1,10 +1,11 @@
 # ============================================================================
-# handlers/search_query.py  — ONLY query clean + strict title match (alg file)
+# handlers/search_query.py  — ONLY query clean + title match (alg file)
 # - Message se movie name extract (noise hatao)
-# - Short partial ("THE GREAT") long title pe match nahi
+# - "PUSHPA" → Pushpa The Rise match
+# - Short weak tokens long title pe weak match avoid
 # ============================================================================
 import re
-from typing import List, Tuple
+from typing import List
 
 # Extra noise beyond DB STOPWORDS — request / chat filler
 NOISE = {
@@ -35,8 +36,8 @@ def _norm(s: str) -> str:
 def clean_search_query(raw: str) -> str:
     """
     Message se movie name nikaalo.
-    Example: 'hello bhai please THE GREAT PUNJAB ROBBERY dedo' → 'great punjab robbery'
-    Years (19xx/20xx) keep kiye jaate hain.
+    Example: 'hello bhai please PUSHPA THE RISE dedo' → 'pushpa rise'
+    Years (19xx/20xx) keep.
     """
     text = _norm(raw)
     if not text:
@@ -69,10 +70,11 @@ def _title_tokens(title: str) -> List[str]:
 
 def is_strict_title_match(query: str, movie_title: str, movie_year=None) -> bool:
     """
-    Strict match:
-    - Query ke zyada tar tokens title me hone chahiye
-    - Short query (jaise sirf 'great') long title pe match nahi
-    - Year diya ho to year match prefer
+    Match rules:
+    - Query ke significant tokens title me hone chahiye
+    - Single strong token (len>=5) like PUSHPA → match Pushpa The Rise
+    - Very short single token (len<=3) long title pe match nahi
+    - Year diya ho to soft prefer
     """
     q = clean_search_query(query)
     if not q:
@@ -88,43 +90,37 @@ def is_strict_title_match(query: str, movie_title: str, movie_year=None) -> bool
     title_set = set(title_toks)
     title_blob = " ".join(title_toks)
 
-    # Year handle
     q_years = {t for t in q_tokens if t.isdigit() and len(t) == 4}
     q_words = [t for t in q_tokens if t not in q_years]
     if not q_words and not q_years:
         return False
 
-    if q_years and movie_year is not None:
-        my = str(movie_year).strip()
-        if my and my not in q_years and not any(y == my for y in q_years):
-            # year mismatch — soft fail only if words also weak
-            pass
-
     if not q_words:
-        # only year searched
         return str(movie_year or "") in q_years
 
     matched = sum(1 for t in q_words if t in title_set or t in title_blob)
-    need = max(1, (len(q_words) * 2 + 2) // 3)  # ~67% of query words
+    # Query coverage: ~60% of query words must hit title
+    need = max(1, (len(q_words) * 3 + 4) // 5)
     if matched < need:
         return False
 
-    # Short query vs long title: kam se kam title ke half significant tokens cover
-    if len(q_words) < max(2, (len(title_toks) + 1) // 2):
-        min_cover = max(2, (len(title_toks) + 1) // 2)
-        if matched < min_cover:
+    # Single-token queries:
+    # - len >= 5 (PUSHPA, ROBBERY, AVENGERS) → allow even on longer titles
+    # - len <= 3 → only if title short
+    if len(q_words) == 1:
+        tok = q_words[0]
+        if len(tok) <= 3 and len(title_toks) > 2:
             return False
-
-    # Single short token (len<=4) only if title itself short
-    if len(q_words) == 1 and len(q_words[0]) <= 4:
-        if len(title_toks) > 2:
-            return False
+        # medium token (4 chars): allow if it is first title word or title is short
+        if len(tok) == 4 and len(title_toks) > 3:
+            if title_toks[0] != tok:
+                return False
 
     return True
 
 
 def filter_strict_matches(query: str, movies: list) -> list:
-    """Keep only movies that strictly match cleaned query."""
+    """Keep only movies that match cleaned query."""
     out = []
     for m in movies or []:
         title = m.get("title") or ""
