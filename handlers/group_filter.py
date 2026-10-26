@@ -2,7 +2,7 @@
 # handlers/group_filter.py  — ONLY filter / search
 # Style: movie name + Link 🔗 https://t.me/c/... (group poster post)
 # Query: noise hatao, pura title strict match (search_query.py)
-# Delete: auto_delete.py (testing 2 min)
+# Delete: auto_delete.py (testing 2 min) — bot reply + user message dono
 # ============================================================================
 import logging
 import re
@@ -123,7 +123,7 @@ def register_group_filter_handlers(bot: Client):
 
         if not search_q or len(search_q) < 2:
             m = await message.reply_text(f"❌ Movie name samajh nahi aaya.", quote=True)
-            # not-found style → 2 min (testing)
+            # bot reply + user message → 2 min
             schedule_not_found_delete(client, message.chat.id, [m.id, message.id])
             return
 
@@ -137,7 +137,7 @@ def register_group_filter_handlers(bot: Client):
 
         if not results:
             m = await message.reply_text(f"❌ <b>{query}</b> nahi mila.", quote=True)
-            # not found → 2 min testing (baad me 48h)
+            # bot reply + user message → 2 min
             schedule_not_found_delete(client, message.chat.id, [m.id, message.id])
             return
 
@@ -148,8 +148,8 @@ def register_group_filter_handlers(bot: Client):
             disable_web_page_preview=True,
         )
         if sent:
-            # result mila → 2 min testing (baad me 24h)
-            schedule_result_delete(client, message.chat.id, [sent.id])
+            # bot result + user message → 2 min
+            schedule_result_delete(client, message.chat.id, [sent.id, message.id])
 
     @bot.on_callback_query(filters.regex(r"^close_card$"))
     async def close_card_callback(client: Client, query: CallbackQuery):
