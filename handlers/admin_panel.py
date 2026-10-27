@@ -1,5 +1,5 @@
 # ==============================================================================
-# handlers/admin_panel.py — Admin Panel + Force Sub + Caption + Auto Delete
+# handlers/admin_panel.py — Admin Panel + Force Sub + Caption + Auto Delete + Manage Admin
 # ==============================================================================
 import logging
 import re
@@ -30,7 +30,14 @@ from handlers.auto_delete import (
     set_group_result_delete_seconds,
     get_group_not_found_delete_seconds,
     set_group_not_found_delete_seconds,
-    DEFAULT_BOT_NOTICE,
+)
+from handlers.admins_db import (
+    list_all_admins,
+    add_bot_admin,
+    remove_bot_admin,
+    promote_in_group,
+    demote_in_group,
+    sync_admins_to_config,
 )
 
 logger = logging.getLogger("AdminPanel")
@@ -65,7 +72,23 @@ def kb_admin_home():
         [InlineKeyboardButton("🔐 Force Sub", callback_data="ap_fs_menu")],
         [InlineKeyboardButton("📝 File Caption", callback_data="ap_cap_menu")],
         [InlineKeyboardButton("⏱ Set Auto Delete", callback_data="ap_ad_menu")],
+        [InlineKeyboardButton("👑 Manage Admin", callback_data="ap_ma_menu")],
         [InlineKeyboardButton("❌ Close", callback_data="ap_close")],
+    ])
+
+
+def kb_ma_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Admin", callback_data="ap_ma_add")],
+        [InlineKeyboardButton("📋 See Admins", callback_data="ap_ma_list")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="ap_home")],
+    ])
+
+
+def kb_admin_actions(user_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Delete Admin", callback_data=f"ap_ma_del:{user_id}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="ap_ma_list")],
     ])
 
 
@@ -235,6 +258,40 @@ async def _resolve_channel(client: Client, message: Message):
     return None, None, None
 
 
+async def _resolve_user(client: Client, message: Message):
+    """Resolve user_id, name, username from id / @username / forward / text."""
+    if message.forward_from:
+        u = message.forward_from
+        return int(u.id), _safe(u.first_name or ""), _safe(u.username or "")
+
+    text = (message.text or message.caption or "").strip()
+    if not text:
+        return None, None, None
+
+    if re.fullmatch(r"\d{5,}", text):
+        uid = int(text)
+        try:
+            chat = await client.get_users(uid)
+            return int(chat.id), _safe(chat.first_name or ""), _safe(chat.username or "")
+        except Exception as e:
+            logger.warning("get_users id: %s", e)
+            return uid, str(uid), ""
+
+    m = re.search(r"(?:t\.me/|telegram\.me/|@)?([A-Za-z0-9_]{4,})", text)
+    if m:
+        uname = m.group(1)
+        if uname.lower() in ("c", "joinchat", "addstickers"):
+            return None, None, None
+        try:
+            chat = await client.get_users(uname)
+            return int(chat.id), _safe(chat.first_name or ""), _safe(chat.username or uname)
+        except Exception as e:
+            logger.warning("get_users uname: %s", e)
+            return None, None, None
+
+    return None, None, None
+
+
 async def _bot_is_admin(client: Client, channel_id: int) -> bool:
     try:
         me = await client.get_me()
@@ -271,6 +328,11 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
             pass
         return
 
+    try:
+        await sync_admins_to_config()
+    except Exception:
+        pass
+
     if not _is_admin(user.id):
         try:
             await query.answer("Sirf owner/admin ke liye.", show_alert=True)
@@ -302,6 +364,109 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
             "🛠 <b>Admin Panel</b>\n\nSirf owner/admin ke liye.\nNeeche se option choose karo:",
             kb_admin_home(),
         )
+        return
+
+    # ---------- Manage Admin ----------
+    if data == "ap_ma_menu":
+        _AP_STATE.pop(uid, None)
+        await _edit_or_reply(
+            query,
+            "👑 <b>Manage Admin</b>\n\n"
+            "Bot admin add/remove. Add pe group me bhi auto-promote hoga.",
+            kb_ma_menu(),
+        )
+        return
+
+    if data == "ap_ma_add":
+        _AP_STATE[uid] = {"step": "wait_add_admin"}
+        await _edit_or_reply(
+            query,
+            "➕ <b>Add Admin</b>\n\n"
+            "User ko admin banane ke liye bhejo:\n"
+            "• User ID (<code>123456789</code>)\n"
+            "• @username\n"
+            "• User ka message <b>forward</b>\n\n"
+            "Bot + Movie Group dono me admin banega.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_ma_menu")]]),
+        )
+        return
+
+    if data == "ap_ma_list":
+        try:
+            admins = await list_all_admins()
+        except Exception as e:
+            await _edit_or_reply(query, f"Error: {e}", kb_ma_menu())
+            return
+        if not admins:
+            await _edit_or_reply(query, "Koi admin nahi mila.", kb_ma_menu())
+            return
+        rows = []
+        for a in admins:
+            aid = a.get("user_id")
+            name = _safe(a.get("name") or str(aid))[:28]
+            un = a.get("username") or ""
+            src = a.get("source") or ""
+            label = f"{name}"
+            if un:
+                label += f" (@{un})"
+            if src == "owner":
+                label = "👑 " + label
+            rows.append([InlineKeyboardButton(label[:60], callback_data=f"ap_ma_view:{aid}")])
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="ap_ma_menu")])
+        await _edit_or_reply(
+            query,
+            "📋 <b>Admins</b>\n\nNaam pe click → Delete / Back:",
+            InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data.startswith("ap_ma_view:"):
+        try:
+            aid = int(data.split(":")[1])
+        except Exception:
+            return
+        try:
+            admins = await list_all_admins()
+        except Exception:
+            admins = []
+        a = next((x for x in admins if int(x.get("user_id", 0)) == aid), None)
+        if not a:
+            await _edit_or_reply(query, "Admin nahi mila.", kb_ma_menu())
+            return
+        name = _safe(a.get("name") or "")
+        un = _safe(a.get("username") or "-")
+        src = a.get("source") or ""
+        text = (
+            f"👤 <b>{name}</b>\n"
+            f"ID: <code>{aid}</code>\n"
+            f"Username: @{un}\n"
+            f"Source: <code>{src}</code>"
+        )
+        if src == "owner":
+            await _edit_or_reply(
+                query,
+                text + "\n\n⚠️ Owner delete nahi hota.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_ma_list")]]),
+            )
+        else:
+            await _edit_or_reply(query, text, kb_admin_actions(aid))
+        return
+
+    if data.startswith("ap_ma_del:"):
+        try:
+            aid = int(data.split(":")[1])
+        except Exception:
+            return
+        res = await remove_bot_admin(aid)
+        grp = await demote_in_group(client, aid)
+        if res.get("ok"):
+            await _edit_or_reply(
+                query,
+                f"✅ Admin remove: <code>{aid}</code>\n{grp}",
+                kb_ma_menu(),
+            )
+        else:
+            await _edit_or_reply(query, f"❌ {res.get('msg')}", kb_ma_menu())
         return
 
     # ---------- Auto Delete ----------
@@ -356,8 +521,8 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
             query,
             "💬 <b>Set Auto Delete Message</b>\n\n"
             "File ke neeche jo notice aata hai, woh template bhejo.\n"
-            "Placeholder: <code>{time}</code> (e.g. 30 minutes)\n\n"
-            "Default reset ke liye: <code>off</code>",
+            "Placeholder: <code>{time}</code>\n\n"
+            "Default reset: <code>off</code>",
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_ad_menu")]]),
         )
         return
@@ -382,8 +547,8 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
         await _edit_or_reply(
             query,
             "👁 <b>Group Delete Timings</b>\n\n"
-            f"✅ Result mila (user + bot result): <code>{format_duration(res_sec)}</code>\n"
-            f"❌ Result nahi mila (user msg): <code>{format_duration(nf_sec)}</code>",
+            f"✅ Result mila: <code>{format_duration(res_sec)}</code>\n"
+            f"❌ Result nahi mila: <code>{format_duration(nf_sec)}</code>",
             kb_ad_grp_menu(),
         )
         return
@@ -393,7 +558,7 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
         await _edit_or_reply(
             query,
             "✅ <b>Result User + Bot Delete Timing</b>\n\n"
-            "Group me result milne par user message + bot result kitne time baad delete.\n\n"
+            "Group me result milne par user + bot result kitne time baad delete.\n\n"
             + _TIME_HELP,
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_ad_grp_menu")]]),
         )
@@ -417,7 +582,6 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
         await _edit_or_reply(
             query,
             "📝 <b>File Caption</b>\n\n"
-            "File bhejne pe jo caption lagta hai, yahan set/delete kar sakte ho.\n"
             "Placeholders: <code>{file_name}</code> <code>{file_size}</code> <code>{file_caption}</code>",
             kb_cap_menu(has),
         )
@@ -427,12 +591,8 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
         _AP_STATE[uid] = {"step": "wait_caption"}
         await _edit_or_reply(
             query,
-            "✏️ <b>Set Caption</b>\n\n"
-            "Apna caption template bhejo (HTML allowed).\n\n"
-            "Placeholders:\n"
-            "• <code>{file_name}</code>\n"
-            "• <code>{file_size}</code>\n"
-            "• <code>{file_caption}</code>",
+            "✏️ <b>Set Caption</b>\n\nCaption template bhejo (HTML OK).\n"
+            "• <code>{file_name}</code> • <code>{file_size}</code> • <code>{file_caption}</code>",
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_cap_menu")]]),
         )
         return
@@ -440,17 +600,9 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
     if data == "ap_cap_see":
         cap = await _get_file_cap()
         if not cap:
-            await _edit_or_reply(
-                query,
-                "Koi custom caption set nahi hai.\nFile pe original caption lagega.",
-                kb_cap_menu(False),
-            )
+            await _edit_or_reply(query, "Koi custom caption set nahi.", kb_cap_menu(False))
             return
-        await _edit_or_reply(
-            query,
-            f"👁 <b>Current File Caption:</b>\n\n{_safe(cap)}",
-            kb_cap_see_actions(),
-        )
+        await _edit_or_reply(query, f"👁 <b>Current:</b>\n\n{_safe(cap)}", kb_cap_see_actions())
         return
 
     if data == "ap_cap_del":
@@ -458,21 +610,13 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
             await db.clear_file_caption()
         except Exception as e:
             logger.warning("clear caption: %s", e)
-        await _edit_or_reply(
-            query,
-            "✅ Custom caption delete.\nAb file ka <b>original</b> caption use hoga.",
-            kb_cap_menu(False),
-        )
+        await _edit_or_reply(query, "✅ Caption delete. Original use hoga.", kb_cap_menu(False))
         return
 
     # ---------- Force Sub ----------
     if data == "ap_fs_menu":
         _AP_STATE.pop(uid, None)
-        await _edit_or_reply(
-            query,
-            "🔐 <b>Force Sub Panel</b>\n\nChannel add/remove, message & pic set karo:",
-            kb_fs_menu(),
-        )
+        await _edit_or_reply(query, "🔐 <b>Force Sub Panel</b>", kb_fs_menu())
         return
 
     if data == "ap_fs_add":
@@ -480,11 +624,7 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
         await _edit_or_reply(
             query,
             "➕ <b>Add Force Sub Channel</b>\n\n"
-            "Mujhe bhejo:\n"
-            "• Channel ID (<code>-1001234567890</code>)\n"
-            "• Channel link / @username\n"
-            "• Channel se message <b>forward</b>\n\n"
-            "Bot us channel me <b>admin</b> hona chahiye.",
+            "Channel ID / @username / link / forward bhejo.\nBot us channel me admin hona chahiye.",
             kb_back_fs(),
         )
         return
@@ -506,16 +646,14 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
             _AP_STATE.pop(uid, None)
             await _edit_or_reply(
                 query,
-                f"✅ Force sub channel add ho gaya.\n\n"
-                f"<b>{_safe(title)}</b>\nID: <code>{cid}</code>\nMode: <code>{mode}</code>",
+                f"✅ Force sub add.\n<b>{_safe(title)}</b>\nID: <code>{cid}</code>\nMode: <code>{mode}</code>",
                 kb_fs_menu(),
             )
         except ValueError as ve:
-            msg = "❌ Max 7 force-sub channels allowed." if str(ve) == "MAX_7" else f"❌ {ve}"
+            msg = "❌ Max 7 force-sub channels." if str(ve) == "MAX_7" else f"❌ {ve}"
             await _edit_or_reply(query, msg, kb_fs_menu())
         except Exception as e:
-            logger.exception("add_force_channel")
-            await _edit_or_reply(query, f"❌ Error: {type(e).__name__}: {e}", kb_fs_menu())
+            await _edit_or_reply(query, f"❌ Error: {e}", kb_fs_menu())
         return
 
     if data == "ap_fs_list":
@@ -524,7 +662,7 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
         except Exception:
             chs = []
         if not chs:
-            await _edit_or_reply(query, "Koi force-sub channel nahi hai.", kb_fs_menu())
+            await _edit_or_reply(query, "Koi force-sub channel nahi.", kb_fs_menu())
             return
         rows = []
         for c in chs:
@@ -533,11 +671,7 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
             mode = c.get("mode") or "normal"
             rows.append([InlineKeyboardButton(f"{title} [{mode}]", callback_data=f"ap_fs_view:{cid}")])
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_menu")])
-        await _edit_or_reply(
-            query,
-            "📋 <b>Force Sub Channels</b>\n\nClick karke delete kar sakte ho:",
-            InlineKeyboardMarkup(rows),
-        )
+        await _edit_or_reply(query, "📋 <b>Force Sub Channels</b>", InlineKeyboardMarkup(rows))
         return
 
     if data.startswith("ap_fs_view:"):
@@ -578,7 +712,7 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
         _AP_STATE.pop(uid, None)
         await _edit_or_reply(
             query,
-            "💬 <b>Force Sub Messages</b>\n\nMessage / pic set karo:",
+            "💬 <b>Force Sub Messages</b>",
             kb_fs_msg_menu(bool(await _get_fs_msg()), bool(await _get_fs_pic())),
         )
         return
@@ -587,7 +721,7 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
         _AP_STATE[uid] = {"step": "wait_msg"}
         await _edit_or_reply(
             query,
-            "✏️ <b>Set Force Sub Message</b>\n\nNaya message bhejo.\n"
+            "✏️ <b>Set Force Sub Message</b>\n\nMessage bhejo.\n"
             "Placeholders: <code>{name}</code> <code>{username}</code> <code>{user}</code>",
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_msg_menu")]]),
         )
@@ -613,7 +747,7 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
         _AP_STATE[uid] = {"step": "wait_pic"}
         await _edit_or_reply(
             query,
-            "🖼 <b>Set Force Sub Pic</b>\n\nEk photo bhejo.",
+            "🖼 <b>Set Force Sub Pic</b>\n\nPhoto bhejo.",
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_msg_menu")]]),
         )
         return
@@ -641,7 +775,7 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
         await _edit_or_reply(query, "✅ Pic delete.", kb_fs_msg_menu(bool(await _get_fs_msg()), False))
         return
 
-    await _edit_or_reply(query, "🛠 <b>Admin Panel</b>\n\nOption choose karo:", kb_admin_home())
+    await _edit_or_reply(query, "🛠 <b>Admin Panel</b>", kb_admin_home())
 
 
 def register_admin_panel_handlers(bot: Client):
@@ -652,6 +786,10 @@ def register_admin_panel_handlers(bot: Client):
             if not message.from_user:
                 return
             uid = int(message.from_user.id)
+            try:
+                await sync_admins_to_config()
+            except Exception:
+                pass
             if not _is_admin(uid):
                 return
             st = _AP_STATE.get(uid)
@@ -663,13 +801,34 @@ def register_admin_panel_handlers(bot: Client):
 
             step = st.get("step")
 
-            # Auto-delete time inputs
+            if step == "wait_add_admin":
+                aid, name, username = await _resolve_user(client, message)
+                if not aid:
+                    await message.reply_text(
+                        "❌ User samajh nahi aaya.\nUser ID / @username / forward bhejo.",
+                        quote=True,
+                        reply_markup=kb_ma_menu(),
+                    )
+                    return
+                res = await add_bot_admin(aid, name=name or str(aid), username=username or "")
+                grp = await promote_in_group(client, aid)
+                _AP_STATE.pop(uid, None)
+                await message.reply_text(
+                    f"✅ <b>{_safe(name) or aid}</b> bot admin.\n"
+                    f"ID: <code>{aid}</code>\n"
+                    f"{res.get('msg')}\n"
+                    f"Group: {grp}",
+                    quote=True,
+                    reply_markup=kb_ma_menu(),
+                )
+                return
+
             if step in ("wait_ad_bot", "wait_ad_result", "wait_ad_notfound"):
                 text = (message.text or "").strip()
                 sec = parse_duration(text)
                 if sec is None:
                     await message.reply_text(
-                        "❌ Time samajh nahi aaya.\nExamples: <code>30m</code> <code>1h</code> <code>24h</code> <code>2d</code> <code>3month</code>",
+                        "❌ Time samajh nahi aaya.\nExamples: <code>30m</code> <code>1h</code> <code>24h</code> <code>2d</code>",
                         quote=True,
                     )
                     return
@@ -680,7 +839,7 @@ def register_admin_panel_handlers(bot: Client):
                         back = kb_ad_menu()
                     elif step == "wait_ad_result":
                         await set_group_result_delete_seconds(sec)
-                        label = "Group result (user+bot)"
+                        label = "Group result"
                         back = kb_ad_grp_menu()
                     else:
                         await set_group_not_found_delete_seconds(sec)
@@ -688,7 +847,7 @@ def register_admin_panel_handlers(bot: Client):
                         back = kb_ad_grp_menu()
                     _AP_STATE.pop(uid, None)
                     await message.reply_text(
-                        f"✅ {label} auto-delete set:\n<code>{format_duration(sec)}</code> ({sec}s)",
+                        f"✅ {label}: <code>{format_duration(sec)}</code> ({sec}s)",
                         quote=True,
                         reply_markup=back,
                     )
@@ -722,11 +881,7 @@ def register_admin_panel_handlers(bot: Client):
                 try:
                     await db.set_file_caption(text)
                     _AP_STATE.pop(uid, None)
-                    await message.reply_text(
-                        "✅ File caption set ho gaya.\nAb files pe ye template lagega.",
-                        quote=True,
-                        reply_markup=kb_cap_menu(True),
-                    )
+                    await message.reply_text("✅ File caption set.", quote=True, reply_markup=kb_cap_menu(True))
                 except Exception as e:
                     await message.reply_text(f"Error: {e}", quote=True)
                 return
@@ -734,14 +889,11 @@ def register_admin_panel_handlers(bot: Client):
             if step == "wait_channel":
                 cid, title, username = await _resolve_channel(client, message)
                 if not cid:
-                    await message.reply_text(
-                        "❌ Channel samajh nahi aaya.\nID / @username / link / forward bhejo.",
-                        quote=True, reply_markup=kb_back_fs(),
-                    )
+                    await message.reply_text("❌ Channel samajh nahi aaya.", quote=True, reply_markup=kb_back_fs())
                     return
                 if not await _bot_is_admin(client, cid):
                     await message.reply_text(
-                        f"❌ Bot is channel me admin nahi.\nPehle bot ko <b>{_safe(title) or cid}</b> me admin banao.",
+                        f"❌ Bot is channel me admin nahi: <b>{_safe(title) or cid}</b>",
                         quote=True, reply_markup=kb_back_fs(),
                     )
                     return
@@ -752,8 +904,7 @@ def register_admin_panel_handlers(bot: Client):
                     "username": username or "",
                 }
                 await message.reply_text(
-                    f"✅ Bot admin confirmed.\n\n<b>{_safe(title) or cid}</b>\n"
-                    f"ID: <code>{cid}</code>\n\nAb mode choose karo:",
+                    f"✅ Bot admin confirmed.\n<b>{_safe(title) or cid}</b>\nID: <code>{cid}</code>\nMode choose karo:",
                     quote=True, reply_markup=kb_mode_pick(cid),
                 )
                 return
