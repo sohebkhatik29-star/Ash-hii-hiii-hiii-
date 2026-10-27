@@ -115,20 +115,22 @@ async def _get_fs_pic() -> str:
 
 
 async def _edit_or_reply(query: CallbackQuery, text: str, markup=None):
+    """Edit in place only — never send a second message (prevents double panels)."""
     text = _safe(text)
     try:
         await query.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
         return
     except Exception as e1:
+        # Same content / not modified is fine
+        err = str(e1).lower()
+        if "not modified" in err or "message is not modified" in err:
+            return
         logger.warning("edit_text: %s", e1)
+    # Last resort: only answer alert, do NOT reply a new message (causes double UI)
     try:
-        await query.message.reply_text(text, reply_markup=markup, disable_web_page_preview=True, quote=True)
-    except Exception as e2:
-        logger.warning("reply_text: %s", e2)
-        try:
-            await query.answer(str(e2)[:180], show_alert=True)
-        except Exception:
-            pass
+        await query.answer("Updated", show_alert=False)
+    except Exception:
+        pass
 
 
 async def _resolve_channel(client: Client, message: Message):
@@ -188,7 +190,7 @@ async def _bot_is_admin(client: Client, channel_id: int) -> bool:
 
 
 async def handle_ap_callback(client: Client, query: CallbackQuery):
-    """Main entry for all ap_* callbacks (called from session_callbacks + own handler)."""
+    """Single entry for all ap_* callbacks (only via session_callbacks)."""
     user = query.from_user
     data = (query.data or "").strip()
     logger.info("AP cb data=%s user=%s", data, getattr(user, "id", None))
@@ -412,9 +414,8 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
 
 
 def register_admin_panel_handlers(bot: Client):
-    @bot.on_callback_query(filters.regex(r"^ap_"), group=-2)
-    async def ap_callbacks(client: Client, query: CallbackQuery):
-        await handle_ap_callback(client, query)
+    # NOTE: ap_* callbacks are routed ONLY from session_callbacks -> handle_ap_callback
+    # Do NOT register a second on_callback_query here (that caused double panels).
 
     @bot.on_message(filters.private, group=50)
     async def ap_admin_input(client: Client, message: Message):
@@ -495,4 +496,4 @@ def register_admin_panel_handlers(bot: Client):
         except Exception as e:
             logger.exception("ap_admin_input: %s", e)
 
-    logger.info("Admin panel handlers registered OK")
+    logger.info("Admin panel handlers registered OK (callbacks via session_callbacks only)")
