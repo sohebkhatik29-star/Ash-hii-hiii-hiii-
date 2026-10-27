@@ -138,6 +138,14 @@ try:
 except Exception as e:
     logger.error(f"delete_filter_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
+# /not_available command (bot_commands folder) — fail-safe
+try:
+    from handlers.bot_commands.notavailable_cmd import register_notavailable_command
+    register_notavailable_command(Bot)
+    logger.info("/not_available command registered")
+except Exception as e:
+    logger.error(f"notavailable_cmd register failed (bot still runs): {type(e).__name__}: {e}")
+
 # Admin Panel (Force Sub UI) — fail-safe so bot still boots if panel has issue
 try:
     from handlers.admin_panel import register_admin_panel_handlers
@@ -165,6 +173,7 @@ async def setup_bot_commands(bot: Client):
         BotCommand("done", "Not-found session close"),
         BotCommand("chakspelling", "Check spelling (reply to user)"),
         BotCommand("deletefilter", "Reply to poster \u2192 remove filter"),
+        BotCommand("not_available", "Not available on Telegram (reply)"),
     ]
     private_cmds = [
         BotCommand("start", "Bot start / welcome"),
