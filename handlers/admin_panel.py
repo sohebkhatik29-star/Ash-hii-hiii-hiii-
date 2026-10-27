@@ -1,5 +1,5 @@
 # ==============================================================================
-# handlers/admin_panel.py — Admin Panel + Force Sub UI (owner/admin only)
+# handlers/admin_panel.py — Admin Panel + Force Sub UI + File Caption (owner/admin)
 # ==============================================================================
 import logging
 import re
@@ -12,6 +12,11 @@ from pyrogram.types import (
 )
 from configs import Config
 from handlers.database import db
+
+try:
+    from handlers import caption_db  # noqa: F401 — patches db.get/set/clear_file_caption
+except Exception:
+    pass
 
 logger = logging.getLogger("AdminPanel")
 
@@ -43,7 +48,23 @@ def _safe(s) -> str:
 def kb_admin_home():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔐 Force Sub", callback_data="ap_fs_menu")],
+        [InlineKeyboardButton("📝 File Caption", callback_data="ap_cap_menu")],
         [InlineKeyboardButton("❌ Close", callback_data="ap_close")],
+    ])
+
+
+def kb_cap_menu(has_cap: bool):
+    rows = [[InlineKeyboardButton("✏️ Set Caption", callback_data="ap_cap_set")]]
+    if has_cap:
+        rows.append([InlineKeyboardButton("👁 See Caption", callback_data="ap_cap_see")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="ap_home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_cap_see_actions():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Delete Caption", callback_data="ap_cap_del")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="ap_cap_menu")],
     ])
 
 
@@ -114,6 +135,13 @@ async def _get_fs_pic() -> str:
         return ""
 
 
+async def _get_file_cap() -> str:
+    try:
+        return (await db.get_file_caption()) or ""
+    except Exception:
+        return ""
+
+
 async def _edit_or_reply(query: CallbackQuery, text: str, markup=None):
     """Edit in place only — never send a second message (prevents double panels)."""
     text = _safe(text)
@@ -121,12 +149,10 @@ async def _edit_or_reply(query: CallbackQuery, text: str, markup=None):
         await query.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
         return
     except Exception as e1:
-        # Same content / not modified is fine
         err = str(e1).lower()
         if "not modified" in err or "message is not modified" in err:
             return
         logger.warning("edit_text: %s", e1)
-    # Last resort: only answer alert, do NOT reply a new message (causes double UI)
     try:
         await query.answer("Updated", show_alert=False)
     except Exception:
@@ -235,6 +261,64 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
         )
         return
 
+    # ---------- File Caption ----------
+    if data == "ap_cap_menu":
+        _AP_STATE.pop(uid, None)
+        has = bool(await _get_file_cap())
+        await _edit_or_reply(
+            query,
+            "📝 <b>File Caption</b>\n\n"
+            "File bhejne pe jo caption lagta hai, yahan set/delete kar sakte ho.\n"
+            "Placeholders: <code>{file_name}</code> <code>{file_size}</code> <code>{file_caption}</code>",
+            kb_cap_menu(has),
+        )
+        return
+
+    if data == "ap_cap_set":
+        _AP_STATE[uid] = {"step": "wait_caption"}
+        await _edit_or_reply(
+            query,
+            "✏️ <b>Set Caption</b>\n\n"
+            "Apna caption template bhejo (HTML allowed).\n\n"
+            "Example:\n"
+            "<code><a href=\"https://t.me/Movies_1770\"><b>{file_name}</b></a></code>\n\n"
+            "Placeholders:\n"
+            "• <code>{file_name}</code> — file ka naam\n"
+            "• <code>{file_size}</code> — size\n"
+            "• <code>{file_caption}</code> — original caption",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_cap_menu")]]),
+        )
+        return
+
+    if data == "ap_cap_see":
+        cap = await _get_file_cap()
+        if not cap:
+            await _edit_or_reply(
+                query,
+                "Koi custom caption set nahi hai.\nFile pe original caption lagega.",
+                kb_cap_menu(False),
+            )
+            return
+        await _edit_or_reply(
+            query,
+            f"👁 <b>Current File Caption:</b>\n\n{_safe(cap)}",
+            kb_cap_see_actions(),
+        )
+        return
+
+    if data == "ap_cap_del":
+        try:
+            await db.clear_file_caption()
+        except Exception as e:
+            logger.warning("clear caption: %s", e)
+        await _edit_or_reply(
+            query,
+            "✅ Custom caption delete.\nAb file ka <b>original</b> caption use hoga.",
+            kb_cap_menu(False),
+        )
+        return
+
+    # ---------- Force Sub ----------
     if data == "ap_fs_menu":
         _AP_STATE.pop(uid, None)
         await _edit_or_reply(
@@ -414,8 +498,7 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
 
 
 def register_admin_panel_handlers(bot: Client):
-    # NOTE: ap_* callbacks are routed ONLY from session_callbacks -> handle_ap_callback
-    # Do NOT register a second on_callback_query here (that caused double panels).
+    # ap_* callbacks ONLY via session_callbacks -> handle_ap_callback
 
     @bot.on_message(filters.private, group=50)
     async def ap_admin_input(client: Client, message: Message):
@@ -433,6 +516,23 @@ def register_admin_panel_handlers(bot: Client):
                 return
 
             step = st.get("step")
+
+            if step == "wait_caption":
+                text = (message.text or message.caption or "").strip()
+                if not text:
+                    await message.reply_text("Caption text bhejo.", quote=True)
+                    return
+                try:
+                    await db.set_file_caption(text)
+                    _AP_STATE.pop(uid, None)
+                    await message.reply_text(
+                        "✅ File caption set ho gaya.\nAb files pe ye template lagega.",
+                        quote=True,
+                        reply_markup=kb_cap_menu(True),
+                    )
+                except Exception as e:
+                    await message.reply_text(f"Error: {e}", quote=True)
+                return
 
             if step == "wait_channel":
                 cid, title, username = await _resolve_channel(client, message)
