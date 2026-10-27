@@ -1,1 +1,303 @@
-PLACEHOLDER
+# ==============================================================================
+# ASH AUTOMATIC MOVIE FILE STORE BOT
+# Module: handlers/save_media.py
+# Purpose: Instant /addmovie media handling. Surrogate-safe. Poster restored.
+# Version: 2026-10-26-v3.4-fast-ack-no-poster-block
+# ==============================================================================
+
+import asyncio
+import logging
+from pyrogram import Client
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait
+
+from configs import Config
+from handlers.database import db
+from handlers.parser import extract_movie_metadata, format_size, sanitize_text
+from handlers.session_manager import session_mgr
+from handlers.movie_card import build_final_movie_card_text, build_final_movie_card_buttons
+from handlers.poster import extract_poster_from_message
+
+logger = logging.getLogger(__name__)
+
+_SESSION_MARKUP = InlineKeyboardMarkup([
+    [
+        InlineKeyboardButton("Continue Upload", callback_data="session_continue"),
+        InlineKeyboardButton("Generate Links", callback_data="session_generate"),
+    ],
+    [InlineKeyboardButton("Cancel Session", callback_data="session_cancel")],
+])
+
+
+def _safe(s, default=""):
+    try:
+        return sanitize_text(s) if s is not None else default
+    except Exception:
+        return default
+
+
+async def forward_to_db_channel(bot: Client, message: Message) -> Message:
+    try:
+        sent = await message.copy(Config.DB_CHANNEL)
+        return sent
+    except FloodWait as sl:
+        await asyncio.sleep(sl.value)
+        return await forward_to_db_channel(bot, message)
+    except Exception as e:
+        logger.error("Failed to forward media to DB channel: %s", type(e).__name__)
+        raise
+
+
+async def _bg_copy_and_patch(bot, message, movie_id, quality_key, quality_data):
+    """Background: copy file to DB channel, then patch quality with channel_msg_id. FAST path."""
+    try:
+        channel_msg = await forward_to_db_channel(bot, message)
+        if channel_msg and channel_msg.id:
+            quality_data = dict(quality_data or {})
+            quality_data["channel_msg_id"] = channel_msg.id
+            quality_data["channel_chat_id"] = Config.DB_CHANNEL
+            try:
+                await db.add_quality_to_movie(movie_id, quality_key, quality_data)
+            except Exception as pe:
+                logger.debug("patch quality channel id: %s", type(pe).__name__)
+    except Exception as e:
+        logger.warning("_bg_copy_and_patch: %s: %s", type(e).__name__, e)
+
+
+async def _quick_status_edit(bot, session, text, markup=None):
+    status_msg_id = session.get("status_msg_id") if session else None
+    status_chat_id = (session or {}).get("status_chat_id")
+    if not status_msg_id or not status_chat_id:
+        return False
+    try:
+        await bot.edit_message_text(
+            chat_id=status_chat_id,
+            message_id=status_msg_id,
+            text=_safe(text),
+            reply_markup=markup or _SESSION_MARKUP,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def handle_incoming_movie_file(bot: Client, message: Message):
+    try:
+        await _handle_incoming_movie_file_inner(bot, message)
+    except Exception as e:
+        logger.exception("handle_incoming_movie_file")
+        try:
+            await message.reply_text(f"File process fail: {type(e).__name__}: {e}", quote=True)
+        except Exception:
+            pass
+
+
+async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
+    admin_id = message.from_user.id if message.from_user else 0
+    if admin_id not in getattr(Config, "ADMINS", set()):
+        return
+
+    session = await session_mgr.get_session(admin_id)
+    if not session:
+        await message.reply_text(
+            "⚠️ Koi active movie session nahi hai.\nPehle /addmovie chalao.",
+            quote=True,
+        )
+        return
+
+    file_id = None
+    filesize = 0
+    file_name = ""
+    if message.video:
+        file_id = message.video.file_id
+        filesize = message.video.file_size or 0
+        file_name = message.video.file_name or ""
+    elif message.document:
+        file_id = message.document.file_id
+        filesize = message.document.file_size or 0
+        file_name = message.document.file_name or ""
+
+    if not file_id:
+        await message.reply_text("Sirf video/document support hai.", quote=True)
+        return
+
+    ack = None
+    try:
+        ack = await message.reply_text("⏳ File process ho rahi hai...", quote=True)
+    except Exception:
+        pass
+
+    caption = message.caption or ""
+    try:
+        meta = extract_movie_metadata(file_name, caption)
+    except Exception:
+        meta = {}
+    title = _safe(
+        meta.get("title")
+        or session.get("title")
+        or (file_name.rsplit(".", 1)[0] if file_name else "")
+        or "Unknown"
+    )
+    year = meta.get("year") or session.get("year")
+    final_quality = meta.get("quality") or meta.get("quality_label") or "HD"
+    season = (meta.get("season") or "").strip()
+    episode = (meta.get("episode") or "").strip()
+    if episode:
+        parts = [final_quality]
+        if season:
+            parts.append(season)
+        parts.append(episode)
+        quality_key = " ".join(parts)
+    else:
+        quality_key = final_quality
+    filesize_str = format_size(filesize) if filesize else "?"
+    file_name = _safe(file_name)
+
+    async with session_mgr.get_lock(admin_id):
+        session = await session_mgr.get_session(admin_id)
+        if not session:
+            msg = "⚠️ Session expire ho gaya. /addmovie dobara chalao."
+            if ack:
+                try:
+                    await ack.edit_text(msg)
+                except Exception:
+                    await message.reply_text(msg, quote=True)
+            else:
+                await message.reply_text(msg, quote=True)
+            return
+
+        movie_id = session.get("movie_id")
+        active_title = session.get("title") or title
+        active_year = session.get("year") or year
+
+        if not movie_id:
+            poster_file_id = session.get("poster_file_id")
+            existing = None
+            try:
+                existing = await db.find_movie_by_title_year(active_title, active_year)
+            except Exception:
+                existing = None
+
+            if existing and existing.get("movie_id"):
+                movie_id = existing["movie_id"]
+                try:
+                    patch = {"updated_at": __import__("datetime").datetime.utcnow().isoformat()}
+                    if active_title and len(active_title) < len(str(existing.get("title") or "")):
+                        patch["title"] = active_title
+                        patch["normalized_title"] = _safe(active_title.lower())
+                    if getattr(db, "has_mongo", False) and getattr(db, "movies_col", None) is not None:
+                        await db.movies_col.update_one({"movie_id": movie_id}, {"$set": patch})
+                    if movie_id in getattr(db, "_mem_movies", {}):
+                        db._mem_movies[movie_id].update(patch)
+                except Exception as e:
+                    logger.debug("merge existing: %s", type(e).__name__)
+            else:
+                doc = await db.create_movie(
+                    title=active_title,
+                    normalized_title=_safe(active_title.lower()),
+                    year=active_year,
+                    poster_file_id=poster_file_id,
+                )
+                movie_id = doc.get("movie_id")
+
+            await session_mgr.register_first_movie_file(
+                admin_id, movie_id, active_title,
+                year=active_year, quality=final_quality, poster_file_id=poster_file_id,
+            )
+            session = await session_mgr.get_session(admin_id) or session
+            session["movie_id"] = movie_id
+            session["title"] = active_title
+            session["year"] = active_year
+
+            if not session.get("poster_file_id"):
+                asyncio.create_task(_bg_extract_poster(bot, message, movie_id, admin_id))
+
+        quality_data = {
+            "file_id": file_id,
+            "file_name": file_name,
+            "file_size": filesize,
+            "label": quality_key,
+            "quality": final_quality,
+            "season": season or None,
+            "episode": episode or None,
+        }
+        await db.add_quality_to_movie(movie_id, quality_key, quality_data)
+        try:
+            await session_mgr.register_additional_quality(admin_id, quality_key)
+        except Exception:
+            pass
+        asyncio.create_task(_bg_copy_and_patch(bot, message, movie_id, quality_key, quality_data))
+
+        qualities_list = (await db.get_movie(movie_id) or {}).get("qualities", {})
+        q_str = ", ".join(qualities_list.keys()) if qualities_list else quality_key
+        status_text = (
+            f"🎬 **Movie Session Active** (v3.3)\n\n"
+            f"**Title:** `{active_title}`\n"
+            f"**Year:** `{active_year or 'N/A'}`\n\n"
+            f"✅ **Added:** `{quality_key}` ({filesize_str})\n"
+            f"**All qualities:** `{q_str}`\n\n"
+            f"Aur quality bhejo ya Generate Links dabaao."
+        )
+        status_msg_id = session.get("status_msg_id")
+        status_chat_id = session.get("status_chat_id", message.chat.id)
+        edited = False
+        try:
+            if status_msg_id:
+                await bot.edit_message_text(
+                    chat_id=status_chat_id,
+                    message_id=status_msg_id,
+                    text=_safe(status_text),
+                    reply_markup=_SESSION_MARKUP,
+                )
+                edited = True
+        except Exception as e:
+            logger.debug("status edit: %s", type(e).__name__)
+        if not edited:
+            try:
+                sent = await message.reply_text(
+                    _safe(status_text), quote=True, reply_markup=_SESSION_MARKUP
+                )
+                session["status_msg_id"] = sent.id
+                session["status_chat_id"] = message.chat.id
+                session_mgr.active_sessions[admin_id] = session
+                try:
+                    await db.set_active_session(admin_id, session)
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.error("status reply fail: %s", type(e).__name__)
+
+        if ack:
+            try:
+                await ack.delete()
+            except Exception:
+                pass
+
+
+async def _bg_extract_poster(bot, message, movie_id, admin_id):
+    """Background poster — never blocks file save / session reply."""
+    try:
+        poster_file_id = await extract_poster_from_message(bot, message)
+        if not poster_file_id:
+            return
+        try:
+            if getattr(db, "has_mongo", False) and getattr(db, "movies_col", None) is not None:
+                await db.movies_col.update_one(
+                    {"movie_id": movie_id},
+                    {"$set": {"poster_file_id": poster_file_id}},
+                )
+            if movie_id in getattr(db, "_mem_movies", {}):
+                db._mem_movies[movie_id]["poster_file_id"] = poster_file_id
+        except Exception as e:
+            logger.debug("poster db: %s", type(e).__name__)
+        try:
+            session = await session_mgr.get_session(admin_id)
+            if session:
+                session["poster_file_id"] = poster_file_id
+                session_mgr.active_sessions[admin_id] = session
+                await db.set_active_session(admin_id, session)
+        except Exception:
+            pass
+        logger.info("bg poster ok movie=%s", movie_id)
+    except Exception as e:
+        logger.warning("bg poster fail: %s: %s", type(e).__name__, e)
