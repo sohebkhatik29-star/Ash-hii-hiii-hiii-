@@ -1,10 +1,14 @@
 # ============================================================================
 # handlers/search_query.py  — ONLY query clean + title match (alg file)
-# STRICT: multi-word title → query me saare significant words hone chahiye
-# "FURY" alone ↛ "Fury In The Shadows"
-# "FURY IN THE SHADOWS" / "fury shadows" → match
-# Single-word title (RRR, Pushpa if only one word) → that word enough
-# Year-only → never match
+#
+# Rules:
+# 1) Year-only → never match
+# 2) Full significant title words in query → match
+#    "FURY IN THE SHADOWS" / "fury shadows" → Fury In The Shadows
+# 3) Single distinctive FIRST word (len >= 5) → match
+#    "PUSHPA" → Pushpa The Rise   (franchise / main name)
+#    "FURY" (len 4) → NO match on Fury In The Shadows
+# 4) Weak tail-only (RISE, SHADOWS without first word) → NO match
 # ============================================================================
 import re
 from typing import List
@@ -35,7 +39,7 @@ def _norm(s: str) -> str:
 
 
 def clean_search_query(raw: str) -> str:
-    """Noise hatao; years rakh o (name ke saath)."""
+    """Noise hatao; years name ke saath rakho."""
     text = _norm(raw)
     if not text:
         return ""
@@ -67,13 +71,11 @@ def _title_tokens(title: str) -> List[str]:
 
 def is_strict_title_match(query: str, movie_title: str, movie_year=None) -> bool:
     """
-    PURA significant name match:
-    - Title ke saare significant words query me hone chahiye
-      (noise/year hata ke: "Fury In The Shadows" → fury, shadows)
-    - Sirf pehla word (FURY) → NO match jab title multi-word ho
-    - Single-word title (RRR) → us word se match
-    - Sirf year → NO match
-    - Query me year ho to movie year match (jab available)
+    Hybrid smart match:
+    - Full significant title in query → OK
+    - Query = distinctive first word of title (len >= 5) → OK  (PUSHPA)
+    - Short first word only (FURY len4) when title multi-word → NO
+    - Year-only / weak tail-only → NO
     """
     q = clean_search_query(query)
     if not q:
@@ -85,9 +87,8 @@ def is_strict_title_match(query: str, movie_title: str, movie_year=None) -> bool
     q_years = {t for t in q_tokens if t.isdigit() and len(t) == 4}
     q_words = [t for t in q_tokens if t not in q_years]
 
-    # Year-only → reject
     if not q_words:
-        return False
+        return False  # year-only
 
     title_toks = _title_tokens(movie_title or "")
     title_words = [t for t in title_toks if not (t.isdigit() and len(t) == 4)]
@@ -96,7 +97,7 @@ def is_strict_title_match(query: str, movie_title: str, movie_year=None) -> bool
 
     q_set = set(q_words)
 
-    # Year constraint
+    # Year constraint when user typed a year
     if q_years and movie_year is not None:
         try:
             if str(int(movie_year)) not in q_years:
@@ -105,14 +106,17 @@ def is_strict_title_match(query: str, movie_title: str, movie_year=None) -> bool
             if str(movie_year) not in q_years:
                 return False
 
-    # EVERY significant title word must appear in query
-    for tw in title_words:
-        if tw not in q_set:
-            if len(tw) >= 5 and any(tw in qw or qw in tw for qw in q_words if len(qw) >= 4):
-                continue
-            return False
+    # Path A: every significant title word is in the query (full name)
+    if all(tw in q_set for tw in title_words):
+        return True
 
-    return True
+    # Path B: distinctive main/franchise name = first title word, len >= 5
+    # PUSHPA → Pushpa The Rise  |  RRR → RRR  |  FURY (4) → blocked
+    first = title_words[0]
+    if len(first) >= 5 and first in q_set:
+        return True
+
+    return False
 
 
 def filter_strict_matches(query: str, movies: list) -> list:
