@@ -1,6 +1,5 @@
 # ==============================================================================
 # handlers/admin_panel.py — Admin Panel + Force Sub UI (owner/admin only)
-# Single file so register never silently fails.
 # ==============================================================================
 import logging
 import re
@@ -16,20 +15,15 @@ from handlers.database import db
 
 logger = logging.getLogger("AdminPanel")
 
-# admin_id -> pending state
 _AP_STATE = {}
 
 
 def _is_admin(uid) -> bool:
     try:
         uid = int(uid)
-    except Exception:
-        return False
-    try:
         admins = Config.ADMINS
-        if admins is None:
+        if not admins:
             return False
-        # set / list / tuple all support `in`
         return uid in admins
     except Exception:
         return False
@@ -63,9 +57,7 @@ def kb_fs_menu():
 
 
 def kb_fs_msg_menu(has_msg: bool, has_pic: bool):
-    rows = [
-        [InlineKeyboardButton("✏️ Set Force Sub Message", callback_data="ap_fs_set_msg")],
-    ]
+    rows = [[InlineKeyboardButton("✏️ Set Force Sub Message", callback_data="ap_fs_set_msg")]]
     if has_msg:
         rows.append([InlineKeyboardButton("👁 See Force Sub Message", callback_data="ap_fs_see_msg")])
     rows.append([InlineKeyboardButton("🖼 Set Force Sub Pic", callback_data="ap_fs_set_pic")])
@@ -124,25 +116,15 @@ async def _get_fs_pic() -> str:
 
 async def _edit_or_reply(query: CallbackQuery, text: str, markup=None):
     text = _safe(text)
-    # Prefer edit; if fails, send new message so user always sees response
     try:
-        await query.message.edit_text(
-            text,
-            reply_markup=markup,
-            disable_web_page_preview=True,
-        )
+        await query.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
         return
     except Exception as e1:
-        logger.warning("edit_text failed: %s", e1)
+        logger.warning("edit_text: %s", e1)
     try:
-        await query.message.reply_text(
-            text,
-            reply_markup=markup,
-            disable_web_page_preview=True,
-            quote=True,
-        )
+        await query.message.reply_text(text, reply_markup=markup, disable_web_page_preview=True, quote=True)
     except Exception as e2:
-        logger.warning("reply_text failed: %s", e2)
+        logger.warning("reply_text: %s", e2)
         try:
             await query.answer(str(e2)[:180], show_alert=True)
         except Exception:
@@ -196,12 +178,7 @@ async def _bot_is_admin(client: Client, channel_id: int) -> bool:
         me = await client.get_me()
         m = await client.get_chat_member(channel_id, me.id)
         st = str(getattr(m.status, "value", m.status) or m.status).lower()
-        if st in (
-            "administrator", "owner", "creator",
-            "chatmemberstatus.administrator",
-            "chatmemberstatus.owner",
-            "chatmemberstatus.creator",
-        ):
+        if any(x in st for x in ("administrator", "owner", "creator")):
             return True
         if getattr(m, "privileges", None) is not None:
             return True
@@ -210,294 +187,237 @@ async def _bot_is_admin(client: Client, channel_id: int) -> bool:
     return False
 
 
-def register_admin_panel_handlers(bot: Client):
-    """Register Admin Panel callbacks + admin input for force-sub setup."""
+async def handle_ap_callback(client: Client, query: CallbackQuery):
+    """Main entry for all ap_* callbacks (called from session_callbacks + own handler)."""
+    user = query.from_user
+    data = (query.data or "").strip()
+    logger.info("AP cb data=%s user=%s", data, getattr(user, "id", None))
 
-    @bot.on_callback_query(filters.regex(r"^ap_"), group=0)
-    async def ap_callbacks(client: Client, query: CallbackQuery):
+    if not user:
         try:
-            user = query.from_user
-            data = (query.data or "").strip()
-            logger.info("AdminPanel cb data=%s user=%s", data, getattr(user, "id", None))
+            await query.answer()
+        except Exception:
+            pass
+        return
 
-            if not user:
-                try:
-                    await query.answer()
-                except Exception:
-                    pass
-                return
+    if not _is_admin(user.id):
+        try:
+            await query.answer("Sirf owner/admin ke liye.", show_alert=True)
+        except Exception:
+            pass
+        return
 
-            if not _is_admin(user.id):
-                try:
-                    await query.answer("Sirf owner/admin ke liye.", show_alert=True)
-                except Exception:
-                    pass
-                return
+    uid = int(user.id)
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
-            uid = int(user.id)
-
-            # Answer early so Telegram stops loading spinner
+    if data == "ap_close":
+        _AP_STATE.pop(uid, None)
+        try:
+            await query.message.delete()
+        except Exception:
             try:
-                await query.answer()
+                await query.message.edit_text("Admin panel band.")
             except Exception:
                 pass
+        return
 
-            if data == "ap_close":
-                _AP_STATE.pop(uid, None)
-                try:
-                    await query.message.delete()
-                except Exception:
-                    try:
-                        await query.message.edit_text("Admin panel band.")
-                    except Exception:
-                        pass
-                return
+    if data == "ap_home":
+        _AP_STATE.pop(uid, None)
+        await _edit_or_reply(
+            query,
+            "🛠 <b>Admin Panel</b>\n\nSirf owner/admin ke liye.\nNeeche se option choose karo:",
+            kb_admin_home(),
+        )
+        return
 
-            if data == "ap_home":
-                _AP_STATE.pop(uid, None)
-                await _edit_or_reply(
-                    query,
-                    "🛠 <b>Admin Panel</b>\n\nSirf owner/admin ke liye.\nNeeche se option choose karo:",
-                    kb_admin_home(),
-                )
-                return
+    if data == "ap_fs_menu":
+        _AP_STATE.pop(uid, None)
+        await _edit_or_reply(
+            query,
+            "🔐 <b>Force Sub Panel</b>\n\nChannel add/remove, message & pic set karo:",
+            kb_fs_menu(),
+        )
+        return
 
-            if data == "ap_fs_menu":
-                _AP_STATE.pop(uid, None)
-                await _edit_or_reply(
-                    query,
-                    "🔐 <b>Force Sub Panel</b>\n\nChannel add/remove, message & pic set karo:",
-                    kb_fs_menu(),
-                )
-                return
+    if data == "ap_fs_add":
+        _AP_STATE[uid] = {"step": "wait_channel"}
+        await _edit_or_reply(
+            query,
+            "➕ <b>Add Force Sub Channel</b>\n\n"
+            "Mujhe bhejo:\n"
+            "• Channel ID (<code>-1001234567890</code>)\n"
+            "• Channel link / @username\n"
+            "• Channel se message <b>forward</b>\n\n"
+            "Bot us channel me <b>admin</b> hona chahiye.",
+            kb_back_fs(),
+        )
+        return
 
-            if data == "ap_fs_add":
-                _AP_STATE[uid] = {"step": "wait_channel"}
-                await _edit_or_reply(
-                    query,
-                    "➕ <b>Add Force Sub Channel</b>\n\n"
-                    "Mujhe bhejo (kisi bhi tarike se):\n"
-                    "• Channel ID  (jaise <code>-1001234567890</code>)\n"
-                    "• Channel link / @username\n"
-                    "• Channel se koi message <b>forward</b> karo\n\n"
-                    "Bot us channel me <b>admin</b> hona chahiye.",
-                    kb_back_fs(),
-                )
-                return
-
-            if data.startswith("ap_fs_mode:"):
-                parts = data.split(":")
-                if len(parts) < 3:
-                    return
-                mode = parts[1]
-                try:
-                    cid = int(parts[2])
-                except Exception:
-                    return
-                st = _AP_STATE.get(uid) or {}
-                title = st.get("title") or str(cid)
-                username = st.get("username") or ""
-                try:
-                    await db.add_force_channel(cid, title=title, username=username, mode=mode)
-                    _AP_STATE.pop(uid, None)
-                    await _edit_or_reply(
-                        query,
-                        f"✅ Force sub channel add ho gaya.\n\n"
-                        f"<b>{_safe(title)}</b>\n"
-                        f"ID: <code>{cid}</code>\n"
-                        f"Mode: <code>{mode}</code>",
-                        kb_fs_menu(),
-                    )
-                except ValueError as ve:
-                    if str(ve) == "MAX_7":
-                        await _edit_or_reply(query, "❌ Max 7 force-sub channels allowed.", kb_fs_menu())
-                    else:
-                        await _edit_or_reply(query, f"❌ Error: {ve}", kb_fs_menu())
-                except Exception as e:
-                    logger.exception("add_force_channel")
-                    await _edit_or_reply(query, f"❌ Error: {type(e).__name__}", kb_fs_menu())
-                return
-
-            if data == "ap_fs_list":
-                try:
-                    chs = await db.list_force_channels()
-                except Exception:
-                    chs = []
-                if not chs:
-                    await _edit_or_reply(query, "Koi force-sub channel nahi hai.", kb_fs_menu())
-                    return
-                rows = []
-                for c in chs:
-                    cid = c.get("channel_id")
-                    title = _safe(c.get("title") or str(cid))[:40]
-                    mode = c.get("mode") or "normal"
-                    rows.append([
-                        InlineKeyboardButton(
-                            f"{title} [{mode}]",
-                            callback_data=f"ap_fs_view:{cid}",
-                        )
-                    ])
-                rows.append([InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_menu")])
-                await _edit_or_reply(
-                    query,
-                    "📋 <b>Force Sub Channels</b>\n\nChannel pe click karke delete kar sakte ho:",
-                    InlineKeyboardMarkup(rows),
-                )
-                return
-
-            if data.startswith("ap_fs_view:"):
-                try:
-                    cid = int(data.split(":")[1])
-                except Exception:
-                    return
-                try:
-                    chs = await db.list_force_channels()
-                except Exception:
-                    chs = []
-                ch = next((x for x in chs if int(x.get("channel_id", 0)) == cid), None)
-                if not ch:
-                    await _edit_or_reply(query, "Channel nahi mila.", kb_fs_menu())
-                    return
-                text = (
-                    f"📢 <b>{_safe(ch.get('title') or '')}</b>\n"
-                    f"ID: <code>{cid}</code>\n"
-                    f"Username: @{_safe(ch.get('username') or '-')}\n"
-                    f"Mode: <code>{ch.get('mode') or 'normal'}</code>"
-                )
-                await _edit_or_reply(query, text, kb_channel_actions(cid))
-                return
-
-            if data.startswith("ap_fs_del:"):
-                try:
-                    cid = int(data.split(":")[1])
-                except Exception:
-                    return
-                try:
-                    await db.remove_force_channel(cid)
-                    await _edit_or_reply(
-                        query,
-                        f"✅ Channel <code>{cid}</code> delete ho gaya.",
-                        kb_fs_menu(),
-                    )
-                except Exception as e:
-                    await _edit_or_reply(query, f"❌ Delete fail: {e}", kb_fs_menu())
-                return
-
-            if data == "ap_fs_msg_menu":
-                _AP_STATE.pop(uid, None)
-                has_msg = bool(await _get_fs_msg())
-                has_pic = bool(await _get_fs_pic())
-                await _edit_or_reply(
-                    query,
-                    "💬 <b>Force Sub Messages</b>\n\nMessage / pic set karo jo users ko dikhe:",
-                    kb_fs_msg_menu(has_msg, has_pic),
-                )
-                return
-
-            if data == "ap_fs_set_msg":
-                _AP_STATE[uid] = {"step": "wait_msg"}
-                await _edit_or_reply(
-                    query,
-                    "✏️ <b>Set Force Sub Message</b>\n\n"
-                    "Ab naya message bhejo.\n"
-                    "Placeholders: <code>{name}</code> <code>{username}</code> <code>{user}</code>",
-                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_msg_menu")]]),
-                )
-                return
-
-            if data == "ap_fs_see_msg":
-                msg = await _get_fs_msg()
-                if not msg:
-                    await _edit_or_reply(
-                        query,
-                        "Koi custom message set nahi hai.",
-                        kb_fs_msg_menu(False, bool(await _get_fs_pic())),
-                    )
-                    return
-                await _edit_or_reply(
-                    query,
-                    f"👁 <b>Current Force Sub Message:</b>\n\n{_safe(msg)}",
-                    kb_msg_actions(),
-                )
-                return
-
-            if data == "ap_fs_del_msg":
-                try:
-                    await db.clear_force_sub_message()
-                except Exception as e:
-                    logger.warning("clear msg: %s", e)
-                await _edit_or_reply(
-                    query,
-                    "✅ Force sub message delete. Default use hoga.",
-                    kb_fs_msg_menu(False, bool(await _get_fs_pic())),
-                )
-                return
-
-            if data == "ap_fs_set_pic":
-                _AP_STATE[uid] = {"step": "wait_pic"}
-                await _edit_or_reply(
-                    query,
-                    "🖼 <b>Set Force Sub Pic</b>\n\nAb ek photo bhejo (image).",
-                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_msg_menu")]]),
-                )
-                return
-
-            if data == "ap_fs_see_pic":
-                pic = await _get_fs_pic()
-                if not pic:
-                    await _edit_or_reply(
-                        query,
-                        "Koi force sub pic set nahi hai.",
-                        kb_fs_msg_menu(bool(await _get_fs_msg()), False),
-                    )
-                    return
-                try:
-                    await query.message.delete()
-                except Exception:
-                    pass
-                try:
-                    await client.send_photo(
-                        query.message.chat.id,
-                        pic,
-                        caption="👁 Current Force Sub Pic",
-                        reply_markup=kb_pic_actions(),
-                    )
-                except Exception as e:
-                    await client.send_message(
-                        query.message.chat.id,
-                        f"Pic load fail: {e}",
-                        reply_markup=kb_fs_msg_menu(bool(await _get_fs_msg()), True),
-                    )
-                return
-
-            if data == "ap_fs_del_pic":
-                try:
-                    await db.clear_force_sub_pic()
-                except Exception as e:
-                    logger.warning("clear pic: %s", e)
-                await _edit_or_reply(
-                    query,
-                    "✅ Force sub pic delete.",
-                    kb_fs_msg_menu(bool(await _get_fs_msg()), False),
-                )
-                return
-
-            # Unknown ap_ callback — still show home so button never feels dead
+    if data.startswith("ap_fs_mode:"):
+        parts = data.split(":")
+        if len(parts) < 3:
+            return
+        mode = parts[1]
+        try:
+            cid = int(parts[2])
+        except Exception:
+            return
+        st = _AP_STATE.get(uid) or {}
+        title = st.get("title") or str(cid)
+        username = st.get("username") or ""
+        try:
+            await db.add_force_channel(cid, title=title, username=username, mode=mode)
+            _AP_STATE.pop(uid, None)
             await _edit_or_reply(
                 query,
-                "🛠 <b>Admin Panel</b>\n\nOption choose karo:",
-                kb_admin_home(),
+                f"✅ Force sub channel add ho gaya.\n\n"
+                f"<b>{_safe(title)}</b>\nID: <code>{cid}</code>\nMode: <code>{mode}</code>",
+                kb_fs_menu(),
             )
+        except ValueError as ve:
+            msg = "❌ Max 7 force-sub channels allowed." if str(ve) == "MAX_7" else f"❌ {ve}"
+            await _edit_or_reply(query, msg, kb_fs_menu())
         except Exception as e:
-            logger.exception("ap_callbacks error")
-            try:
-                await query.answer(f"Error: {type(e).__name__}", show_alert=True)
-            except Exception:
-                pass
+            logger.exception("add_force_channel")
+            await _edit_or_reply(query, f"❌ Error: {type(e).__name__}: {e}", kb_fs_menu())
+        return
+
+    if data == "ap_fs_list":
+        try:
+            chs = await db.list_force_channels()
+        except Exception:
+            chs = []
+        if not chs:
+            await _edit_or_reply(query, "Koi force-sub channel nahi hai.", kb_fs_menu())
+            return
+        rows = []
+        for c in chs:
+            cid = c.get("channel_id")
+            title = _safe(c.get("title") or str(cid))[:40]
+            mode = c.get("mode") or "normal"
+            rows.append([InlineKeyboardButton(f"{title} [{mode}]", callback_data=f"ap_fs_view:{cid}")])
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_menu")])
+        await _edit_or_reply(
+            query,
+            "📋 <b>Force Sub Channels</b>\n\nClick karke delete kar sakte ho:",
+            InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data.startswith("ap_fs_view:"):
+        try:
+            cid = int(data.split(":")[1])
+        except Exception:
+            return
+        try:
+            chs = await db.list_force_channels()
+        except Exception:
+            chs = []
+        ch = next((x for x in chs if int(x.get("channel_id", 0)) == cid), None)
+        if not ch:
+            await _edit_or_reply(query, "Channel nahi mila.", kb_fs_menu())
+            return
+        text = (
+            f"📢 <b>{_safe(ch.get('title') or '')}</b>\n"
+            f"ID: <code>{cid}</code>\n"
+            f"Username: @{_safe(ch.get('username') or '-')}\n"
+            f"Mode: <code>{ch.get('mode') or 'normal'}</code>"
+        )
+        await _edit_or_reply(query, text, kb_channel_actions(cid))
+        return
+
+    if data.startswith("ap_fs_del:"):
+        try:
+            cid = int(data.split(":")[1])
+        except Exception:
+            return
+        try:
+            await db.remove_force_channel(cid)
+            await _edit_or_reply(query, f"✅ Channel <code>{cid}</code> delete.", kb_fs_menu())
+        except Exception as e:
+            await _edit_or_reply(query, f"❌ Delete fail: {e}", kb_fs_menu())
+        return
+
+    if data == "ap_fs_msg_menu":
+        _AP_STATE.pop(uid, None)
+        await _edit_or_reply(
+            query,
+            "💬 <b>Force Sub Messages</b>\n\nMessage / pic set karo:",
+            kb_fs_msg_menu(bool(await _get_fs_msg()), bool(await _get_fs_pic())),
+        )
+        return
+
+    if data == "ap_fs_set_msg":
+        _AP_STATE[uid] = {"step": "wait_msg"}
+        await _edit_or_reply(
+            query,
+            "✏️ <b>Set Force Sub Message</b>\n\nNaya message bhejo.\n"
+            "Placeholders: <code>{name}</code> <code>{username}</code> <code>{user}</code>",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_msg_menu")]]),
+        )
+        return
+
+    if data == "ap_fs_see_msg":
+        msg = await _get_fs_msg()
+        if not msg:
+            await _edit_or_reply(query, "Koi custom message set nahi.", kb_fs_msg_menu(False, bool(await _get_fs_pic())))
+            return
+        await _edit_or_reply(query, f"👁 <b>Current:</b>\n\n{_safe(msg)}", kb_msg_actions())
+        return
+
+    if data == "ap_fs_del_msg":
+        try:
+            await db.clear_force_sub_message()
+        except Exception as e:
+            logger.warning("clear msg: %s", e)
+        await _edit_or_reply(query, "✅ Message delete.", kb_fs_msg_menu(False, bool(await _get_fs_pic())))
+        return
+
+    if data == "ap_fs_set_pic":
+        _AP_STATE[uid] = {"step": "wait_pic"}
+        await _edit_or_reply(
+            query,
+            "🖼 <b>Set Force Sub Pic</b>\n\nEk photo bhejo.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_msg_menu")]]),
+        )
+        return
+
+    if data == "ap_fs_see_pic":
+        pic = await _get_fs_pic()
+        if not pic:
+            await _edit_or_reply(query, "Koi pic set nahi.", kb_fs_msg_menu(bool(await _get_fs_msg()), False))
+            return
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        try:
+            await client.send_photo(query.message.chat.id, pic, caption="👁 Current Force Sub Pic", reply_markup=kb_pic_actions())
+        except Exception as e:
+            await client.send_message(query.message.chat.id, f"Pic fail: {e}", reply_markup=kb_fs_msg_menu(bool(await _get_fs_msg()), True))
+        return
+
+    if data == "ap_fs_del_pic":
+        try:
+            await db.clear_force_sub_pic()
+        except Exception as e:
+            logger.warning("clear pic: %s", e)
+        await _edit_or_reply(query, "✅ Pic delete.", kb_fs_msg_menu(bool(await _get_fs_msg()), False))
+        return
+
+    await _edit_or_reply(query, "🛠 <b>Admin Panel</b>\n\nOption choose karo:", kb_admin_home())
+
+
+def register_admin_panel_handlers(bot: Client):
+    @bot.on_callback_query(filters.regex(r"^ap_"), group=-2)
+    async def ap_callbacks(client: Client, query: CallbackQuery):
+        await handle_ap_callback(client, query)
 
     @bot.on_message(filters.private, group=50)
     async def ap_admin_input(client: Client, message: Message):
-        """Only acts when admin has pending panel state (wait_channel / wait_msg / wait_pic)."""
         try:
             if not message.from_user:
                 return
@@ -507,8 +427,6 @@ def register_admin_panel_handlers(bot: Client):
             st = _AP_STATE.get(uid)
             if not st:
                 return
-
-            # Don't steal commands
             text0 = (message.text or "").strip()
             if text0.startswith("/"):
                 return
@@ -519,18 +437,14 @@ def register_admin_panel_handlers(bot: Client):
                 cid, title, username = await _resolve_channel(client, message)
                 if not cid:
                     await message.reply_text(
-                        "❌ Channel samajh nahi aaya.\n"
-                        "Channel ID / @username / link / forward bhejo.",
-                        quote=True,
-                        reply_markup=kb_back_fs(),
+                        "❌ Channel samajh nahi aaya.\nID / @username / link / forward bhejo.",
+                        quote=True, reply_markup=kb_back_fs(),
                     )
                     return
                 if not await _bot_is_admin(client, cid):
                     await message.reply_text(
-                        f"❌ Bot is channel me admin nahi hai.\n"
-                        f"Pehle bot ko <b>{_safe(title) or cid}</b> me admin banao, fir dubara try karo.",
-                        quote=True,
-                        reply_markup=kb_back_fs(),
+                        f"❌ Bot is channel me admin nahi.\nPehle bot ko <b>{_safe(title) or cid}</b> me admin banao.",
+                        quote=True, reply_markup=kb_back_fs(),
                     )
                     return
                 _AP_STATE[uid] = {
@@ -540,12 +454,9 @@ def register_admin_panel_handlers(bot: Client):
                     "username": username or "",
                 }
                 await message.reply_text(
-                    f"✅ Bot admin confirmed.\n\n"
-                    f"<b>{_safe(title) or cid}</b>\n"
-                    f"ID: <code>{cid}</code>\n\n"
-                    f"Ab mode choose karo:",
-                    quote=True,
-                    reply_markup=kb_mode_pick(cid),
+                    f"✅ Bot admin confirmed.\n\n<b>{_safe(title) or cid}</b>\n"
+                    f"ID: <code>{cid}</code>\n\nAb mode choose karo:",
+                    quote=True, reply_markup=kb_mode_pick(cid),
                 )
                 return
 
@@ -558,7 +469,7 @@ def register_admin_panel_handlers(bot: Client):
                     await db.set_force_sub_message(text)
                     _AP_STATE.pop(uid, None)
                     await message.reply_text(
-                        "✅ Force sub message set ho gaya.",
+                        "✅ Force sub message set.",
                         quote=True,
                         reply_markup=kb_fs_msg_menu(True, bool(await _get_fs_pic())),
                     )
@@ -570,12 +481,11 @@ def register_admin_panel_handlers(bot: Client):
                 if not message.photo:
                     await message.reply_text("Sirf photo bhejo.", quote=True)
                     return
-                file_id = message.photo.file_id
                 try:
-                    await db.set_force_sub_pic(file_id)
+                    await db.set_force_sub_pic(message.photo.file_id)
                     _AP_STATE.pop(uid, None)
                     await message.reply_text(
-                        "✅ Force sub pic set ho gaya.",
+                        "✅ Force sub pic set.",
                         quote=True,
                         reply_markup=kb_fs_msg_menu(bool(await _get_fs_msg()), True),
                     )
@@ -583,6 +493,6 @@ def register_admin_panel_handlers(bot: Client):
                     await message.reply_text(f"Error: {e}", quote=True)
                 return
         except Exception as e:
-            logger.exception("ap_admin_input error: %s", e)
+            logger.exception("ap_admin_input: %s", e)
 
     logger.info("Admin panel handlers registered OK")

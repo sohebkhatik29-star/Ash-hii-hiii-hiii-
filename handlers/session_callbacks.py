@@ -23,6 +23,19 @@ def register_callback_handlers(bot: Client):
         data = query.data or ""
         user_id = query.from_user.id if query.from_user else 0
 
+        # Admin Panel callbacks (ap_*) — MUST handle here because this is a catch-all
+        if data.startswith("ap_"):
+            try:
+                from handlers.admin_panel import handle_ap_callback
+                await handle_ap_callback(client, query)
+            except Exception as e:
+                logger.error(f"ap callback: {e}", exp_info=True)
+                try:
+                    await query.answer(f"Panel error: {type(e).__name__}", show_alert=True)
+                except Exception:
+                    pass
+            return
+
         # Force-sub buttons — handle BEFORE anything else
         if data.startswith("fs_mode:") or data.startswith("fs_refresh") or data == "fs_noop":
             try:
@@ -146,7 +159,7 @@ def register_callback_handlers(bot: Client):
                 user_id=user_id
             )
             channel_url = f"https://t.me/{Config.UPDATES_CHANNEL}" if Config.UPDATES_CHANNEL and not str(Config.UPDATES_CHANNEL).startswith("-") else f"https://t.me/{Config.BOT_USERNAME}"
-            markup = InlineKeyboardMarkup([
+            rows = [
                 [
                     InlineKeyboardButton("📢 Updates Channel", url=channel_url),
                     InlineKeyboardButton("🍿 Dev Info", callback_data="about_dev")
@@ -155,7 +168,10 @@ def register_callback_handlers(bot: Client):
                     InlineKeyboardButton("ℹ️ About Bot", callback_data="about_bot"),
                     InlineKeyboardButton("❌ Close", callback_data="close_card")
                 ]
-            ])
+            ]
+            if user_id in (Config.ADMINS or []):
+                rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="ap_home")])
+            markup = InlineKeyboardMarkup(rows)
             try:
                 await query.message.edit(welcome_text, reply_markup=markup, disable_web_page_preview=True)
             except Exception:
