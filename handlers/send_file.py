@@ -1,12 +1,11 @@
 # ==============================================================================
 # ASH AUTOMATIC MOVIE FILE STORE BOT 🎬
 # Module: handlers/send_file.py
-# Purpose: Movie delivery, quality download execution, 30-min auto-delete timers,
-#          and backward compatibility for legacy file links.
 # ==============================================================================
 
 import asyncio
 import logging
+import re
 from pyrogram import Client
 from pyrogram.types import Message, CallbackQuery
 from pyrogram.errors import FloodWait
@@ -14,6 +13,13 @@ from pyrogram.errors import FloodWait
 from configs import Config
 from handlers.database import db
 from handlers.movie_card import build_final_movie_card_text, build_final_movie_card_buttons
+
+try:
+    from handlers import caption_db  # noqa: F401
+    from handlers.caption_db import build_delivery_caption, media_meta_from_message
+except Exception:
+    build_delivery_caption = None
+    media_meta_from_message = None
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +32,28 @@ async def delete_after_delay(message: Message, delay: int = 1800):
     except Exception as e:
         logger.debug(f"Auto-delete note: {e}")
 
+async def _apply_custom_caption(bot: Client, sent_file: Message, source_msg: Message = None):
+    """If admin set a custom caption template, edit the delivered file caption."""
+    if not sent_file or build_delivery_caption is None:
+        return
+    try:
+        fname, fsize, orig = "", "", ""
+        if source_msg and media_meta_from_message:
+            fname, fsize, orig = media_meta_from_message(source_msg)
+        if not fname and media_meta_from_message:
+            fname, fsize, orig = media_meta_from_message(sent_file)
+        custom = await build_delivery_caption(fname, fsize, orig)
+        if custom is None:
+            return
+        try:
+            await sent_file.edit_caption(custom)
+        except Exception:
+            # some media types / forwarded may not allow edit; ignore
+            pass
+    except Exception as e:
+        logger.debug("custom caption: %s", e)
+
 async def send_movie_card(bot: Client, user_id: int, movie_id: str, is_admin: bool = False):
-    """
-    Sends the clean final movie card to a user when they click the deep link.
-    """
     movie = await db.get_movie(movie_id)
     if not movie:
         await bot.send_message(
@@ -87,9 +111,6 @@ def find_matching_quality(qualities: dict, quality_query: str):
     return None, None
 
 async def deliver_movie_quality(bot: Client, query: CallbackQuery, movie_id: str, quality: str):
-    """
-    Sends the requested movie quality file to the user from DB_CHANNEL with auto-delete notice.
-    """
     user_id = query.from_user.id
     movie = await db.get_movie(movie_id)
 
@@ -113,20 +134,34 @@ async def deliver_movie_quality(bot: Client, query: CallbackQuery, movie_id: str
 
     try:
         sent_file = None
+        source_msg = None
         if channel_msg_id and Config.DB_CHANNEL:
             try:
+                try:
+                    source_msg = await bot.get_messages(Config.DB_CHANNEL, channel_msg_id)
+                except Exception:
+                    source_msg = None
+                custom_cap = None
+                if build_delivery_caption and source_msg and media_meta_from_message:
+                    fname, fsize, orig = media_meta_from_message(source_msg)
+                    custom_cap = await build_delivery_caption(fname, fsize, orig)
                 if Config.FORWARD_AS_COPY:
-                    sent_file = await bot.copy_message(
+                    kw = dict(
                         chat_id=user_id,
                         from_chat_id=Config.DB_CHANNEL,
-                        message_id=channel_msg_id
+                        message_id=channel_msg_id,
                     )
+                    if custom_cap is not None:
+                        kw["caption"] = custom_cap
+                    sent_file = await bot.copy_message(**kw)
                 else:
                     sent_file = await bot.forward_messages(
                         chat_id=user_id,
                         from_chat_id=Config.DB_CHANNEL,
                         message_ids=channel_msg_id
                     )
+                    if custom_cap is not None:
+                        await _apply_custom_caption(bot, sent_file, source_msg)
             except Exception as e:
                 logger.warning(f"Channel copy failed: {e}")
 
@@ -135,6 +170,7 @@ async def deliver_movie_quality(bot: Client, query: CallbackQuery, movie_id: str
                 chat_id=user_id,
                 file_id=q_data["file_id"]
             )
+            await _apply_custom_caption(bot, sent_file, source_msg)
 
         if not sent_file:
             await query.answer("File deliver karne mein samasya aayi!", show_alert=True)
@@ -159,10 +195,6 @@ async def deliver_movie_quality(bot: Client, query: CallbackQuery, movie_id: str
         await bot.send_message(chat_id=user_id, text=f"File bhejne mein error aaya: {e}")
 
 async def deliver_movie_quality_direct(bot: Client, user_id: int, movie_id: str, quality: str):
-    """
-    Direct delivery triggered when user clicks a movie download link/button from a group.
-    Delivers file into user's private bot chat with copyright auto-delete timer.
-    """
     movie = await db.get_movie(movie_id)
     if not movie:
         await bot.send_message(chat_id=user_id, text="❌ **Movie record nahi mila ya link invalid hai!**")
@@ -178,20 +210,34 @@ async def deliver_movie_quality_direct(bot: Client, user_id: int, movie_id: str,
 
     try:
         sent_file = None
+        source_msg = None
         if channel_msg_id and Config.DB_CHANNEL:
             try:
+                try:
+                    source_msg = await bot.get_messages(Config.DB_CHANNEL, channel_msg_id)
+                except Exception:
+                    source_msg = None
+                custom_cap = None
+                if build_delivery_caption and source_msg and media_meta_from_message:
+                    fname, fsize, orig = media_meta_from_message(source_msg)
+                    custom_cap = await build_delivery_caption(fname, fsize, orig)
                 if Config.FORWARD_AS_COPY:
-                    sent_file = await bot.copy_message(
+                    kw = dict(
                         chat_id=user_id,
                         from_chat_id=Config.DB_CHANNEL,
-                        message_id=channel_msg_id
+                        message_id=channel_msg_id,
                     )
+                    if custom_cap is not None:
+                        kw["caption"] = custom_cap
+                    sent_file = await bot.copy_message(**kw)
                 else:
                     sent_file = await bot.forward_messages(
                         chat_id=user_id,
                         from_chat_id=Config.DB_CHANNEL,
                         message_ids=channel_msg_id
                     )
+                    if custom_cap is not None:
+                        await _apply_custom_caption(bot, sent_file, source_msg)
             except Exception as e:
                 logger.warning(f"Direct channel copy failed: {e}")
 
@@ -200,6 +246,7 @@ async def deliver_movie_quality_direct(bot: Client, user_id: int, movie_id: str,
                 chat_id=user_id,
                 file_id=q_data["file_id"]
             )
+            await _apply_custom_caption(bot, sent_file, source_msg)
 
         if not sent_file:
             await bot.send_message(chat_id=user_id, text="❌ **File deliver nahi ho paayi.**")
@@ -223,15 +270,28 @@ async def deliver_movie_quality_direct(bot: Client, user_id: int, movie_id: str,
         logger.error(f"Error direct sending movie quality: {e}")
         await bot.send_message(chat_id=user_id, text=f"File bhejne mein error aaya: {e}")
 
-# ==================== LEGACY FILE SUPPORT ====================
-
 async def send_media_and_reply(bot: Client, user_id: int, file_id: int):
     """Maintains backward compatibility for old FileStore base64 links."""
     try:
+        source_msg = None
+        custom_cap = None
+        try:
+            source_msg = await bot.get_messages(Config.DB_CHANNEL, file_id)
+            if build_delivery_caption and media_meta_from_message and source_msg:
+                fname, fsize, orig = media_meta_from_message(source_msg)
+                custom_cap = await build_delivery_caption(fname, fsize, orig)
+        except Exception:
+            pass
+
         if Config.FORWARD_AS_COPY:
-            sent = await bot.copy_message(chat_id=user_id, from_chat_id=Config.DB_CHANNEL, message_id=file_id)
+            kw = dict(chat_id=user_id, from_chat_id=Config.DB_CHANNEL, message_id=file_id)
+            if custom_cap is not None:
+                kw["caption"] = custom_cap
+            sent = await bot.copy_message(**kw)
         else:
             sent = await bot.forward_messages(chat_id=user_id, from_chat_id=Config.DB_CHANNEL, message_ids=file_id)
+            if custom_cap is not None:
+                await _apply_custom_caption(bot, sent, source_msg)
 
         notice = await bot.send_message(
             chat_id=user_id,
