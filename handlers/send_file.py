@@ -21,19 +21,47 @@ except Exception:
     build_delivery_caption = None
     media_meta_from_message = None
 
+try:
+    from handlers.auto_delete import get_bot_file_delete_seconds, build_bot_notice_text
+except Exception:
+    get_bot_file_delete_seconds = None
+    build_bot_notice_text = None
+
 logger = logging.getLogger(__name__)
 
 async def delete_after_delay(message: Message, delay: int = 1800):
-    """Auto-deletes delivered movie file after specified seconds (default 30 min)."""
     try:
+        if not delay or delay <= 0:
+            return
         await asyncio.sleep(delay)
         await message.delete()
         logger.info(f"Auto-deleted file message {message.id} after {delay} seconds.")
     except Exception as e:
         logger.debug(f"Auto-delete note: {e}")
 
+async def _bot_delete_delay() -> int:
+    try:
+        if get_bot_file_delete_seconds:
+            return int(await get_bot_file_delete_seconds())
+    except Exception:
+        pass
+    return int(getattr(Config, "AUTO_DELETE_TIME", 1800) or 1800)
+
+async def _bot_notice() -> str:
+    try:
+        if build_bot_notice_text:
+            return await build_bot_notice_text()
+    except Exception:
+        pass
+    sec = await _bot_delete_delay()
+    mins = max(1, sec // 60)
+    return (
+        f"⚠️ **Copyright Protection Alert:**\n\n"
+        f"File will be automatically deleted in **{mins} minutes**.\n"
+        f"Kripya ise turant apne 'Saved Messages' mein forward kar lein!"
+    )
+
 async def _apply_custom_caption(bot: Client, sent_file: Message, source_msg: Message = None):
-    """If admin set a custom caption template, edit the delivered file caption."""
     if not sent_file or build_delivery_caption is None:
         return
     try:
@@ -48,7 +76,6 @@ async def _apply_custom_caption(bot: Client, sent_file: Message, source_msg: Mes
         try:
             await sent_file.edit_caption(custom)
         except Exception:
-            # some media types / forwarded may not allow edit; ignore
             pass
     except Exception as e:
         logger.debug("custom caption: %s", e)
@@ -176,16 +203,16 @@ async def deliver_movie_quality(bot: Client, query: CallbackQuery, movie_id: str
             await query.answer("File deliver karne mein samasya aayi!", show_alert=True)
             return
 
+        delay = await _bot_delete_delay()
+        notice_text = await _bot_notice()
         notice = await bot.send_message(
             chat_id=user_id,
-            text=f"⚠️ **Copyright Protection Alert:**\n\n"
-                 f"File will be automatically deleted in **{Config.AUTO_DELETE_TIME // 60} minutes**.\n"
-                 f"Kripya ise turant apne 'Saved Messages' mein forward kar lein!",
+            text=notice_text,
             reply_to_message_id=sent_file.id
         )
 
-        asyncio.create_task(delete_after_delay(sent_file, Config.AUTO_DELETE_TIME))
-        asyncio.create_task(delete_after_delay(notice, Config.AUTO_DELETE_TIME))
+        asyncio.create_task(delete_after_delay(sent_file, delay))
+        asyncio.create_task(delete_after_delay(notice, delay))
 
     except FloodWait as sl:
         await asyncio.sleep(sl.value)
@@ -252,16 +279,16 @@ async def deliver_movie_quality_direct(bot: Client, user_id: int, movie_id: str,
             await bot.send_message(chat_id=user_id, text="❌ **File deliver nahi ho paayi.**")
             return
 
+        delay = await _bot_delete_delay()
+        notice_text = await _bot_notice()
         notice = await bot.send_message(
             chat_id=user_id,
-            text=f"⚠️ **Copyright Protection Alert:**\n\n"
-                 f"File will be automatically deleted in **{Config.AUTO_DELETE_TIME // 60} minutes**.\n"
-                 f"Kripya ise turant apne 'Saved Messages' mein forward kar lein!",
+            text=notice_text,
             reply_to_message_id=sent_file.id
         )
 
-        asyncio.create_task(delete_after_delay(sent_file, Config.AUTO_DELETE_TIME))
-        asyncio.create_task(delete_after_delay(notice, Config.AUTO_DELETE_TIME))
+        asyncio.create_task(delete_after_delay(sent_file, delay))
+        asyncio.create_task(delete_after_delay(notice, delay))
 
     except FloodWait as sl:
         await asyncio.sleep(sl.value)
@@ -271,7 +298,6 @@ async def deliver_movie_quality_direct(bot: Client, user_id: int, movie_id: str,
         await bot.send_message(chat_id=user_id, text=f"File bhejne mein error aaya: {e}")
 
 async def send_media_and_reply(bot: Client, user_id: int, file_id: int):
-    """Maintains backward compatibility for old FileStore base64 links."""
     try:
         source_msg = None
         custom_cap = None
@@ -293,12 +319,14 @@ async def send_media_and_reply(bot: Client, user_id: int, file_id: int):
             if custom_cap is not None:
                 await _apply_custom_caption(bot, sent, source_msg)
 
+        delay = await _bot_delete_delay()
+        notice_text = await _bot_notice()
         notice = await bot.send_message(
             chat_id=user_id,
-            text=f"⚠️ File will be auto-deleted in {Config.AUTO_DELETE_TIME // 60} minutes.",
+            text=notice_text,
             reply_to_message_id=sent.id
         )
-        asyncio.create_task(delete_after_delay(sent, Config.AUTO_DELETE_TIME))
-        asyncio.create_task(delete_after_delay(notice, Config.AUTO_DELETE_TIME))
+        asyncio.create_task(delete_after_delay(sent, delay))
+        asyncio.create_task(delete_after_delay(notice, delay))
     except Exception as e:
         logger.error(f"Legacy file send error: {e}")
