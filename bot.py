@@ -154,6 +154,14 @@ try:
 except Exception as e:
     logger.error(f"premium_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
+# /deleteallfilters command (bot_commands folder) — fail-safe
+try:
+    from handlers.bot_commands.delete_all_filters_cmd import register_delete_all_filters_command
+    register_delete_all_filters_command(Bot)
+    logger.info("/deleteallfilters command registered")
+except Exception as e:
+    logger.error(f"delete_all_filters_cmd register failed (bot still runs): {type(e).__name__}: {e}")
+
 # Admin Panel (Force Sub UI) — fail-safe so bot still boots if panel has issue
 try:
     from handlers.admin_panel import register_admin_panel_handlers
@@ -183,6 +191,7 @@ async def setup_bot_commands(bot: Client):
         BotCommand("deletefilter", "Reply to poster \u2192 remove filter"),
         BotCommand("not_available", "Not available on Telegram (reply)"),
         BotCommand("premium", "Premium only — contact @movies_1780"),
+        BotCommand("deleteallfilters", "Delete ALL filters (confirm)"),
     ]
     private_cmds = [
         BotCommand("start", "Bot start / welcome"),
