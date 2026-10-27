@@ -1,15 +1,14 @@
 # ============================================================================
 # handlers/search_query.py  — ONLY query clean + title match (alg file)
-# - Message se movie name extract (noise hatao)
-# - "PUSHPA" → Pushpa The Rise match
-# - "2021" alone → NO match
-# - "THE RISE" / weak tail words → NO match (not first + short)
-# - "PUSHPA 2021" → match
+# STRICT: multi-word title → query me saare significant words hone chahiye
+# "FURY" alone ↛ "Fury In The Shadows"
+# "FURY IN THE SHADOWS" / "fury shadows" → match
+# Single-word title (RRR, Pushpa if only one word) → that word enough
+# Year-only → never match
 # ============================================================================
 import re
 from typing import List
 
-# Extra noise beyond DB STOPWORDS — request / chat filler
 NOISE = {
     "dedo", "de", "do", "please", "plz", "pls", "pleasee", "bhai", "bro", "sir", "ji",
     "movie", "movies", "film", "films", "full", "hd", "print",
@@ -36,11 +35,7 @@ def _norm(s: str) -> str:
 
 
 def clean_search_query(raw: str) -> str:
-    """
-    Message se movie name nikaalo.
-    Example: 'hello bhai please PUSHPA THE RISE dedo' → 'pushpa rise'
-    Years (19xx/20xx) keep (with name), but year-alone rejected in match.
-    """
+    """Noise hatao; years rakh o (name ke saath)."""
     text = _norm(raw)
     if not text:
         return ""
@@ -72,14 +67,13 @@ def _title_tokens(title: str) -> List[str]:
 
 def is_strict_title_match(query: str, movie_title: str, movie_year=None) -> bool:
     """
-    Match rules:
-    1) Sirf year (2021) → NEVER match
-    2) Query words must hit title; coverage ~60%
-    3) At least ONE strong hit:
-       - first significant title word (PUSHPA of Pushpa The Rise), OR
-       - distinctive token len >= 5 present in title
-    4) Weak tail only (RISE, PART) without first/strong word → NO match
-    5) If query has year, movie year must match when movie has year
+    PURA significant name match:
+    - Title ke saare significant words query me hone chahiye
+      (noise/year hata ke: "Fury In The Shadows" → fury, shadows)
+    - Sirf pehla word (FURY) → NO match jab title multi-word ho
+    - Single-word title (RRR) → us word se match
+    - Sirf year → NO match
+    - Query me year ho to movie year match (jab available)
     """
     q = clean_search_query(query)
     if not q:
@@ -91,7 +85,7 @@ def is_strict_title_match(query: str, movie_title: str, movie_year=None) -> bool
     q_years = {t for t in q_tokens if t.isdigit() and len(t) == 4}
     q_words = [t for t in q_tokens if t not in q_years]
 
-    # Year-only query → reject (user: 2021 alone must not return movies)
+    # Year-only → reject
     if not q_words:
         return False
 
@@ -99,9 +93,10 @@ def is_strict_title_match(query: str, movie_title: str, movie_year=None) -> bool
     title_words = [t for t in title_toks if not (t.isdigit() and len(t) == 4)]
     if not title_words:
         return False
-    title_set = set(title_words)
 
-    # Year filter when user typed a year with the name
+    q_set = set(q_words)
+
+    # Year constraint
     if q_years and movie_year is not None:
         try:
             if str(int(movie_year)) not in q_years:
@@ -110,37 +105,17 @@ def is_strict_title_match(query: str, movie_title: str, movie_year=None) -> bool
             if str(movie_year) not in q_years:
                 return False
 
-    # Word hits
-    matched = [t for t in q_words if t in title_set]
-    if not matched and len(q_words) == 1 and len(q_words[0]) >= 5:
-        tok = q_words[0]
-        if any(tok in tw or tw in tok for tw in title_words if len(tw) >= 4):
-            matched = [tok]
-    if not matched:
-        return False
-
-    need = max(1, (len(q_words) * 3 + 4) // 5)
-    if len(matched) < need:
-        return False
-
-    # Strong hit required: first title word OR any matched token len >= 5
-    first = title_words[0]
-    strong = False
-    for t in matched:
-        if t == first:
-            strong = True
-            break
-        if len(t) >= 5:
-            strong = True
-            break
-    if not strong:
-        return False
+    # EVERY significant title word must appear in query
+    for tw in title_words:
+        if tw not in q_set:
+            if len(tw) >= 5 and any(tw in qw or qw in tw for qw in q_words if len(qw) >= 4):
+                continue
+            return False
 
     return True
 
 
 def filter_strict_matches(query: str, movies: list) -> list:
-    """Keep only movies that match cleaned query under strict rules."""
     out = []
     for m in movies or []:
         title = m.get("title") or ""
