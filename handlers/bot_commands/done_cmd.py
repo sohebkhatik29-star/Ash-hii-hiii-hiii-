@@ -5,6 +5,8 @@
 #   1) deletes the admin's /done message
 #   2) replies on the original user message:
 #      "Your file has been uploaded successfully. Please check it."
+#   3) If that original user message is later deleted from the group,
+#      the bot's confirmation reply is also deleted automatically.
 # Without reply-to: does nothing.
 # ==============================================================================
 
@@ -18,6 +20,10 @@ from configs import Config
 logger = logging.getLogger("DoneCmd")
 
 DONE_TEXT = "Your file has been uploaded successfully. Please check it."
+
+# (chat_id, user_message_id) -> bot_reply_message_id
+# When user msg is deleted, bot reply is deleted too.
+_DONE_REPLY_MAP: dict = {}
 
 
 async def _is_authorized(client: Client, message: Message) -> bool:
@@ -54,7 +60,7 @@ async def _is_authorized(client: Client, message: Message) -> bool:
 
 
 def register_done_command(bot: Client):
-    """Register /done — group + private; admin-only; reply-required."""
+    """Register /done + auto-cleanup when original user message is deleted."""
 
     @bot.on_message(
         filters.command(["done"]) & (filters.group | filters.private),
@@ -87,8 +93,9 @@ def register_done_command(bot: Client):
             except Exception as e:
                 logger.warning("done: delete cmd failed: %s", e)
 
+            bot_msg = None
             try:
-                await client.send_message(
+                bot_msg = await client.send_message(
                     chat_id=message.chat.id,
                     text=DONE_TEXT,
                     reply_to_message_id=target.id,
@@ -96,11 +103,51 @@ def register_done_command(bot: Client):
             except Exception as e:
                 logger.warning("done: send reply failed: %s", e)
                 try:
-                    await target.reply_text(DONE_TEXT, quote=True)
+                    bot_msg = await target.reply_text(DONE_TEXT, quote=True)
                 except Exception as e2:
                     logger.warning("done: fallback reply failed: %s", e2)
+
+            # Track: if user original msg deleted → delete this bot reply too
+            if bot_msg and target:
+                try:
+                    key = (int(message.chat.id), int(target.id))
+                    _DONE_REPLY_MAP[key] = int(bot_msg.id)
+                    logger.info("done: mapped user_msg=%s → bot_reply=%s", target.id, bot_msg.id)
+                except Exception as e:
+                    logger.debug("done: map store failed: %s", e)
 
         except Exception as e:
             logger.exception("done_command_handler: %s", e)
 
-    logger.info("/done command registered (group=-3)")
+    @bot.on_deleted_messages()
+    async def done_on_user_msg_deleted(client: Client, messages):
+        """If the original user message (that /done replied to) is deleted,
+        also delete the bot confirmation reply."""
+        try:
+            if not messages:
+                return
+            # messages may share one chat or list of Message-like objects
+            for m in messages:
+                try:
+                    chat_id = getattr(getattr(m, "chat", None), "id", None)
+                    msg_id = getattr(m, "id", None)
+                    if chat_id is None or msg_id is None:
+                        continue
+                    key = (int(chat_id), int(msg_id))
+                    bot_reply_id = _DONE_REPLY_MAP.pop(key, None)
+                    if not bot_reply_id:
+                        continue
+                    try:
+                        await client.delete_messages(chat_id, bot_reply_id)
+                        logger.info(
+                            "done: user msg %s deleted → bot reply %s deleted",
+                            msg_id, bot_reply_id,
+                        )
+                    except Exception as e:
+                        logger.warning("done: could not delete bot reply %s: %s", bot_reply_id, e)
+                except Exception as e:
+                    logger.debug("done deleted_messages item: %s", e)
+        except Exception as e:
+            logger.debug("done_on_user_msg_deleted: %s", e)
+
+    logger.info("/done command registered (group=-3 + delete-sync)")
