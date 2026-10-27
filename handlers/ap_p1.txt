@@ -1,0 +1,172 @@
+# ==============================================================================
+# handlers/admin_panel.py — Admin Panel + Force Sub UI (admin/owner only)
+# ==============================================================================
+import asyncio
+import logging
+import re
+from pyrogram import Client, filters
+from pyrogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+)
+from configs import Config
+from handlers.database import db
+
+logger = logging.getLogger("AdminPanel")
+
+# admin_id -> pending state dict
+_AP_STATE: dict = {}
+
+def _is_admin(uid: int) -> bool:
+    try:
+        return int(uid) in (Config.ADMINS or [])
+    except Exception:
+        return False
+
+def _safe(s) -> str:
+    if s is None:
+        return ""
+    if not isinstance(s, str):
+        s = str(s)
+    return re.sub(r"[\ud800-\udfff]", "", s)
+
+# ---------- keyboards ----------
+def kb_admin_home():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔐 Force Sub", callback_data="ap_fs_menu")],
+        [InlineKeyboardButton("⬅️ Back / Close", callback_data="ap_close")],
+    ])
+
+def kb_fs_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Force Sub Channel", callback_data="ap_fs_add")],
+        [InlineKeyboardButton("📋 See Force Sub Channels", callback_data="ap_fs_list")],
+        [InlineKeyboardButton("💬 Force Sub Messages", callback_data="ap_fs_msg_menu")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="ap_home")],
+    ])
+
+def kb_fs_msg_menu(has_msg: bool, has_pic: bool):
+    rows = [
+        [InlineKeyboardButton("✏️ Set Force Sub Message", callback_data="ap_fs_set_msg")],
+    ]
+    if has_msg:
+        rows.append([InlineKeyboardButton("👁 See Force Sub Message", callback_data="ap_fs_see_msg")])
+    rows.append([InlineKeyboardButton("🖼 Set Force Sub Pic", callback_data="ap_fs_set_pic")])
+    if has_pic:
+        rows.append([InlineKeyboardButton("👁 See Force Sub Pic", callback_data="ap_fs_see_pic")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_menu")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_mode_pick(channel_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Normal Join", callback_data=f"ap_fs_mode:normal:{channel_id}")],
+        [InlineKeyboardButton("📩 Request Join", callback_data=f"ap_fs_mode:request:{channel_id}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_menu")],
+    ])
+
+def kb_back_fs():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_menu")]])
+
+def kb_channel_actions(channel_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Delete Channel", callback_data=f"ap_fs_del:{channel_id}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_list")],
+    ])
+
+def kb_msg_actions():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Delete Force Sub Message", callback_data="ap_fs_del_msg")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_msg_menu")],
+    ])
+
+def kb_pic_actions():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Delete Force Sub Pic", callback_data="ap_fs_del_pic")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="ap_fs_msg_menu")],
+    ])
+
+# ---------- helpers ----------
+async def _resolve_channel(client: Client, message: Message):
+    """Return (channel_id, title, username) from forward / id / link."""
+    if message.forward_from_chat:
+        ch = message.forward_from_chat
+        cid = int(ch.id)
+        title = _safe(getattr(ch, "title", None) or "")
+        username = _safe(getattr(ch, "username", None) or "")
+        return cid, title, username
+
+    text = (message.text or message.caption or "").strip()
+    if not text:
+        return None, None, None
+
+    if re.fullmatch(r"-?\d{5,}", text):
+        cid = int(text)
+        try:
+            chat = await client.get_chat(cid)
+            return int(chat.id), _safe(chat.title or ""), _safe(chat.username or "")
+        except Exception as e:
+            logger.warning("get_chat id: %s", e)
+            return cid, str(cid), ""
+
+    m = re.search(r"(?:t\.me/|telegram\.me/|@)([A-Za-z0-9_]{4,})", text)
+    if m:
+        uname = m.group(1)
+        if uname.lower() in ("c", "joinchat", "addstickers"):
+            m2 = re.search(r"t\.me/c/(\d+)", text)
+            if m2:
+                cid = int("-100" + m2.group(1))
+                try:
+                    chat = await client.get_chat(cid)
+                    return int(chat.id), _safe(chat.title or ""), _safe(chat.username or "")
+                except Exception as e:
+                    logger.warning("get_chat c/: %s", e)
+                    return cid, str(cid), ""
+            return None, None, None
+        try:
+            chat = await client.get_chat(uname)
+            return int(chat.id), _safe(chat.title or ""), _safe(chat.username or uname)
+        except Exception as e:
+            logger.warning("get_chat uname: %s", e)
+            return None, None, None
+
+    return None, None, None
+
+
+async def _bot_is_admin(client: Client, channel_id: int) -> bool:
+    try:
+        me = await client.get_me()
+        m = await client.get_chat_member(channel_id, me.id)
+        st = str(getattr(m.status, "value", m.status) or m.status).lower()
+        if st in ("administrator", "owner", "creator",
+                  "chatmemberstatus.administrator", "chatmemberstatus.owner",
+                  "chatmemberstatus.creator"):
+            return True
+        if getattr(m, "privileges", None) is not None:
+            return True
+    except Exception as e:
+        logger.warning("bot admin check %s: %s", channel_id, e)
+    return False
+
+
+async def _edit_or_reply(query: CallbackQuery, text: str, markup=None):
+    text = _safe(text)
+    try:
+        await query.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+    except Exception:
+        try:
+            await query.message.reply_text(text, reply_markup=markup, disable_web_page_preview=True)
+        except Exception as e:
+            logger.warning("edit_or_reply: %s", e)
+
+
+async def _get_fs_msg() -> str:
+    try:
+        return (await db.get_force_sub_message()) or ""
+    except Exception:
+        return ""
+
+
+async def _get_fs_pic() -> str:
+    try:
+        return (await db.get_force_sub_pic()) or ""
+    except Exception:
+        return ""
