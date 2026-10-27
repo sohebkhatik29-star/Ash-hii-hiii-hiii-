@@ -130,6 +130,14 @@ try:
 except Exception as e:
     logger.error(f"chakspelling_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
+# /deletefilter command (bot_commands folder) — fail-safe
+try:
+    from handlers.bot_commands.delete_filter_cmd import register_delete_filter_command
+    register_delete_filter_command(Bot)
+    logger.info("/deletefilter command registered")
+except Exception as e:
+    logger.error(f"delete_filter_cmd register failed (bot still runs): {type(e).__name__}: {e}")
+
 # Admin Panel (Force Sub UI) — fail-safe so bot still boots if panel has issue
 try:
     from handlers.admin_panel import register_admin_panel_handlers
@@ -156,6 +164,7 @@ async def setup_bot_commands(bot: Client):
         BotCommand("unban", "User unban (reply / user_id)"),
         BotCommand("done", "Not-found session close"),
         BotCommand("chakspelling", "Check spelling (reply to user)"),
+        BotCommand("deletefilter", "Reply to poster \u2192 remove filter"),
     ]
     private_cmds = [
         BotCommand("start", "Bot start / welcome"),
