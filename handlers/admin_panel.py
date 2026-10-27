@@ -1,5 +1,5 @@
 # ==============================================================================
-# handlers/admin_panel.py — Admin Panel + Force Sub UI + File Caption (owner/admin)
+# handlers/admin_panel.py — Admin Panel + Force Sub + Caption + Auto Delete
 # ==============================================================================
 import logging
 import re
@@ -14,9 +14,24 @@ from configs import Config
 from handlers.database import db
 
 try:
-    from handlers import caption_db  # noqa: F401 — patches db.get/set/clear_file_caption
+    from handlers import caption_db  # noqa: F401
 except Exception:
     pass
+
+from handlers.auto_delete import (
+    parse_duration,
+    format_duration,
+    get_bot_file_delete_seconds,
+    set_bot_file_delete_seconds,
+    get_bot_delete_notice,
+    set_bot_delete_notice,
+    clear_bot_delete_notice,
+    get_group_result_delete_seconds,
+    set_group_result_delete_seconds,
+    get_group_not_found_delete_seconds,
+    set_group_not_found_delete_seconds,
+    DEFAULT_BOT_NOTICE,
+)
 
 logger = logging.getLogger("AdminPanel")
 
@@ -49,7 +64,27 @@ def kb_admin_home():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔐 Force Sub", callback_data="ap_fs_menu")],
         [InlineKeyboardButton("📝 File Caption", callback_data="ap_cap_menu")],
+        [InlineKeyboardButton("⏱ Set Auto Delete", callback_data="ap_ad_menu")],
         [InlineKeyboardButton("❌ Close", callback_data="ap_close")],
+    ])
+
+
+def kb_ad_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👁 See Auto Delete Time", callback_data="ap_ad_see_bot")],
+        [InlineKeyboardButton("➕ Set Auto Delete Time (Bot File)", callback_data="ap_ad_set_bot")],
+        [InlineKeyboardButton("💬 Set Auto Delete Message", callback_data="ap_ad_set_notice")],
+        [InlineKeyboardButton("👥 Group Delete Management", callback_data="ap_ad_grp_menu")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="ap_home")],
+    ])
+
+
+def kb_ad_grp_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Result User+Bot Delete Timing", callback_data="ap_ad_set_result")],
+        [InlineKeyboardButton("❌ Not-Result User Delete Timing", callback_data="ap_ad_set_notfound")],
+        [InlineKeyboardButton("👁 See Group Timings", callback_data="ap_ad_see_grp")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="ap_ad_menu")],
     ])
 
 
@@ -143,7 +178,6 @@ async def _get_file_cap() -> str:
 
 
 async def _edit_or_reply(query: CallbackQuery, text: str, markup=None):
-    """Edit in place only — never send a second message (prevents double panels)."""
     text = _safe(text)
     try:
         await query.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
@@ -215,8 +249,17 @@ async def _bot_is_admin(client: Client, channel_id: int) -> bool:
     return False
 
 
+_TIME_HELP = (
+    "Time examples:\n"
+    "• <code>1m</code> <code>2m</code> <code>30m</code>\n"
+    "• <code>1h</code> <code>2h</code>\n"
+    "• <code>1d</code> <code>2d</code> <code>24h</code>\n"
+    "• <code>3month</code> <code>4mahine</code>\n"
+    "• ya sirf seconds: <code>1800</code>"
+)
+
+
 async def handle_ap_callback(client: Client, query: CallbackQuery):
-    """Single entry for all ap_* callbacks (only via session_callbacks)."""
     user = query.from_user
     data = (query.data or "").strip()
     logger.info("AP cb data=%s user=%s", data, getattr(user, "id", None))
@@ -261,6 +304,112 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
         )
         return
 
+    # ---------- Auto Delete ----------
+    if data == "ap_ad_menu":
+        _AP_STATE.pop(uid, None)
+        try:
+            bot_sec = await get_bot_file_delete_seconds()
+            res_sec = await get_group_result_delete_seconds()
+            nf_sec = await get_group_not_found_delete_seconds()
+        except Exception:
+            bot_sec, res_sec, nf_sec = 1800, 86400, 172800
+        await _edit_or_reply(
+            query,
+            "⏱ <b>Set Auto Delete</b>\n\n"
+            f"🤖 Bot file: <code>{format_duration(bot_sec)}</code>\n"
+            f"✅ Group result: <code>{format_duration(res_sec)}</code>\n"
+            f"❌ Group not-found: <code>{format_duration(nf_sec)}</code>",
+            kb_ad_menu(),
+        )
+        return
+
+    if data == "ap_ad_see_bot":
+        try:
+            sec = await get_bot_file_delete_seconds()
+            notice = await get_bot_delete_notice()
+        except Exception as e:
+            await _edit_or_reply(query, f"Error: {e}", kb_ad_menu())
+            return
+        await _edit_or_reply(
+            query,
+            f"👁 <b>Bot File Auto Delete</b>\n\n"
+            f"Time: <code>{format_duration(sec)}</code> ({sec}s)\n\n"
+            f"Notice message:\n{_safe(notice)}",
+            kb_ad_menu(),
+        )
+        return
+
+    if data == "ap_ad_set_bot":
+        _AP_STATE[uid] = {"step": "wait_ad_bot"}
+        await _edit_or_reply(
+            query,
+            "➕ <b>Set Bot File Auto Delete Time</b>\n\n"
+            "User jab bot me movie file lega, us file kitne time baad delete ho.\n\n"
+            + _TIME_HELP,
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_ad_menu")]]),
+        )
+        return
+
+    if data == "ap_ad_set_notice":
+        _AP_STATE[uid] = {"step": "wait_ad_notice"}
+        await _edit_or_reply(
+            query,
+            "💬 <b>Set Auto Delete Message</b>\n\n"
+            "File ke neeche jo notice aata hai, woh template bhejo.\n"
+            "Placeholder: <code>{time}</code> (e.g. 30 minutes)\n\n"
+            "Default reset ke liye: <code>off</code>",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_ad_menu")]]),
+        )
+        return
+
+    if data == "ap_ad_grp_menu":
+        _AP_STATE.pop(uid, None)
+        await _edit_or_reply(
+            query,
+            "👥 <b>Group Delete Management</b>\n\n"
+            "Result milne / na milne par group me user + bot message kab delete hon:",
+            kb_ad_grp_menu(),
+        )
+        return
+
+    if data == "ap_ad_see_grp":
+        try:
+            res_sec = await get_group_result_delete_seconds()
+            nf_sec = await get_group_not_found_delete_seconds()
+        except Exception as e:
+            await _edit_or_reply(query, f"Error: {e}", kb_ad_grp_menu())
+            return
+        await _edit_or_reply(
+            query,
+            "👁 <b>Group Delete Timings</b>\n\n"
+            f"✅ Result mila (user + bot result): <code>{format_duration(res_sec)}</code>\n"
+            f"❌ Result nahi mila (user msg): <code>{format_duration(nf_sec)}</code>",
+            kb_ad_grp_menu(),
+        )
+        return
+
+    if data == "ap_ad_set_result":
+        _AP_STATE[uid] = {"step": "wait_ad_result"}
+        await _edit_or_reply(
+            query,
+            "✅ <b>Result User + Bot Delete Timing</b>\n\n"
+            "Group me result milne par user message + bot result kitne time baad delete.\n\n"
+            + _TIME_HELP,
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_ad_grp_menu")]]),
+        )
+        return
+
+    if data == "ap_ad_set_notfound":
+        _AP_STATE[uid] = {"step": "wait_ad_notfound"}
+        await _edit_or_reply(
+            query,
+            "❌ <b>Not-Result User Delete Timing</b>\n\n"
+            "Group me result na milne par user message kitne time baad delete.\n\n"
+            + _TIME_HELP,
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_ad_grp_menu")]]),
+        )
+        return
+
     # ---------- File Caption ----------
     if data == "ap_cap_menu":
         _AP_STATE.pop(uid, None)
@@ -280,12 +429,10 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
             query,
             "✏️ <b>Set Caption</b>\n\n"
             "Apna caption template bhejo (HTML allowed).\n\n"
-            "Example:\n"
-            "<code><a href=\"https://t.me/Movies_1770\"><b>{file_name}</b></a></code>\n\n"
             "Placeholders:\n"
-            "• <code>{file_name}</code> — file ka naam\n"
-            "• <code>{file_size}</code> — size\n"
-            "• <code>{file_caption}</code> — original caption",
+            "• <code>{file_name}</code>\n"
+            "• <code>{file_size}</code>\n"
+            "• <code>{file_caption}</code>",
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_cap_menu")]]),
         )
         return
@@ -498,7 +645,6 @@ async def handle_ap_callback(client: Client, query: CallbackQuery):
 
 
 def register_admin_panel_handlers(bot: Client):
-    # ap_* callbacks ONLY via session_callbacks -> handle_ap_callback
 
     @bot.on_message(filters.private, group=50)
     async def ap_admin_input(client: Client, message: Message):
@@ -516,6 +662,57 @@ def register_admin_panel_handlers(bot: Client):
                 return
 
             step = st.get("step")
+
+            # Auto-delete time inputs
+            if step in ("wait_ad_bot", "wait_ad_result", "wait_ad_notfound"):
+                text = (message.text or "").strip()
+                sec = parse_duration(text)
+                if sec is None:
+                    await message.reply_text(
+                        "❌ Time samajh nahi aaya.\nExamples: <code>30m</code> <code>1h</code> <code>24h</code> <code>2d</code> <code>3month</code>",
+                        quote=True,
+                    )
+                    return
+                try:
+                    if step == "wait_ad_bot":
+                        await set_bot_file_delete_seconds(sec)
+                        label = "Bot file"
+                        back = kb_ad_menu()
+                    elif step == "wait_ad_result":
+                        await set_group_result_delete_seconds(sec)
+                        label = "Group result (user+bot)"
+                        back = kb_ad_grp_menu()
+                    else:
+                        await set_group_not_found_delete_seconds(sec)
+                        label = "Group not-found"
+                        back = kb_ad_grp_menu()
+                    _AP_STATE.pop(uid, None)
+                    await message.reply_text(
+                        f"✅ {label} auto-delete set:\n<code>{format_duration(sec)}</code> ({sec}s)",
+                        quote=True,
+                        reply_markup=back,
+                    )
+                except Exception as e:
+                    await message.reply_text(f"Error: {e}", quote=True)
+                return
+
+            if step == "wait_ad_notice":
+                text = (message.text or message.caption or "").strip()
+                if not text:
+                    await message.reply_text("Message text bhejo (ya off).", quote=True)
+                    return
+                try:
+                    if text.lower() in ("off", "reset", "default", "clear"):
+                        await clear_bot_delete_notice()
+                        msg = "✅ Notice default pe reset."
+                    else:
+                        await set_bot_delete_notice(text)
+                        msg = "✅ Auto delete notice set."
+                    _AP_STATE.pop(uid, None)
+                    await message.reply_text(msg, quote=True, reply_markup=kb_ad_menu())
+                except Exception as e:
+                    await message.reply_text(f"Error: {e}", quote=True)
+                return
 
             if step == "wait_caption":
                 text = (message.text or message.caption or "").strip()
@@ -596,4 +793,4 @@ def register_admin_panel_handlers(bot: Client):
         except Exception as e:
             logger.exception("ap_admin_input: %s", e)
 
-    logger.info("Admin panel handlers registered OK (callbacks via session_callbacks only)")
+    logger.info("Admin panel handlers registered OK")
