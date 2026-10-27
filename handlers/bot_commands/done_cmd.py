@@ -10,6 +10,7 @@
 # Without reply-to: does nothing.
 # ==============================================================================
 
+import asyncio
 import logging
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType, ChatMemberStatus
@@ -21,9 +22,12 @@ logger = logging.getLogger("DoneCmd")
 
 DONE_TEXT = "Your file has been uploaded successfully. Please check it."
 
-# (chat_id, user_message_id) -> bot_reply_message_id
-# When user msg is deleted, bot reply is deleted too.
+# (chat_id, user_message_id) -> [bot_reply_message_ids]
 _DONE_REPLY_MAP: dict = {}
+
+# How long / how often to poll if user msg still exists (deleted_messages is unreliable in groups)
+_WATCH_INTERVAL = 3       # seconds between checks
+_WATCH_MAX_CHECKS = 200   # ~10 minutes coverage
 
 
 async def _is_authorized(client: Client, message: Message) -> bool:
@@ -57,6 +61,66 @@ async def _is_authorized(client: Client, message: Message) -> bool:
         logger.debug("done admin check: %s", e)
 
     return False
+
+
+async def _delete_bot_replies(client: Client, chat_id: int, bot_ids: list):
+    if not bot_ids:
+        return
+    try:
+        await client.delete_messages(chat_id, bot_ids)
+        logger.info("done: deleted bot replies %s in chat %s", bot_ids, chat_id)
+    except Exception as e:
+        # try one-by-one
+        for mid in bot_ids:
+            try:
+                await client.delete_messages(chat_id, mid)
+            except Exception as e2:
+                logger.warning("done: delete bot reply %s failed: %s", mid, e2)
+
+
+def _user_msg_gone(msg) -> bool:
+    if msg is None:
+        return True
+    if isinstance(msg, list):
+        if not msg:
+            return True
+        msg = msg[0]
+    if getattr(msg, "empty", False):
+        return True
+    # Message with no content markers sometimes means deleted/empty
+    if not getattr(msg, "id", None):
+        return True
+    return False
+
+
+async def _watch_user_msg(
+    client: Client,
+    chat_id: int,
+    user_msg_id: int,
+    bot_msg_id: int,
+):
+    """Poll until user message is gone, then delete linked bot confirmation(s)."""
+    key = (int(chat_id), int(user_msg_id))
+    try:
+        for _ in range(_WATCH_MAX_CHECKS):
+            await asyncio.sleep(_WATCH_INTERVAL)
+            try:
+                msg = await client.get_messages(chat_id, user_msg_id)
+            except Exception:
+                msg = None
+
+            if _user_msg_gone(msg):
+                bot_ids = _DONE_REPLY_MAP.pop(key, None)
+                if not bot_ids:
+                    bot_ids = [int(bot_msg_id)]
+                await _delete_bot_replies(client, chat_id, list(bot_ids))
+                return
+
+            # still exists — keep waiting
+        # timeout: stop watching, leave map entry (deleted_messages may still fire)
+        logger.debug("done: watch timeout chat=%s user_msg=%s", chat_id, user_msg_id)
+    except Exception as e:
+        logger.debug("done watch: %s", e)
 
 
 def register_done_command(bot: Client):
@@ -107,47 +171,50 @@ def register_done_command(bot: Client):
                 except Exception as e2:
                     logger.warning("done: fallback reply failed: %s", e2)
 
-            # Track: if user original msg deleted → delete this bot reply too
             if bot_msg and target:
                 try:
-                    key = (int(message.chat.id), int(target.id))
-                    _DONE_REPLY_MAP[key] = int(bot_msg.id)
-                    logger.info("done: mapped user_msg=%s → bot_reply=%s", target.id, bot_msg.id)
+                    chat_id = int(message.chat.id)
+                    user_mid = int(target.id)
+                    bot_mid = int(bot_msg.id)
+                    key = (chat_id, user_mid)
+                    _DONE_REPLY_MAP.setdefault(key, [])
+                    if bot_mid not in _DONE_REPLY_MAP[key]:
+                        _DONE_REPLY_MAP[key].append(bot_mid)
+                    logger.info(
+                        "done: mapped user_msg=%s → bot_reply=%s",
+                        user_mid, bot_mid,
+                    )
+                    # Reliable cleanup: poll until user msg is gone
+                    asyncio.create_task(
+                        _watch_user_msg(client, chat_id, user_mid, bot_mid)
+                    )
                 except Exception as e:
-                    logger.debug("done: map store failed: %s", e)
+                    logger.debug("done: map/watch setup failed: %s", e)
 
         except Exception as e:
             logger.exception("done_command_handler: %s", e)
 
     @bot.on_deleted_messages()
     async def done_on_user_msg_deleted(client: Client, messages):
-        """If the original user message (that /done replied to) is deleted,
-        also delete the bot confirmation reply."""
+        """Backup: if Telegram sends delete update, remove bot confirmations."""
         try:
             if not messages:
                 return
-            # messages may share one chat or list of Message-like objects
             for m in messages:
                 try:
-                    chat_id = getattr(getattr(m, "chat", None), "id", None)
+                    chat = getattr(m, "chat", None)
+                    chat_id = getattr(chat, "id", None) if chat else None
                     msg_id = getattr(m, "id", None)
                     if chat_id is None or msg_id is None:
                         continue
                     key = (int(chat_id), int(msg_id))
-                    bot_reply_id = _DONE_REPLY_MAP.pop(key, None)
-                    if not bot_reply_id:
+                    bot_ids = _DONE_REPLY_MAP.pop(key, None)
+                    if not bot_ids:
                         continue
-                    try:
-                        await client.delete_messages(chat_id, bot_reply_id)
-                        logger.info(
-                            "done: user msg %s deleted → bot reply %s deleted",
-                            msg_id, bot_reply_id,
-                        )
-                    except Exception as e:
-                        logger.warning("done: could not delete bot reply %s: %s", bot_reply_id, e)
+                    await _delete_bot_replies(client, int(chat_id), list(bot_ids))
                 except Exception as e:
                     logger.debug("done deleted_messages item: %s", e)
         except Exception as e:
             logger.debug("done_on_user_msg_deleted: %s", e)
 
-    logger.info("/done command registered (group=-3 + delete-sync)")
+    logger.info("/done registered (watch + deleted_messages cleanup)")
