@@ -146,6 +146,14 @@ try:
 except Exception as e:
     logger.error(f"notavailable_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
+# /premium command (bot_commands folder) — fail-safe
+try:
+    from handlers.bot_commands.premium_cmd import register_premium_command
+    register_premium_command(Bot)
+    logger.info("/premium command registered")
+except Exception as e:
+    logger.error(f"premium_cmd register failed (bot still runs): {type(e).__name__}: {e}")
+
 # Admin Panel (Force Sub UI) — fail-safe so bot still boots if panel has issue
 try:
     from handlers.admin_panel import register_admin_panel_handlers
@@ -174,6 +182,7 @@ async def setup_bot_commands(bot: Client):
         BotCommand("chakspelling", "Check spelling (reply to user)"),
         BotCommand("deletefilter", "Reply to poster \u2192 remove filter"),
         BotCommand("not_available", "Not available on Telegram (reply)"),
+        BotCommand("premium", "Premium only — contact @movies_1780"),
     ]
     private_cmds = [
         BotCommand("start", "Bot start / welcome"),
