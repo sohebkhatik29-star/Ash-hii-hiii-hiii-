@@ -6,8 +6,18 @@
 import asyncio
 import logging
 from pyrogram import Client, filters, idle
-from pyrogram.types import Message, BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeAllChatAdministrators, BotCommandScopeChat, BotCommandScopeChatAdministrators
-from pyrogram.enums import ParseMode
+from pyrogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeChatAdministrators,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+)
 
 from configs import Config
 from handlers.database import db
@@ -20,36 +30,82 @@ from handlers.session_callbacks import register_callback_handlers
 from handlers.group_filter import register_group_filter_handlers
 from handlers.moderation import register_moderation_handlers
 from handlers.force_sub_handler import register_force_sub_handlers
-from handlers.admin_panel import register_admin_panel_handlers
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="[%(asctime)s - %(levelname)s] - %(name)s - %(message)s"
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("AshMovieBot")
 
 Bot = Client(
-    name="AshMovieStoreBot",
+    name=Config.BOT_USERNAME or "AshMovieBot",
     api_id=Config.API_ID,
     api_hash=Config.API_HASH,
     bot_token=Config.BOT_TOKEN,
-    workers=Config.BOT_WORKERS,
-    plugins=None,
-    parse_mode=ParseMode.HTML,
+    workers=100,
+    plugins=dict(root="handlers") if False else None,
 )
 
-@Bot.on_message(filters.private & filters.incoming, group=-1)
-async def _user_status(client: Client, message: Message):
-    await handle_user_status(client, message)
+@Bot.on_message(filters.private, group=-1)
+async def private_status_guard(bot: Client, cmd: Message):
+    try:
+        if cmd.from_user and await handle_user_status(bot, cmd):
+            await cmd.reply_text("🚫 **Aapko is bot se ban kiya gaya hai.**", quote=True)
+            return
+    except Exception as e:
+        logger.debug(f"status guard: {e}")
+
+@Bot.on_message(filters.command(["addmovie", "newmovie"]) & filters.private)
+async def addmovie_command(bot: Client, cmd: Message):
+    try:
+        admin_id = cmd.from_user.id if cmd.from_user else 0
+        if admin_id not in Config.ADMINS:
+            await cmd.reply_text("⚠️ Sirf admin /addmovie use kar sakte hain.", quote=True)
+            return
+        status_msg = await cmd.reply_text(
+            "🎬 <b>Movie Upload Session Started</b> (v3)\n\n"
+            "Pehli video file abhi bhejo.\n"
+            "Uske baad same movie ki aur qualities add kar sakte ho, ya Generate Links dabao.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel Session", callback_data="session_cancel")]
+            ]),
+            quote=True,
+        )
+        await session_mgr.start_addmovie_session(admin_id, status_msg.id, cmd.chat.id)
+    except Exception as e:
+        logger.error(f"addmovie_command error: {type(e).__name__}: {e}")
+        try:
+            await cmd.reply_text(f"❌ Error: <code>{type(e).__name__}</code>", quote=True)
+        except Exception:
+            pass
+
+@Bot.on_message(filters.command("cancel") & filters.private)
+async def cancel_session_command(bot: Client, cmd: Message):
+    admin_id = cmd.from_user.id if cmd.from_user else 0
+    if admin_id not in Config.ADMINS:
+        return
+    await session_mgr.cancel_session(admin_id)
+    await cmd.reply_text("❌ <b>Movie upload session cancelled.</b> (No new files will be added)", quote=True)
+
+@Bot.on_message(filters.command(["finish", "generatelink"]) & filters.private)
+async def finish_session_command(bot: Client, cmd: Message):
+    admin_id = cmd.from_user.id if cmd.from_user else 0
+    if admin_id not in Config.ADMINS:
+        return
+    await handle_generate_links_action(bot, cmd.chat.id, admin_id)
 
 @Bot.on_message(
-    filters.private
-    & filters.user(Config.ADMINS)
-    & (filters.video | filters.document | filters.media)
-    & ~filters.command(["start", "help", "addmovie", "cancel", "finish"])
+    (filters.video | filters.document | filters.animation | filters.audio | filters.media)
+    & filters.private
+    & ~filters.command(["start", "help", "addmovie", "newmovie", "cancel", "finish", "generatelink"])
 )
-async def _incoming_movie(client: Client, message: Message):
-    await handle_incoming_movie_file(client, message)
+async def auto_movie_upload_listener(bot: Client, message: Message):
+    try:
+        if not (message.video or message.document):
+            return
+        await handle_incoming_movie_file(bot, message)
+    except Exception as e:
+        logger.error(f"auto_movie_upload_listener error: {type(e).__name__}: {e}")
 
 register_start_handlers(Bot)
 register_admin_handlers(Bot)
@@ -57,19 +113,38 @@ register_callback_handlers(Bot)
 register_group_filter_handlers(Bot)
 register_moderation_handlers(Bot)
 register_force_sub_handlers(Bot)
-register_admin_panel_handlers(Bot)
+
+# Admin Panel (Force Sub UI) — fail-safe so bot still boots if panel has issue
+try:
+    from handlers.admin_panel import register_admin_panel_handlers
+    register_admin_panel_handlers(Bot)
+    logger.info("Admin panel handlers registered")
+except Exception as e:
+    logger.error(f"admin_panel register failed (bot still runs): {type(e).__name__}: {e}")
 
 async def setup_bot_commands(bot: Client):
-    private_cmds = [
-        BotCommand("start", "Start the bot / Home"),
-        BotCommand("addmovie", "Start movie upload session"),
-        BotCommand("cancel", "Cancel active session"),
-        BotCommand("finish", "Generate links / finish session"),
-        BotCommand("help", "Help & commands"),
-    ]
     group_cmds = [
+        BotCommand("menu", "Admin commands list"),
+        BotCommand("add_force_chnl", "Force-sub channel add"),
+        BotCommand("del_force_chnl", "Force-sub channel delete"),
+        BotCommand("see_force_sub_chnl", "List force-sub channels"),
+        BotCommand("set_force_sub_message", "Custom force-sub message"),
+        BotCommand("del_force_sub_message", "Reset force-sub message"),
+        BotCommand("warn", "User ko warning (3 = ban)"),
+        BotCommand("sp", "Spelling galat + Google button"),
+        BotCommand("rls", "Movie abhi release nahi hui"),
+        BotCommand("n_available", "Telegram pe available nahi"),
+        BotCommand("prm", "Sirf Premium pe available"),
+        BotCommand("dl", "Poster pe reply → filter delete"),
+        BotCommand("dl_all_filters", "Saare filters delete"),
+        BotCommand("unban", "User unban (reply / user_id)"),
+        BotCommand("done", "Not-found session close"),
+    ]
+    private_cmds = [
+        BotCommand("start", "Bot start / welcome"),
+        BotCommand("help", "Help & how to use"),
         BotCommand("addmovie", "Start movie upload session"),
-        BotCommand("cancel", "Cancel active session"),
+        BotCommand("cancel", "Cancel upload session"),
         BotCommand("finish", "Generate links / finish session"),
     ]
     try:
