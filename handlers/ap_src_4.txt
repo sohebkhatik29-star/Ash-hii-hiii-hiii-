@@ -1,0 +1,65 @@
+                    _AP_STATE.pop(uid, None)
+                    await message.reply_text("✅ File caption set.", quote=True, reply_markup=kb_cap_menu(True))
+                except Exception as e:
+                    await message.reply_text(f"Error: {e}", quote=True)
+                return
+
+            if step == "wait_channel":
+                cid, title, username = await _resolve_channel(client, message)
+                if not cid:
+                    await message.reply_text("❌ Channel samajh nahi aaya.", quote=True, reply_markup=kb_back_fs())
+                    return
+                if not await _bot_is_admin(client, cid):
+                    await message.reply_text(
+                        f"❌ Bot is channel me admin nahi: <b>{_safe(title) or cid}</b>",
+                        quote=True, reply_markup=kb_back_fs(),
+                    )
+                    return
+                _AP_STATE[uid] = {
+                    "step": "wait_mode",
+                    "channel_id": cid,
+                    "title": title or str(cid),
+                    "username": username or "",
+                }
+                await message.reply_text(
+                    f"✅ Bot admin confirmed.\n<b>{_safe(title) or cid}</b>\nID: <code>{cid}</code>\nMode choose karo:",
+                    quote=True, reply_markup=kb_mode_pick(cid),
+                )
+                return
+
+            if step == "wait_msg":
+                text = (message.text or message.caption or "").strip()
+                if not text:
+                    await message.reply_text("Text message bhejo.", quote=True)
+                    return
+                try:
+                    await db.set_force_sub_message(text)
+                    _AP_STATE.pop(uid, None)
+                    await message.reply_text(
+                        "✅ Force sub message set.",
+                        quote=True,
+                        reply_markup=kb_fs_msg_menu(True, bool(await _get_fs_pic())),
+                    )
+                except Exception as e:
+                    await message.reply_text(f"Error: {e}", quote=True)
+                return
+
+            if step == "wait_pic":
+                if not message.photo:
+                    await message.reply_text("Sirf photo bhejo.", quote=True)
+                    return
+                try:
+                    await db.set_force_sub_pic(message.photo.file_id)
+                    _AP_STATE.pop(uid, None)
+                    await message.reply_text(
+                        "✅ Force sub pic set.",
+                        quote=True,
+                        reply_markup=kb_fs_msg_menu(bool(await _get_fs_msg()), True),
+                    )
+                except Exception as e:
+                    await message.reply_text(f"Error: {e}", quote=True)
+                return
+        except Exception as e:
+            logger.exception("ap_admin_input: %s", e)
+
+    logger.info("Admin panel handlers registered OK")
