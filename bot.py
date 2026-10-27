@@ -114,7 +114,7 @@ register_group_filter_handlers(Bot)
 register_moderation_handlers(Bot)
 register_force_sub_handlers(Bot)
 
-# /done command (bot_commands folder) \u2014 fail-safe
+# /done command (bot_commands folder) — fail-safe
 try:
     from handlers.bot_commands.done_cmd import register_done_command
     register_done_command(Bot)
@@ -122,7 +122,15 @@ try:
 except Exception as e:
     logger.error(f"done_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
-# Admin Panel (Force Sub UI) \u2014 fail-safe so bot still boots if panel has issue
+# /chakspelling command (bot_commands folder) — fail-safe
+try:
+    from handlers.bot_commands.chakspelling_cmd import register_chakspelling_command
+    register_chakspelling_command(Bot)
+    logger.info("/chakspelling command registered")
+except Exception as e:
+    logger.error(f"chakspelling_cmd register failed (bot still runs): {type(e).__name__}: {e}")
+
+# Admin Panel (Force Sub UI) — fail-safe so bot still boots if panel has issue
 try:
     from handlers.admin_panel import register_admin_panel_handlers
     register_admin_panel_handlers(Bot)
@@ -147,6 +155,7 @@ async def setup_bot_commands(bot: Client):
         BotCommand("dl_all_filters", "Saare filters delete"),
         BotCommand("unban", "User unban (reply / user_id)"),
         BotCommand("done", "Not-found session close"),
+        BotCommand("chakspelling", "Check spelling (reply to user)"),
     ]
     private_cmds = [
         BotCommand("start", "Bot start / welcome"),
