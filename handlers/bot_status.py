@@ -1,10 +1,11 @@
-# handlers/bot_status.py — Bot Status stats + filters list/search helpers
+# handlers/bot_status.py — Bot Status + All Filters (list/search/delete)
 import logging
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from handlers.database import db
 
 logger = logging.getLogger("BotStatus")
 
-# Ensure users collection methods exist (used by check_user_status too)
+
 def _patch_user_methods():
     if getattr(db, "_users_patched", False):
         return
@@ -70,18 +71,15 @@ _patch_user_methods()
 
 
 async def get_bot_stats() -> dict:
-    """users, movies (filters), total quality files."""
-    users = 0
-    movies = 0
-    files = 0
+    users = movies = files = 0
     try:
         users = await db.total_users_count()
     except Exception:
-        users = 0
+        pass
     try:
         movies = await db.total_movies_count()
     except Exception:
-        movies = 0
+        pass
     try:
         if getattr(db, "has_mongo", False) and getattr(db, "movies_col", None) is not None:
             async for doc in db.movies_col.find({}, {"qualities": 1}):
@@ -101,13 +99,10 @@ async def get_bot_stats() -> dict:
 def movie_label(m: dict) -> str:
     title = (m.get("title") or "Unknown").strip()
     year = m.get("year")
-    if year:
-        return f"{title} ({year})"
-    return title
+    return f"{title} ({year})" if year else title
 
 
-async def list_filters_page(page: int = 1, per_page: int = 10) -> tuple:
-    """Returns (movies_list, total_count, page, total_pages)."""
+async def list_filters_page(page: int = 1, per_page: int = 10):
     page = max(1, int(page or 1))
     per_page = max(1, min(20, int(per_page or 10)))
     try:
@@ -135,3 +130,150 @@ async def search_filters(query: str, limit: int = 20) -> list:
     if not isinstance(results, list):
         results = list(results or [])
     return results[:limit]
+
+
+def kb_st_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 All Filters", callback_data="ap_st_filters:1")],
+        [InlineKeyboardButton("🔎 Search Filter", callback_data="ap_st_search")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="ap_home")],
+    ])
+
+
+def kb_filter_actions(movie_id: str, back_data: str = "ap_st_filters:1"):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Delete Filter", callback_data=f"ap_st_del:{movie_id}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data=back_data)],
+    ])
+
+
+async def handle_status_callback(client, query, edit_or_reply, ap_state, safe_fn):
+    """All ap_st_* callbacks."""
+    data = (query.data or "").strip()
+    user = query.from_user
+    uid = int(user.id) if user else 0
+
+    if data == "ap_st_menu":
+        ap_state.pop(uid, None)
+        try:
+            st = await get_bot_stats()
+        except Exception as e:
+            logger.warning("stats: %s", e)
+            st = {"users": 0, "movies": 0, "files": 0}
+        text = (
+            "📊 <b>Bot Status</b>\n\n"
+            f"👥 Users (bot use): <code>{st.get('users', 0)}</code>\n"
+            f"🎬 Filters (movies): <code>{st.get('movies', 0)}</code>\n"
+            f"📁 Files saved (qualities): <code>{st.get('files', 0)}</code>\n"
+        )
+        await edit_or_reply(query, text, kb_st_menu())
+        return
+
+    if data.startswith("ap_st_filters:"):
+        try:
+            page = int(data.split(":")[1])
+        except Exception:
+            page = 1
+        movies, total, page, total_pages = await list_filters_page(page=page, per_page=10)
+        if not movies and total == 0:
+            await edit_or_reply(query, "Koi filter nahi hai.", kb_st_menu())
+            return
+        rows = []
+        for m in movies:
+            mid = m.get("movie_id") or ""
+            label = movie_label(m)[:55]
+            qs = m.get("qualities") or {}
+            nq = len(qs) if isinstance(qs, dict) else 0
+            rows.append([InlineKeyboardButton(f"{label} [{nq}f]", callback_data=f"ap_st_view:{mid}:{page}")])
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"ap_st_filters:{page-1}"))
+        if page < total_pages:
+            nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"ap_st_filters:{page+1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([InlineKeyboardButton("🔎 Search", callback_data="ap_st_search")])
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="ap_st_menu")])
+        await edit_or_reply(
+            query,
+            f"📋 <b>All Filters</b> — page {page}/{total_pages} (total {total})\n\nNaam pe click → Delete / Back:",
+            InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data == "ap_st_search":
+        ap_state[uid] = {"step": "wait_st_search"}
+        await edit_or_reply(
+            query,
+            "🔎 <b>Search Filter</b>\n\nMovie ka naam bhejo:",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="ap_st_menu")]]),
+        )
+        return
+
+    if data.startswith("ap_st_view:"):
+        parts = data.split(":")
+        mid = parts[1] if len(parts) > 1 else ""
+        try:
+            page = int(parts[2]) if len(parts) > 2 else 1
+        except Exception:
+            page = 1
+        back = f"ap_st_filters:{page}"
+        try:
+            m = await db.get_movie(mid)
+        except Exception:
+            m = None
+        if not m:
+            await edit_or_reply(query, "Filter nahi mila.", kb_st_menu())
+            return
+        title = movie_label(m)
+        qs = m.get("qualities") or {}
+        qlist = ", ".join(list(qs.keys())[:12]) if isinstance(qs, dict) else "-"
+        link = m.get("group_post_link") or ""
+        text = (
+            f"🎬 <b>{safe_fn(title)}</b>\n"
+            f"ID: <code>{mid}</code>\n"
+            f"Qualities ({len(qs) if isinstance(qs, dict) else 0}): <code>{safe_fn(qlist)}</code>\n"
+        )
+        if link:
+            text += f"Link: {link}\n"
+        await edit_or_reply(query, text, kb_filter_actions(mid, back))
+        return
+
+    if data.startswith("ap_st_del:"):
+        mid = data.split(":", 1)[1] if ":" in data else ""
+        try:
+            await db.delete_movie(mid)
+            msg = f"✅ Filter delete: <code>{mid}</code>"
+        except Exception as e:
+            msg = f"❌ Delete fail: {e}"
+        await edit_or_reply(query, msg, kb_st_menu())
+        return
+
+    await edit_or_reply(query, "📊 <b>Bot Status</b>", kb_st_menu())
+
+
+async def handle_status_search_input(client, message, ap_state, safe_fn, uid):
+    q = (message.text or "").strip()
+    if not q:
+        await message.reply_text("Movie name bhejo.", quote=True)
+        return
+    results = await search_filters(q, limit=20)
+    ap_state.pop(uid, None)
+    if not results:
+        await message.reply_text(
+            f"❌ <b>{safe_fn(q)}</b> nahi mila.",
+            quote=True,
+            reply_markup=kb_st_menu(),
+        )
+        return
+    rows = []
+    for m in results:
+        mid = m.get("movie_id") or ""
+        label = movie_label(m)[:55]
+        rows.append([InlineKeyboardButton(label, callback_data=f"ap_st_view:{mid}:1")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="ap_st_menu")])
+    await message.reply_text(
+        f"🔎 Results for <code>{safe_fn(q)}</code> ({len(results)}):\nNaam pe click → Delete / Back",
+        quote=True,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
