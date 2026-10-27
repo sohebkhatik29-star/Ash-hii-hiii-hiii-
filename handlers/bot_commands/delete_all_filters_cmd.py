@@ -1,9 +1,10 @@
 # ==============================================================================
 # handlers/bot_commands/delete_all_filters_cmd.py
-# Command: /deleteallfilters  (aliases: /dl_all_filters, /delete_all_filters)
+# Command: /delete_all_filters
 # Group me command → admin command delete → Yes/No confirm
 #   Yes → saare filters delete
 #   No  → cancel
+# Unique name so purane moderation handler se clash na ho.
 # ==============================================================================
 
 import logging
@@ -50,7 +51,7 @@ async def _is_authorized(client: Client, message: Message) -> bool:
             if any(x in st_s for x in ("administrator", "owner", "creator")):
                 return True
     except Exception as e:
-        logger.debug("deleteallfilters admin check: %s", e)
+        logger.debug("delete_all_filters admin check: %s", e)
 
     return False
 
@@ -77,7 +78,7 @@ async def _is_authorized_uid(client: Client, chat_id: int, user_id: int) -> bool
         if any(x in st_s for x in ("administrator", "owner", "creator")):
             return True
     except Exception as e:
-        logger.debug("deleteallfilters uid admin check: %s", e)
+        logger.debug("delete_all_filters uid admin check: %s", e)
 
     return False
 
@@ -94,22 +95,22 @@ async def _wipe_all_filters() -> int:
             try:
                 await db.movies_col.delete_many({})
             except Exception as e:
-                logger.error("deleteallfilters delete_many: %s", e)
+                logger.error("delete_all_filters delete_many: %s", e)
         mem = getattr(db, "_mem_movies", None)
         if isinstance(mem, dict):
             if not count:
                 count = len(mem)
             mem.clear()
     except Exception as e:
-        logger.exception("deleteallfilters wipe: %s", e)
+        logger.exception("delete_all_filters wipe: %s", e)
     return int(count or 0)
 
 
 def register_delete_all_filters_command(bot: Client):
-    """Register /deleteallfilters with Yes/No confirmation."""
+    """Register /delete_all_filters with Yes/No confirmation."""
 
     @bot.on_message(
-        filters.command(["deleteallfilters", "dl_all_filters", "delete_all_filters"])
+        filters.command(["delete_all_filters"])
         & (filters.group | filters.private),
         group=-3,
     )
@@ -126,7 +127,7 @@ def register_delete_all_filters_command(bot: Client):
             try:
                 await message.delete()
             except Exception as e:
-                logger.warning("deleteallfilters: delete cmd failed: %s", e)
+                logger.warning("delete_all_filters: delete cmd failed: %s", e)
 
             kb = InlineKeyboardMarkup([
                 [
@@ -141,7 +142,7 @@ def register_delete_all_filters_command(bot: Client):
                     reply_markup=kb,
                 )
             except Exception as e:
-                logger.error("deleteallfilters: confirm send failed: %s", e)
+                logger.error("delete_all_filters: confirm send failed: %s", e)
 
         except Exception as e:
             logger.exception("delete_all_filters_handler: %s", e)
@@ -163,7 +164,6 @@ def register_delete_all_filters_command(bot: Client):
 
             clicker = query.from_user.id if query.from_user else 0
 
-            # Only the admin who started, or any authorized admin
             if clicker != owner_id:
                 if not await _is_authorized_uid(client, query.message.chat.id, clicker):
                     await query.answer("Only admin can confirm.", show_alert=True)
@@ -184,7 +184,6 @@ def register_delete_all_filters_command(bot: Client):
                 await query.answer("Cancelled")
                 return
 
-            # daf_yes
             await query.answer("Deleting all filters...")
             count = await _wipe_all_filters()
             try:
@@ -198,7 +197,7 @@ def register_delete_all_filters_command(bot: Client):
                         f"All filters deleted.\n\nTotal removed: {count}",
                     )
                 except Exception as e:
-                    logger.error("deleteallfilters: result send failed: %s", e)
+                    logger.error("delete_all_filters: result send failed: %s", e)
 
         except Exception as e:
             logger.exception("delete_all_filters_callback: %s", e)
@@ -207,4 +206,4 @@ def register_delete_all_filters_command(bot: Client):
             except Exception:
                 pass
 
-    logger.info("/deleteallfilters registered (Yes/No confirm)")
+    logger.info("/delete_all_filters registered (Yes/No confirm)")
