@@ -1,1 +1,185 @@
-PLACEHOLDER_Q2
+
+async def enforce_force_sub_in_group(bot, message, query=""):
+    if not message.from_user:
+        return False
+    user_id = message.from_user.id
+    try:
+        if user_id in (Config.ADMINS or []):
+            return False
+    except Exception:
+        pass
+    try:
+        mem = await bot.get_chat_member(message.chat.id, user_id)
+        if _status_is_admin(mem.status):
+            return False
+    except Exception:
+        pass
+    try:
+        channels = await db.list_force_channels()
+    except Exception:
+        channels = []
+    if not channels:
+        return False
+    missing = await get_missing_channels(bot, user_id)
+    if not missing:
+        return False
+    name = _display_user(message.from_user)
+    text, markup = await build_force_sub_prompt(bot, name, missing, pending_query=query or "")
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    pic = ""
+    try:
+        pic = await db.get_force_sub_pic()
+    except Exception:
+        pic = ""
+    try:
+        if pic:
+            await bot.send_photo(message.chat.id, pic, caption=text, reply_markup=markup)
+        else:
+            await bot.send_message(message.chat.id, text, reply_markup=markup, disable_web_page_preview=True)
+    except Exception as e:
+        logger.warning("enforce prompt: %s", e)
+    return True
+
+
+async def handle_force_sub(bot: Client, cmd: Message) -> int:
+    try:
+        if not cmd.from_user:
+            return 200
+        uid = cmd.from_user.id
+        if uid in (Config.ADMINS or []):
+            return 200
+        try:
+            channels = await db.list_force_channels()
+        except Exception:
+            channels = []
+        if channels:
+            missing = await get_missing_channels(bot, uid)
+            if not missing:
+                return 200
+            name = _display_user(cmd.from_user)
+            text, markup = await build_force_sub_prompt(bot, name, missing)
+            pic = ""
+            try:
+                pic = await db.get_force_sub_pic()
+            except Exception:
+                pic = ""
+            try:
+                if pic:
+                    await bot.send_photo(chat_id=cmd.chat.id, photo=pic, caption=text, reply_markup=markup)
+                else:
+                    await bot.send_message(chat_id=cmd.chat.id, text=text, reply_markup=markup, disable_web_page_preview=True)
+            except Exception as e:
+                logger.warning("handle_force_sub prompt: %s", e)
+            return 400
+        return 200
+    except Exception as e:
+        logger.warning("handle_force_sub error (allowing user): %s", e)
+        return 200
+
+
+async def handle_fs_callback(client: Client, query: CallbackQuery):
+    data = query.data or ""
+    if data.startswith("fs_mode:"):
+        if not query.from_user or not query.message:
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            return
+        chat_id = query.message.chat.id
+        uid = query.from_user.id
+        is_admin = await _is_group_admin(client, chat_id, uid)
+        if not is_admin and uid not in (Config.ADMINS or []):
+            try:
+                await query.answer("Sirf admin use kar sakte hain.", show_alert=True)
+            except Exception:
+                pass
+            return
+        parts = data.split(":")
+        if len(parts) < 3:
+            try:
+                await query.answer("Invalid", show_alert=True)
+            except Exception:
+                pass
+            return
+        mode, channel_id = parts[1], int(parts[2])
+        if mode == "cancel":
+            _FS_PENDING.pop(channel_id, None)
+            try:
+                await query.message.delete()
+            except Exception:
+                try:
+                    await query.message.edit_text("Cancelled.")
+                except Exception:
+                    pass
+            try:
+                await query.answer("Cancelled")
+            except Exception:
+                pass
+            return
+        pending = _FS_PENDING.pop(channel_id, {}) or {}
+        title = _safe_text(pending.get("title") or str(channel_id))
+        username = pending.get("username") or ""
+        try:
+            await db.add_force_channel(channel_id, title=title, username=username, mode=mode)
+            await query.message.edit_text(
+                f"✅ Force-sub channel add ho gaya.\n\n"
+                f"Channel: <b>{title}</b>\nMode: <code>{mode}</code>\nID: <code>{channel_id}</code>"
+            )
+            await query.answer("Added!")
+        except ValueError as ve:
+            msg = "Max 7 channels" if str(ve) == "MAX_7" else str(ve)[:80]
+            await query.answer(msg, show_alert=True)
+        except Exception as e:
+            logger.error("fs_mode add: %s", e)
+            await query.answer("Error", show_alert=True)
+        return
+
+    if data.startswith("fs_refresh") or data in ("force_sub_joined", "force_sub_try", "fs_try", "fs_joined"):
+        user = query.from_user
+        if not user:
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            return
+        pending_q = ""
+        if data.startswith("fs_refresh:"):
+            pending_q = data.split(":", 1)[1] if ":" in data else ""
+        missing = await get_missing_channels(client, user.id)
+        if not missing:
+            try:
+                await query.message.edit_text("✅ Thank you! Ab movie search kar sakte ho.")
+            except Exception:
+                try:
+                    await query.message.delete()
+                except Exception:
+                    pass
+            try:
+                await query.answer("Joined!")
+            except Exception:
+                pass
+            if pending_q and query.message:
+                try:
+                    tip = await client.send_message(
+                        query.message.chat.id,
+                        f"Verified. Dubara search: <b>{_safe_text(pending_q)}</b>",
+                    )
+                    await asyncio.sleep(8)
+                    await tip.delete()
+                except Exception:
+                    pass
+            return
+        text, markup = await build_force_sub_prompt(client, _display_user(user), missing, pending_query=pending_q)
+        try:
+            await query.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+        except Exception:
+            pass
+        try:
+            await query.answer("Abhi channels join nahi hue", show_alert=True)
+        except Exception:
+            pass
+        return
