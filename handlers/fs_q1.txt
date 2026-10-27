@@ -110,7 +110,6 @@ async def has_pending_join_request(bot: Client, channel_id: int, user_id: int) -
     if key in _PENDING_REQUESTS:
         return True
     try:
-        # force_sub_db may track
         if hasattr(db, "has_pending_join_request"):
             return bool(await db.has_pending_join_request(user_id, channel_id))
     except Exception:
@@ -152,6 +151,7 @@ async def get_missing_channels(bot: Client, user_id: int) -> list:
 
 
 async def build_force_sub_prompt(bot, user_name, missing, pending_query=""):
+    """Prompt buttons: only channel name (join/request URL) + Joined / Try Again. No extra buttons."""
     user_name = _safe_text(user_name) or "User"
     try:
         custom = await db.get_force_sub_message()
@@ -171,6 +171,9 @@ async def build_force_sub_prompt(bot, user_name, missing, pending_query=""):
     for ch in missing:
         cid = int(ch["channel_id"])
         title = _safe_text(ch.get("title") or ch.get("username") or str(cid))
+        # Prefer real title; avoid showing raw numeric id if possible
+        if title.lstrip("-").isdigit() and ch.get("username"):
+            title = str(ch["username"]).lstrip("@")
         mode = (ch.get("mode") or "normal").lower()
         invite = await get_invite_link(bot, cid, request=(mode == "request"))
         if invite and getattr(invite, "invite_link", None):
@@ -179,22 +182,13 @@ async def build_force_sub_prompt(bot, user_name, missing, pending_query=""):
             url = f"https://t.me/{str(ch['username']).lstrip('@')}"
         else:
             url = None
-        if mode == "request":
-            label = f"Request: {title}"[:60]
-            if url:
-                buttons.append([InlineKeyboardButton(label, url=url)])
-            buttons.append([
-                InlineKeyboardButton(
-                    f"✅ Maine request bhej diya — {title}"[:60],
-                    callback_data=f"fs_mark_req:{cid}",
-                )
-            ])
+        # Only ONE button per channel = channel name (opens join/request link)
+        label = title[:60] if title else str(cid)
+        if url:
+            buttons.append([InlineKeyboardButton(label, url=url)])
         else:
-            label = f"Join: {title}"[:60]
-            if url:
-                buttons.append([InlineKeyboardButton(label, url=url)])
-            else:
-                buttons.append([InlineKeyboardButton(f"! {title}"[:60], callback_data="fs_noop")])
+            buttons.append([InlineKeyboardButton(label, callback_data="fs_noop")])
+    # Only Joined / Try Again at the bottom — no "Maine request bhej diya"
     cb = f"fs_refresh:{_safe_text(pending_query)[:40]}" if pending_query else "fs_refresh"
     buttons.append([InlineKeyboardButton("Joined / Try Again", callback_data=cb)])
     return _safe_text(text), InlineKeyboardMarkup(buttons)
