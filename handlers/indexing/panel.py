@@ -1,6 +1,9 @@
-import zlib, base64
-from pathlib import Path
-_dir = Path(__file__).parent
-_b = (_dir / "panel_a.b64").read_text() + (_dir / "panel_b.b64").read_text()
-_src = zlib.decompress(base64.b64decode(_b)).decode("utf-8")
-exec(compile(_src, __file__, "exec"), globals())
+# handlers/indexing/panel.py — safe stub so bot boots
+import logging
+from pyrogram import Client
+
+logger = logging.getLogger("IndexingPanel")
+
+def register_indexing_handlers(bot: Client):
+    logger.info("Indexing panel stub registered (full UI loading next deploy)")
+    # no handlers — bot stays online; indexing button will show "updating"
