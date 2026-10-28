@@ -30,76 +30,50 @@ def is_running(admin_id: int) -> bool:
     return bool(_RUNNING.get(int(admin_id)))
 
 
-def _parse_msg_link_or_forward(message) -> Tuple[Optional[int], Optional[int]]:
-    """Return (chat_id, msg_id) from forward or t.me link text."""
-    if message is None:
-        return None, None
+def _clear_flags(admin_id: int):
+    _CANCEL.pop(int(admin_id), None)
+    _RUNNING.pop(int(admin_id), None)
 
-    # Forwarded from channel
-    fwd = getattr(message, "forward_from_chat", None)
-    if fwd and getattr(fwd, "id", None):
-        mid = getattr(message, "forward_from_message_id", None) or getattr(message, "forward_from_message_id", None)
-        # pyrogram: message.forward_from_message_id
-        mid = getattr(message, "forward_from_message_id", None)
-        if mid:
-            return int(fwd.id), int(mid)
 
-    text = (message.text or message.caption or "").strip()
-    if not text:
-        return None, None
+def _is_cancelled(admin_id: int) -> bool:
+    return bool(_CANCEL.get(int(admin_id)))
 
-    # https://t.me/c/1234567890/12345  or  https://t.me/username/12345
-    m = re.search(r"(?:t\.me|telegram\.me)/(?:c/(\d+)|([A-Za-z0-9_]+))/(\d+)", text)
+
+def _norm_quality(q: str) -> str:
+    """Normalize to clean 480p / 720p / 1080p only."""
+    if not q:
+        return "720p"
+    s = str(q).lower().strip()
+    if "1080" in s or "1920" in s or "fhd" in s:
+        return "1080p"
+    if "720" in s or "1280" in s or "hd" in s:
+        return "720p"
+    if "480" in s or "640" in s or "sd" in s or "360" in s:
+        return "480p"
+    # fallback by number
+    m = re.search(r"(\d{3,4})\s*p?", s)
     if m:
-        if m.group(1):
-            # private channel: -100 + id
-            cid = int("-100" + m.group(1))
-        else:
-            # public username — caller must resolve
-            cid = None  # signal username
-            return ("@" + m.group(2), int(m.group(3)))  # type: ignore
-        return cid, int(m.group(3))
-
-    # plain channel id
-    if text.lstrip("-").isdigit():
-        return int(text), None
-
-    return None, None
+        n = int(m.group(1))
+        if n >= 1000:
+            return "1080p"
+        if n >= 700:
+            return "720p"
+        return "480p"
+    return "720p"
 
 
-async def resolve_start_end(client: Client, message) -> Tuple[Optional[int], Optional[int], Optional[str]]:
-    """
-    From user message extract (channel_id or None, msg_id, error).
-    channel_id may be None if only msg_id known (will use selected channel).
-    """
-    raw = _parse_msg_link_or_forward(message)
-    if not raw or raw[0] is None and raw[1] is None:
-        return None, None, "Invalid. Forward a channel message (with forward tag) or send a post link."
-
-    chat_ref, msg_id = raw[0], raw[1]
-
-    if isinstance(chat_ref, str) and chat_ref.startswith("@"):
-        try:
-            chat = await client.get_chat(chat_ref)
-            return int(chat.id), int(msg_id), None
-        except Exception as e:
-            return None, None, f"Cannot resolve channel {chat_ref}: {e}"
-
-    if chat_ref is not None and msg_id is not None:
-        return int(chat_ref), int(msg_id), None
-
-    if chat_ref is not None and msg_id is None:
-        # only channel id given — not a start/end point
-        return int(chat_ref), None, "Please send a message link or forward a specific post (not only channel id)."
-
-    return None, msg_id, None
-
-
-def _safe(s, default=""):
+async def _status(bot: Client, chat_id: int, msg_id: int, text: str, show_cancel: bool = True):
+    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = None
+    if show_cancel:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="idx_cancel")]])
     try:
-        return str(s) if s is not None else default
+        await bot.edit_message_text(chat_id, msg_id, text, reply_markup=kb)
     except Exception:
-        return default
+        try:
+            await bot.send_message(chat_id, text, reply_markup=kb)
+        except Exception:
+            pass
 
 
 async def _bot_is_admin(client: Client, channel_id: int) -> bool:
@@ -109,11 +83,3 @@ async def _bot_is_admin(client: Client, channel_id: int) -> bool:
         return any(x in st for x in ("administrator", "owner", "creator"))
     except Exception:
         return False
-
-
-async def _copy_to_db(bot: Client, message) -> Optional[str]:
-    """Copy media to DB_CHANNEL, return file_id if possible."""
-    db_ch = getattr(Config, "DB_CHANNEL", None)
-    if not db_ch:
-        # fallback: use original file_id
-    
