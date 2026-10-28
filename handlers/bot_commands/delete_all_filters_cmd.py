@@ -4,13 +4,13 @@
 # Group me command → admin command delete → Yes/No confirm
 #   Yes → saare filters delete
 #   No  → cancel
-# Unique name so purane moderation handler se clash na ho.
 # ==============================================================================
 
 import logging
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType, ChatMemberStatus
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import QueryIdInvalid
 
 from configs import Config
 from handlers.database import db
@@ -27,33 +27,7 @@ CONFIRM_TEXT = (
 async def _is_authorized(client: Client, message: Message) -> bool:
     if not message.from_user:
         return False
-    user_id = message.from_user.id
-
-    try:
-        from handlers.admins_db import sync_admins_to_config
-        await sync_admins_to_config()
-    except Exception:
-        pass
-
-    try:
-        if user_id in (Config.ADMINS or set()):
-            return True
-    except Exception:
-        pass
-
-    try:
-        if message.chat and message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-            member = await client.get_chat_member(message.chat.id, user_id)
-            st = member.status
-            if st in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-                return True
-            st_s = str(getattr(st, "value", st) or st).lower()
-            if any(x in st_s for x in ("administrator", "owner", "creator")):
-                return True
-    except Exception as e:
-        logger.debug("delete_all_filters admin check: %s", e)
-
-    return False
+    return await _is_authorized_uid(client, message.chat.id, message.from_user.id)
 
 
 async def _is_authorized_uid(client: Client, chat_id: int, user_id: int) -> bool:
@@ -84,7 +58,6 @@ async def _is_authorized_uid(client: Client, chat_id: int, user_id: int) -> bool
 
 
 async def _wipe_all_filters() -> int:
-    """Delete every movie/filter. Returns count removed."""
     count = 0
     try:
         if getattr(db, "has_mongo", False) and getattr(db, "movies_col", None) is not None:
@@ -106,6 +79,15 @@ async def _wipe_all_filters() -> int:
     return int(count or 0)
 
 
+async def _safe_answer(query: CallbackQuery, text: str = "", show_alert: bool = False):
+    try:
+        await query.answer(text, show_alert=show_alert)
+    except QueryIdInvalid:
+        pass
+    except Exception:
+        pass
+
+
 def register_delete_all_filters_command(bot: Client):
     """Register /delete_all_filters with Yes/No confirmation."""
 
@@ -122,17 +104,18 @@ def register_delete_all_filters_command(bot: Client):
             if not await _is_authorized(client, message):
                 return
 
-            admin_id = message.from_user.id
+            admin_id = int(message.from_user.id)
 
             try:
                 await message.delete()
             except Exception as e:
                 logger.warning("delete_all_filters: delete cmd failed: %s", e)
 
+            # Underscore format — no colon (avoids parse issues)
             kb = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("Yes", callback_data=f"daf_yes:{admin_id}"),
-                    InlineKeyboardButton("No", callback_data=f"daf_no:{admin_id}"),
+                    InlineKeyboardButton("Yes", callback_data=f"dafyes_{admin_id}"),
+                    InlineKeyboardButton("No", callback_data=f"dafno_{admin_id}"),
                 ]
             ])
             try:
@@ -147,33 +130,63 @@ def register_delete_all_filters_command(bot: Client):
         except Exception as e:
             logger.exception("delete_all_filters_handler: %s", e)
 
-    @bot.on_callback_query(filters.regex(r"^daf_(yes|no):(\d+)$"))
+    # group=-5 → runs BEFORE session_callbacks catch-all (group=0)
+    @bot.on_callback_query(group=-5)
     async def delete_all_filters_callback(client: Client, query: CallbackQuery):
+        data = (query.data or "").strip()
+        if not (data.startswith("dafyes_") or data.startswith("dafno_") or data.startswith("daf_")):
+            return  # not our button — let other handlers run
+
         try:
-            data = query.data or ""
-            parts = data.split(":", 1)
-            if len(parts) != 2:
-                await query.answer()
-                return
-            action, owner_s = parts[0], parts[1]
-            try:
-                owner_id = int(owner_s)
-            except ValueError:
-                await query.answer()
+            logger.info("delete_all_filters callback data=%s user=%s", data, getattr(query.from_user, "id", None))
+
+            action = None
+            owner_id = None
+
+            if data.startswith("dafyes_"):
+                action = "yes"
+                try:
+                    owner_id = int(data.split("_", 1)[1])
+                except Exception:
+                    owner_id = None
+            elif data.startswith("dafno_"):
+                action = "no"
+                try:
+                    owner_id = int(data.split("_", 1)[1])
+                except Exception:
+                    owner_id = None
+            elif data.startswith("daf_yes:") or data.startswith("daf_yes_"):
+                action = "yes"
+                try:
+                    owner_id = int(data.replace("daf_yes:", "").replace("daf_yes_", ""))
+                except Exception:
+                    owner_id = None
+            elif data.startswith("daf_no:") or data.startswith("daf_no_"):
+                action = "no"
+                try:
+                    owner_id = int(data.replace("daf_no:", "").replace("daf_no_", ""))
+                except Exception:
+                    owner_id = None
+
+            if action is None:
                 return
 
             clicker = query.from_user.id if query.from_user else 0
+            chat_id = query.message.chat.id if query.message else 0
 
-            if clicker != owner_id:
-                if not await _is_authorized_uid(client, query.message.chat.id, clicker):
-                    await query.answer("Only admin can confirm.", show_alert=True)
-                    return
+            # Owner of the prompt OR any authorized admin can click
+            allowed = False
+            if owner_id and clicker == owner_id:
+                allowed = True
+            if not allowed:
+                allowed = await _is_authorized_uid(client, chat_id, clicker)
 
-            if not await _is_authorized_uid(client, query.message.chat.id, clicker):
-                await query.answer("Not authorized.", show_alert=True)
+            if not allowed:
+                await _safe_answer(query, "Only admin can confirm.", show_alert=True)
                 return
 
-            if action == "daf_no":
+            if action == "no":
+                await _safe_answer(query, "Cancelled")
                 try:
                     await query.message.edit_text("Cancelled. No filters were deleted.")
                 except Exception:
@@ -181,29 +194,22 @@ def register_delete_all_filters_command(bot: Client):
                         await query.message.delete()
                     except Exception:
                         pass
-                await query.answer("Cancelled")
                 return
 
-            await query.answer("Deleting all filters...")
+            # action == yes
+            await _safe_answer(query, "Deleting all filters...")
             count = await _wipe_all_filters()
+            text = f"All filters deleted.\n\nTotal removed: {count}"
             try:
-                await query.message.edit_text(
-                    f"All filters deleted.\n\nTotal removed: {count}"
-                )
+                await query.message.edit_text(text)
             except Exception:
                 try:
-                    await client.send_message(
-                        query.message.chat.id,
-                        f"All filters deleted.\n\nTotal removed: {count}",
-                    )
+                    await client.send_message(chat_id, text)
                 except Exception as e:
                     logger.error("delete_all_filters: result send failed: %s", e)
 
         except Exception as e:
             logger.exception("delete_all_filters_callback: %s", e)
-            try:
-                await query.answer("Error", show_alert=True)
-            except Exception:
-                pass
+            await _safe_answer(query, "Error occurred", show_alert=True)
 
-    logger.info("/delete_all_filters registered (Yes/No confirm)")
+    logger.info("/delete_all_filters registered (Yes/No confirm, callback group=-5)")
