@@ -162,6 +162,14 @@ try:
 except Exception as e:
     logger.error(f"delete_all_filters_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
+# Indexing system (handlers/indexing) — fail-safe
+try:
+    from handlers.indexing import register_indexing_handlers
+    register_indexing_handlers(Bot)
+    logger.info("Indexing handlers registered")
+except Exception as e:
+    logger.error(f"indexing register failed (bot still runs): {type(e).__name__}: {e}")
+
 # Admin Panel (Force Sub UI) — fail-safe so bot still boots if panel has issue
 try:
     from handlers.admin_panel import register_admin_panel_handlers
