@@ -1,0 +1,119 @@
+# =============================================================================
+# handlers/indexing/worker.py — scan channel range, save movies, post posters
+# =============================================================================
+import asyncio
+import logging
+import re
+from typing import Optional, Tuple
+
+from pyrogram import Client
+from pyrogram.errors import FloodWait
+
+from configs import Config
+from handlers.database import db
+from handlers.parser import extract_movie_metadata, format_size
+from handlers.movie_card import build_final_movie_card_text, build_final_movie_card_buttons
+
+logger = logging.getLogger("IndexingWorker")
+
+# admin_id -> cancel flag
+_CANCEL: dict = {}
+# admin_id -> running flag
+_RUNNING: dict = {}
+
+
+def request_cancel(admin_id: int):
+    _CANCEL[int(admin_id)] = True
+
+
+def is_running(admin_id: int) -> bool:
+    return bool(_RUNNING.get(int(admin_id)))
+
+
+def _parse_msg_link_or_forward(message) -> Tuple[Optional[int], Optional[int]]:
+    """Return (chat_id, msg_id) from forward or t.me link text."""
+    if message is None:
+        return None, None
+
+    # Forwarded from channel
+    fwd = getattr(message, "forward_from_chat", None)
+    if fwd and getattr(fwd, "id", None):
+        mid = getattr(message, "forward_from_message_id", None) or getattr(message, "forward_from_message_id", None)
+        # pyrogram: message.forward_from_message_id
+        mid = getattr(message, "forward_from_message_id", None)
+        if mid:
+            return int(fwd.id), int(mid)
+
+    text = (message.text or message.caption or "").strip()
+    if not text:
+        return None, None
+
+    # https://t.me/c/1234567890/12345  or  https://t.me/username/12345
+    m = re.search(r"(?:t\.me|telegram\.me)/(?:c/(\d+)|([A-Za-z0-9_]+))/(\d+)", text)
+    if m:
+        if m.group(1):
+            # private channel: -100 + id
+            cid = int("-100" + m.group(1))
+        else:
+            # public username — caller must resolve
+            cid = None  # signal username
+            return ("@" + m.group(2), int(m.group(3)))  # type: ignore
+        return cid, int(m.group(3))
+
+    # plain channel id
+    if text.lstrip("-").isdigit():
+        return int(text), None
+
+    return None, None
+
+
+async def resolve_start_end(client: Client, message) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    """
+    From user message extract (channel_id or None, msg_id, error).
+    channel_id may be None if only msg_id known (will use selected channel).
+    """
+    raw = _parse_msg_link_or_forward(message)
+    if not raw or raw[0] is None and raw[1] is None:
+        return None, None, "Invalid. Forward a channel message (with forward tag) or send a post link."
+
+    chat_ref, msg_id = raw[0], raw[1]
+
+    if isinstance(chat_ref, str) and chat_ref.startswith("@"):
+        try:
+            chat = await client.get_chat(chat_ref)
+            return int(chat.id), int(msg_id), None
+        except Exception as e:
+            return None, None, f"Cannot resolve channel {chat_ref}: {e}"
+
+    if chat_ref is not None and msg_id is not None:
+        return int(chat_ref), int(msg_id), None
+
+    if chat_ref is not None and msg_id is None:
+        # only channel id given — not a start/end point
+        return int(chat_ref), None, "Please send a message link or forward a specific post (not only channel id)."
+
+    return None, msg_id, None
+
+
+def _safe(s, default=""):
+    try:
+        return str(s) if s is not None else default
+    except Exception:
+        return default
+
+
+async def _bot_is_admin(client: Client, channel_id: int) -> bool:
+    try:
+        m = await client.get_chat_member(channel_id, "me")
+        st = str(getattr(m.status, "value", m.status) or m.status).lower()
+        return any(x in st for x in ("administrator", "owner", "creator"))
+    except Exception:
+        return False
+
+
+async def _copy_to_db(bot: Client, message) -> Optional[str]:
+    """Copy media to DB_CHANNEL, return file_id if possible."""
+    db_ch = getattr(Config, "DB_CHANNEL", None)
+    if not db_ch:
+        # fallback: use original file_id
+    
