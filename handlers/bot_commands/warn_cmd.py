@@ -1,6 +1,6 @@
 # ==============================================================================
 # handlers/bot_commands/warn_cmd.py
-# /warn — reply + reason; 3 warns = group suspend; admin cmd auto-delete
+# /warn — reply + reason; 3 warns = ban/restrict; admin cmd auto-delete
 # ==============================================================================
 
 import asyncio
@@ -17,6 +17,8 @@ logger = logging.getLogger("WarnCmd")
 
 # user_id -> list of {"reason": str, "by": int, "at": str}
 _WARNS: dict = {}
+# users who hit 3 warns and must not message (chat_id, user_id)
+_SUSPENDED: set = set()  # (chat_id, user_id)
 
 
 def _is_config_admin(user_id: int) -> bool:
@@ -81,7 +83,64 @@ async def _delete_later(client: Client, chat_id: int, msg_ids: list, seconds: in
         pass
 
 
+async def _force_mute(client: Client, chat_id: int, uid: int) -> str:
+    errors = []
+    try:
+        await client.restrict_chat_member(
+            chat_id,
+            uid,
+            permissions=_mute_permissions(),
+        )
+        try:
+            m = await client.get_chat_member(chat_id, uid)
+            perms = getattr(m, "permissions", None)
+            if perms is not None and getattr(perms, "can_send_messages", True) is False:
+                return "muted"
+        except Exception:
+            return "muted"
+    except Exception as e:
+        errors.append(f"restrict:{type(e).__name__}")
+        logger.warning("restrict fail uid=%s: %s", uid, e)
+
+    try:
+        await client.ban_chat_member(chat_id, uid)
+        return "banned"
+    except Exception as e:
+        errors.append(f"ban:{type(e).__name__}")
+        logger.warning("ban fail uid=%s: %s", uid, e)
+
+    return "FAIL:" + ",".join(errors)
+
+
 def register_warn_command(bot: Client):
+
+    @bot.on_message(filters.group & ~filters.service, group=-20)
+    async def suspend_watch(client: Client, message: Message):
+        try:
+            if not message.from_user or message.from_user.is_bot:
+                return
+            key = (message.chat.id, message.from_user.id)
+            if key not in _SUSPENDED:
+                return
+            if _is_config_admin(message.from_user.id):
+                return
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            try:
+                await client.restrict_chat_member(
+                    message.chat.id,
+                    message.from_user.id,
+                    permissions=_mute_permissions(),
+                )
+            except Exception:
+                try:
+                    await client.ban_chat_member(message.chat.id, message.from_user.id)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug("suspend_watch: %s", e)
 
     @bot.on_message(filters.command("warn") & filters.group, group=-12)
     async def warn_cmd(client: Client, message: Message):
@@ -97,7 +156,6 @@ def register_warn_command(bot: Client):
 
             replied = message.reply_to_message
 
-            # always delete admin /warn command
             try:
                 await message.delete()
             except Exception:
@@ -118,7 +176,6 @@ def register_warn_command(bot: Client):
             if target.is_bot or _is_config_admin(target.id):
                 return
 
-            # don't warn group admins
             try:
                 tm = await client.get_chat_member(chat_id, target.id)
                 st = tm.status
@@ -144,7 +201,6 @@ def register_warn_command(bot: Client):
             lst.append(entry)
             count = len(lst)
 
-            # try persist in db if available (best-effort)
             try:
                 from handlers.database import db
                 if hasattr(db, "add_warning"):
@@ -153,20 +209,22 @@ def register_warn_command(bot: Client):
                 logger.debug("db warn: %s", e)
 
             if count >= 3:
-                # suspend — cannot send messages in group
-                try:
-                    await client.restrict_chat_member(
-                        chat_id,
-                        uid,
-                        permissions=_mute_permissions(),
-                    )
-                except Exception as e:
-                    logger.warning("restrict on 3 warn: %s", e)
+                status = await _force_mute(client, chat_id, uid)
+                _SUSPENDED.add((chat_id, uid))
 
                 lines = []
                 for i, w in enumerate(lst[:10], 1):
                     lines.append(f"{i}. <code>{w.get('reason', '-')}</code>")
                 warns_block = "\n".join(lines)
+
+                if status.startswith("FAIL"):
+                    extra = (
+                        f"\n\n\u26a0\ufe0f <b>Bot mute/ban nahi laga paya</b> ({status}).\n"
+                        f"Group settings me bot ko <b>Ban users</b> + "
+                        f"<b>Restrict members</b> permission do."
+                    )
+                else:
+                    extra = f"\n\nAction: <b>{status.upper()}</b>"
 
                 text = (
                     f"\U0001f6ab <b>AAP SUSPEND HO GAYE</b>\n\n"
@@ -174,7 +232,8 @@ def register_warn_command(bot: Client):
                     f"Warnings: <b>{count}/3</b>\n\n"
                     f"<b>Aapko di gayi warnings:</b>\n{warns_block}\n\n"
                     f"Ab aap is group me message nahi kar sakte.\n"
-                    f"Unban ke liye admin se baat karo: <code>/unbanlink {uid}</code>"
+                    f"Unban: <code>/unbanlink {uid}</code>"
+                    f"{extra}"
                 )
             else:
                 text = (
@@ -202,5 +261,33 @@ def register_warn_command(bot: Client):
 
         except Exception as e:
             logger.exception("warn_cmd: %s", e)
+
+    @bot.on_message(
+        filters.command(["unbanlink", "ulink", "unban_link"]) & filters.group,
+        group=-11,
+    )
+    async def warn_clear_on_unban(client: Client, message: Message):
+        try:
+            if not message.from_user:
+                return
+            if not await _is_admin(client, message):
+                return
+            target_id = None
+            if message.reply_to_message and message.reply_to_message.from_user:
+                target_id = message.reply_to_message.from_user.id
+            else:
+                parts = (message.text or "").split()
+                if len(parts) >= 2:
+                    try:
+                        target_id = int(parts[1].strip())
+                    except Exception:
+                        pass
+            if target_id:
+                _WARNS.pop(target_id, None)
+                for key in list(_SUSPENDED):
+                    if key[1] == target_id:
+                        _SUSPENDED.discard(key)
+        except Exception:
+            pass
 
     logger.info("/warn command registered (bot_commands)")
