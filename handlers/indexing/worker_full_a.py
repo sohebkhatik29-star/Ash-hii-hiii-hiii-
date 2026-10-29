@@ -36,6 +36,38 @@ def _norm_quality(q: str) -> str:
         return "480p"
     return "720p"
 
+_ALLOWED_Q = ("480p", "720p", "1080p")
+
+
+async def _prune_qualities(movie_id: str, keep_key: str = None):
+    """Only 480p / 720p / 1080p — one slot each. Same res always overwrites."""
+    try:
+        mov = await db.get_movie(movie_id)
+        if not mov:
+            return
+        quals = dict(mov.get("qualities") or {})
+        if not quals:
+            return
+        cleaned = {}
+        for k, v in quals.items():
+            nk = _norm_quality(str(k))
+            if nk not in _ALLOWED_Q:
+                continue
+            cleaned[nk] = v
+        if keep_key and keep_key in _ALLOWED_Q and keep_key in quals:
+            cleaned[keep_key] = quals[keep_key]
+        if cleaned == quals:
+            return
+        if getattr(db, "movies_col", None) is not None:
+            await db.movies_col.update_one(
+                {"movie_id": movie_id},
+                {"$set": {"qualities": cleaned}},
+            )
+        if getattr(db, "_mem_movies", None) is not None and movie_id in db._mem_movies:
+            db._mem_movies[movie_id]["qualities"] = cleaned
+    except Exception as e:
+        logger.warning("prune_qualities: %s", e)
+
 
 def _safe(t: str) -> str:
     if not t:
@@ -260,7 +292,7 @@ async def run_indexing(
             if not title:
                 continue
 
-            quality_key = final_quality
+            quality_key = final_quality  # only 480p / 720p / 1080p
             norm = re.sub(r"[^\w\s]", " ", title.lower())
             norm = re.sub(r"\s+", " ", norm).strip()
             key = (norm, year)
@@ -332,6 +364,7 @@ async def run_indexing(
             }
             try:
                 ok = await db.add_quality_to_movie(movie_id, quality_key, quality_data)
+                await _prune_qualities(movie_id, keep_key=quality_key)
                 if ok:
                     saved += 1
                 else:
