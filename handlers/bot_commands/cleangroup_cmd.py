@@ -13,7 +13,7 @@ try:
 except Exception:
     ChatMembersFilter = None
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import FloodWait, QueryIdInvalid, MessageDeleteForbidden, ChatAdminRequired
+from pyrogram.errors import FloodWait, QueryIdInvalid
 
 from configs import Config
 
@@ -26,6 +26,8 @@ _RUNNING: dict = {}
 async def _safe_answer(query: CallbackQuery, text: str = "", show_alert: bool = False):
     try:
         await query.answer(text, show_alert=show_alert)
+    except QueryIdInvalid:
+        pass
     except Exception:
         pass
 
@@ -55,7 +57,7 @@ async def _is_admin(client: Client, chat_id: int, user_id: int) -> bool:
         if any(x in s for x in ("administrator", "owner", "creator")):
             return True
     except Exception as e:
-        logger.warning("is_admin check: %s", e)
+        logger.warning("is_admin: %s", e)
     return False
 
 
@@ -134,7 +136,7 @@ async def _run_clean(client: Client, chat_id: int, mode: str, status_msg: Messag
                     skipped += 1
                 else:
                     do_del = True
-            else:  # users
+            else:
                 if bot_id and uid == bot_id:
                     skipped += 1
                 elif owner_id and uid == owner_id:
@@ -206,9 +208,9 @@ def register_cleangroup_command(bot: Client):
     )
     async def cleangroup_cmd(client: Client, message: Message):
         logger.info(
-            "cleangroup received chat=%s user=%s",
-            message.chat.id if message.chat else None,
-            message.from_user.id if message.from_user else None,
+            "cleangroup cmd chat=%s user=%s",
+            getattr(message.chat, "id", None),
+            getattr(message.from_user, "id", None),
         )
         try:
             if not message.from_user or not message.chat:
@@ -225,12 +227,12 @@ def register_cleangroup_command(bot: Client):
                 return
 
             if _RUNNING.get(chat_id):
-                await message.reply_text("⏳ Clean pehle se chal raha hai. Ruko ya Cancel dabao.")
+                await message.reply_text("⏳ Clean pehle se chal raha hai.")
                 return
 
             if not await _bot_can_delete(client, chat_id):
                 await message.reply_text(
-                    "❌ Bot ko Admin + Delete messages permission do group me."
+                    "❌ Bot ko Admin + Delete messages permission do."
                 )
                 return
 
@@ -260,41 +262,70 @@ def register_cleangroup_command(bot: Client):
             except Exception:
                 pass
 
-    @bot.on_callback_query(filters.regex(r"^cg_(users|uo|all|no):"), group=-5)
-    async def cleangroup_cb(client: Client, query: CallbackQuery):
+    # group=-15 runs BEFORE session_callbacks catch-all (group 0)
+    @bot.on_callback_query(group=-15)
+    async def cleangroup_cb_router(client: Client, query: CallbackQuery):
+        data = query.data or ""
+        if not data.startswith("cg_"):
+            return
+
+        logger.info("cleangroup callback data=%s", data)
         try:
-            data = query.data or ""
-            action, _, owner_s = data.partition(":")
+            if ":" in data:
+                action, owner_s = data.split(":", 1)
+            else:
+                action, owner_s = data, ""
             try:
-                owner_id = int(owner_s)
+                owner_id = int(owner_s) if owner_s else None
             except Exception:
                 owner_id = None
+
             clicker = query.from_user.id if query.from_user else 0
             chat_id = query.message.chat.id if query.message else 0
 
             if not (clicker == owner_id or await _is_admin(client, chat_id, clicker)):
-                await _safe_answer(query, "Only admin", show_alert=True)
+                await _safe_answer(query, "Only admin can use this.", show_alert=True)
                 return
 
             if action == "cg_no":
                 await _safe_answer(query, "Cancelled")
                 try:
-                    await query.message.edit_text("❌ Cancelled.")
+                    await query.message.edit_text("❌ Cancelled. Kuch delete nahi hua.")
                 except Exception:
                     pass
                 return
 
-            mode = {"cg_users": "users", "cg_uo": "users_owner", "cg_all": "all"}.get(action)
-            if not mode:
+            if action == "cg_stop":
+                _CANCEL[chat_id] = True
+                await _safe_answer(query, "Cancelling...")
+                try:
+                    await query.message.edit_text("⏹ Cancelling clean...")
+                except Exception:
+                    pass
                 return
+
+            mode = {
+                "cg_users": "users",
+                "cg_uo": "users_owner",
+                "cg_all": "all",
+            }.get(action)
+            if not mode:
+                await _safe_answer(query, "Unknown action")
+                return
+
             if _RUNNING.get(chat_id):
                 await _safe_answer(query, "Already running", show_alert=True)
                 return
+
             if not await _bot_can_delete(client, chat_id):
-                await _safe_answer(query, "Need delete permission", show_alert=True)
+                await _safe_answer(
+                    query,
+                    "Bot needs Delete messages permission",
+                    show_alert=True,
+                )
                 return
 
-            await _safe_answer(query, "Starting...")
+            await _safe_answer(query, "Starting clean...")
             try:
                 await query.message.edit_text(
                     f"🧹 Cleaning...\nMode: {_label(mode)}\nDeleted: 0\nSkipped: 0",
@@ -302,28 +333,12 @@ def register_cleangroup_command(bot: Client):
                         [InlineKeyboardButton("⏹ Cancel Clean", callback_data=f"cg_stop:{clicker}")]
                     ]),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("edit status: %s", e)
+
             asyncio.create_task(_run_clean(client, chat_id, mode, query.message))
         except Exception as e:
             logger.exception("cleangroup_cb: %s", e)
-            await _safe_answer(query, "Error", show_alert=True)
+            await _safe_answer(query, f"Error: {type(e).__name__}", show_alert=True)
 
-    @bot.on_callback_query(filters.regex(r"^cg_stop:"), group=-5)
-    async def cleangroup_stop(client: Client, query: CallbackQuery):
-        try:
-            chat_id = query.message.chat.id if query.message else 0
-            clicker = query.from_user.id if query.from_user else 0
-            if not await _is_admin(client, chat_id, clicker):
-                await _safe_answer(query, "Only admin", show_alert=True)
-                return
-            _CANCEL[chat_id] = True
-            await _safe_answer(query, "Cancelling...")
-            try:
-                await query.message.edit_text("⏹ Cancelling...")
-            except Exception:
-                pass
-        except Exception as e:
-            logger.exception("cleangroup_stop: %s", e)
-
-    logger.info("/cleangroup + /purgeall + /cleangrp registered (group=-3)")
+    logger.info("/cleangroup registered (cmd group=-3, cb group=-15)")
