@@ -43,7 +43,7 @@ def register_start_handlers(bot: Client):
                 first_name=safe_name,
                 user_id=user_id
             )
-            channel_url = f"https://t.me/{Config.UPDATES_CHANNEL}" if Config.UPDATES_CHANNEL and not str(Config.UPDATES_CHANNEL).startswith("-") else f"https://t.me/{Config.BOT_USERNAME}"
+            channel_url = "https://t.me/ash_movie_1782"
             rows = [
                 [
                     InlineKeyboardButton("📢 Updates Channel", url=channel_url),
@@ -60,59 +60,55 @@ def register_start_handlers(bot: Client):
             await cmd.reply_text(welcome_text, reply_markup=markup, quote=True, disable_web_page_preview=True)
             return
 
-        # 2. Deep Link Payload Processing
+        # 2. Deep Link Handling
         payload = parts[1].strip()
-
-        if payload.startswith("f_"):
-            try:
-                msg_id = int(payload.split("f_", 1)[-1])
-                await send_media_and_reply(client, user_id=user_id, file_id=msg_id)
-                return
-            except Exception as e:
-                logger.error(f"Error handling f_ deep link: {e}")
-
-        if payload.startswith("dl_"):
-            dl_parts = payload.split("_", 2)
-            if len(dl_parts) >= 3:
-                movie_id = dl_parts[1]
-                quality = dl_parts[2]
-                await deliver_movie_quality_direct(client, user_id=user_id, movie_id=movie_id, quality=quality)
-                return
-
-        if payload.startswith("mov_"):
-            movie_id = payload.split("mov_", 1)[-1]
-            is_admin = user_id in Config.ADMINS
-            await send_movie_card(client, user_id=user_id, movie_id=movie_id, is_admin=is_admin)
-            return
-
         try:
+            # Movie card: m_<id>
+            if payload.startswith("m_"):
+                movie_id = payload[2:]
+                is_admin = user_id in (Config.ADMINS or [])
+                await send_movie_card(client, user_id=user_id, movie_id=movie_id, is_admin=is_admin)
+                return
+
+            # Direct file: f_<msg_id>
+            if payload.startswith("f_"):
+                try:
+                    msg_id = int(payload[2:])
+                    await send_media_and_reply(client, user_id=user_id, file_id=msg_id)
+                except Exception as e:
+                    logger.error(f"deep f_ error: {e}")
+                    await cmd.reply_text("File deliver fail. Retry later.")
+                return
+
+            # Quality: q_<movie_id>_<quality>
+            if payload.startswith("q_"):
+                rest = payload[2:]
+                if "_" in rest:
+                    mid, quality = rest.rsplit("_", 1)
+                    await deliver_movie_quality_direct(client, cmd, mid, quality)
+                return
+
+            # Base64 legacy
             try:
-                file_id_str = b64_to_str(payload)
+                decoded = b64_to_str(payload)
+                if decoded:
+                    if decoded.startswith("m_"):
+                        movie_id = decoded[2:]
+                        is_admin = user_id in (Config.ADMINS or [])
+                        await send_movie_card(client, user_id=user_id, movie_id=movie_id, is_admin=is_admin)
+                        return
             except Exception:
-                file_id_str = payload
+                pass
 
-            if file_id_str.startswith("batch_"):
-                parts_ids = file_id_str.split("_")
-                first_id = int(parts_ids[1])
-                last_id = int(parts_ids[2])
-                for msg_id in range(first_id, last_id + 1):
-                    await send_media_and_reply(client, user_id, msg_id)
-            else:
-                file_id = int(file_id_str.split("_")[-1])
-                await send_media_and_reply(client, user_id, file_id)
+            await cmd.reply_text("Invalid link. /start dabao.")
         except Exception as e:
-            logger.error(f"Failed to handle deep link payload: {e}")
-            await cmd.reply_text("❌ **Invalid ya Expired Link!** Kripya sahi link use karein.", quote=True)
+            logger.exception("start deep link: %s", e)
+            await cmd.reply_text("Error. /start se dubara try karo.")
 
-
-    @bot.on_callback_query(filters.regex(r"^(about_bot|about_dev|close_card)$"))
-    async def start_menu_callbacks(client: Client, query: CallbackQuery):
+    @bot.on_callback_query(filters.regex(r"^(about_bot|about_dev)$"))
+    async def about_cb(client: Client, query: CallbackQuery):
         data = query.data or ""
         try:
-            if data == "close_card":
-                await query.message.delete()
-                await query.answer()
-                return
             if data == "about_bot":
                 await query.message.edit_text(
                     Config.ABOUT_BOT_TEXT,
@@ -149,7 +145,7 @@ def register_start_handlers(bot: Client):
             first_name=safe_name,
             user_id=user_id,
         )
-        channel_url = f"https://t.me/{Config.UPDATES_CHANNEL}" if Config.UPDATES_CHANNEL and not str(Config.UPDATES_CHANNEL).startswith("-") else f"https://t.me/{Config.BOT_USERNAME}"
+        channel_url = "https://t.me/ash_movie_1782"
         rows = [
             [
                 InlineKeyboardButton("📢 Updates Channel", url=channel_url),
