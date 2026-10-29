@@ -2,7 +2,7 @@
 # handlers/bot_commands/cleangroup_cmd.py
 # /cleangroup  |  /purgeall | /cleangrp
 # Group clean with mode buttons. Admin only.
-# NOTE: Bots cannot use get_chat_history. We walk message IDs via get_messages.
+# Bots cannot use get_chat_history — use get_messages / direct delete by IDs.
 # ==============================================================================
 
 import asyncio
@@ -23,8 +23,7 @@ logger = logging.getLogger("CleanGroupCmd")
 _CANCEL: dict = {}
 _RUNNING: dict = {}
 
-# How far back (by message id) to scan. ~3000 is usually enough for busy groups.
-MAX_SCAN = 3000
+MAX_SCAN = 5000
 BATCH_SIZE = 100
 
 
@@ -109,141 +108,93 @@ def _label(mode: str) -> str:
     }.get(mode, mode)
 
 
-async def _run_clean(client: Client, chat_id: int, mode: str, status_msg: Message):
-    """
-    Bot-safe clean: walk message IDs backwards with get_messages (allowed for bots).
-    get_chat_history is NOT allowed for bots (BOT_METHOD_INVALID).
-    """
+async def _delete_ids(client: Client, chat_id: int, ids: list) -> tuple:
+    """Try batch delete; on failure try one-by-one. Returns (deleted, failed)."""
+    if not ids:
+        return 0, 0
+    try:
+        await client.delete_messages(chat_id, ids)
+        return len(ids), 0
+    except FloodWait as e:
+        await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
+        try:
+            await client.delete_messages(chat_id, ids)
+            return len(ids), 0
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("batch delete fail (%s): %s", len(ids), e)
+
+    deleted = failed = 0
+    for mid in ids:
+        try:
+            await client.delete_messages(chat_id, mid)
+            deleted += 1
+        except FloodWait as e:
+            await asyncio.sleep(int(getattr(e, "value", 3)) + 1)
+            try:
+                await client.delete_messages(chat_id, mid)
+                deleted += 1
+            except Exception:
+                failed += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+    return deleted, failed
+
+
+async def _run_clean_all(client: Client, chat_id: int, status_msg: Message):
+    """Delete ALL — no get_messages needed, just wipe ID ranges."""
     _RUNNING[chat_id] = True
     _CANCEL[chat_id] = False
-    deleted = skipped = scanned = 0
-    bot_id = None
-    try:
-        bot_id = (await client.get_me()).id
-    except Exception:
-        pass
-    owner_id = None
-    if mode in ("users", "users_owner"):
-        owner_id = await _get_owner_id(client, chat_id)
-
+    deleted = failed = 0
     top_id = int(getattr(status_msg, "id", 0) or 0)
     if top_id <= 1:
         try:
-            await status_msg.edit_text("❌ Status message id nahi mili. Dubara /cleangroup try karo.")
+            await status_msg.edit_text("❌ Status id missing. Dubara /cleangroup.")
         except Exception:
             pass
         _RUNNING[chat_id] = False
         return
 
     lowest = max(1, top_id - MAX_SCAN)
-    batch_to_delete = []
+    current = top_id - 1
+    tried = 0
 
     try:
-        current = top_id - 1
         while current >= lowest:
             if _CANCEL.get(chat_id):
                 break
-
             ids = []
             for _ in range(BATCH_SIZE):
                 if current < lowest:
                     break
-                if current != top_id:
-                    ids.append(current)
+                ids.append(current)
                 current -= 1
-
             if not ids:
                 break
 
+            tried += len(ids)
+            d, f = await _delete_ids(client, chat_id, ids)
+            deleted += d
+            failed += f
+
             try:
-                msgs = await client.get_messages(chat_id, ids)
-            except FloodWait as e:
-                await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
-                try:
-                    msgs = await client.get_messages(chat_id, ids)
-                except Exception as e2:
-                    logger.warning("get_messages flood retry: %s", e2)
-                    skipped += len(ids)
-                    continue
-            except Exception as e:
-                logger.warning("get_messages: %s", e)
-                skipped += len(ids)
-                await asyncio.sleep(0.2)
-                continue
-
-            if not isinstance(msgs, list):
-                msgs = [msgs]
-
-            for msg in msgs:
-                if msg is None:
-                    skipped += 1
-                    continue
-                if getattr(msg, "empty", False):
-                    skipped += 1
-                    continue
-
-                scanned += 1
-                uid = msg.from_user.id if msg.from_user else None
-                do_del = False
-
-                if mode == "all":
-                    do_del = True
-                elif mode == "users_owner":
-                    if bot_id and uid == bot_id:
-                        skipped += 1
-                    else:
-                        do_del = True
-                else:
-                    if bot_id and uid == bot_id:
-                        skipped += 1
-                    elif owner_id and uid == owner_id:
-                        skipped += 1
-                    else:
-                        do_del = True
-
-                if do_del and msg.id != top_id:
-                    batch_to_delete.append(msg.id)
-
-            if len(batch_to_delete) >= BATCH_SIZE:
-                try:
-                    await client.delete_messages(chat_id, batch_to_delete)
-                    deleted += len(batch_to_delete)
-                except FloodWait as e:
-                    await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
-                    try:
-                        await client.delete_messages(chat_id, batch_to_delete)
-                        deleted += len(batch_to_delete)
-                    except Exception:
-                        skipped += len(batch_to_delete)
-                except Exception as e:
-                    logger.warning("delete batch: %s", e)
-                    skipped += len(batch_to_delete)
-                batch_to_delete = []
-
-                try:
-                    await status_msg.edit_text(
-                        f"🧹 Cleaning...\nMode: {_label(mode)}\n"
-                        f"Scanned: {scanned}\nDeleted: {deleted}\nSkipped: {skipped}"
-                    )
-                except Exception:
-                    pass
-                await asyncio.sleep(0.25)
-
-        if batch_to_delete and not _CANCEL.get(chat_id):
-            try:
-                await client.delete_messages(chat_id, batch_to_delete)
-                deleted += len(batch_to_delete)
-            except Exception as e:
-                logger.warning("final delete: %s", e)
-                skipped += len(batch_to_delete)
+                await status_msg.edit_text(
+                    f"🧹 Cleaning...\nMode: Delete ALL\n"
+                    f"Tried IDs: {tried}\nDeleted: {deleted}\nFailed: {failed}"
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(0.2)
 
         final = (
-            f"⏹ Cancelled\nScanned: {scanned}\nDeleted: {deleted}\nSkipped: {skipped}"
+            f"⏹ Cancelled\nTried: {tried}\nDeleted: {deleted}\nFailed: {failed}"
             if _CANCEL.get(chat_id)
             else (
-                f"✅ Done\nMode: {_label(mode)}\n"
-                f"Scanned: {scanned}\nDeleted: {deleted}\nSkipped: {skipped}\n"
-                f"(last ~{MAX_SCAN} msg ids checked)"
+                f"✅ Done\nMode: Delete ALL\n"
+                f"Tried IDs: {tried}\nDeleted: {deleted}\nFailed: {failed}\n"
+                f"(last ~{MAX_SCAN} ids)"
             )
         )
         try:
@@ -254,7 +205,7 @@ async def _run_clean(client: Client, chat_id: int, mode: str, status_msg: Messag
             except Exception:
                 pass
     except Exception as e:
-        logger.exception("run_clean: %s", e)
+        logger.exception("run_clean_all: %s", e)
         try:
             await status_msg.edit_text(f"❌ Error: {type(e).__name__}: {e}")
         except Exception:
@@ -262,6 +213,136 @@ async def _run_clean(client: Client, chat_id: int, mode: str, status_msg: Messag
     finally:
         _RUNNING[chat_id] = False
         _CANCEL[chat_id] = False
+
+
+async def _run_clean_filtered(client: Client, chat_id: int, mode: str, status_msg: Message):
+    """users / users_owner — need get_messages to check sender."""
+    _RUNNING[chat_id] = True
+    _CANCEL[chat_id] = False
+    deleted = kept = failed = scanned = 0
+    bot_id = None
+    try:
+        bot_id = (await client.get_me()).id
+    except Exception:
+        pass
+    owner_id = await _get_owner_id(client, chat_id)
+
+    top_id = int(getattr(status_msg, "id", 0) or 0)
+    if top_id <= 1:
+        try:
+            await status_msg.edit_text("❌ Status id missing. Dubara /cleangroup.")
+        except Exception:
+            pass
+        _RUNNING[chat_id] = False
+        return
+
+    lowest = max(1, top_id - MAX_SCAN)
+    current = top_id - 1
+    pending = []
+
+    try:
+        while current >= lowest:
+            if _CANCEL.get(chat_id):
+                break
+
+            ids = []
+            for _ in range(BATCH_SIZE):
+                if current < lowest:
+                    break
+                ids.append(current)
+                current -= 1
+            if not ids:
+                break
+
+            try:
+                msgs = await client.get_messages(chat_id, ids)
+            except FloodWait as e:
+                await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
+                try:
+                    msgs = await client.get_messages(chat_id, ids)
+                except Exception:
+                    continue
+            except Exception as e:
+                logger.warning("get_messages: %s", e)
+                await asyncio.sleep(0.2)
+                continue
+
+            if not isinstance(msgs, list):
+                msgs = [msgs]
+
+            for msg in msgs:
+                if msg is None or getattr(msg, "empty", False):
+                    continue
+                if msg.id == top_id:
+                    continue
+
+                scanned += 1
+                uid = msg.from_user.id if msg.from_user else None
+
+                keep = False
+                if bot_id and uid == bot_id:
+                    keep = True
+                elif mode == "users" and owner_id and uid == owner_id:
+                    keep = True
+
+                if keep:
+                    kept += 1
+                else:
+                    pending.append(msg.id)
+
+            if len(pending) >= BATCH_SIZE:
+                d, f = await _delete_ids(client, chat_id, pending)
+                deleted += d
+                failed += f
+                pending = []
+                try:
+                    await status_msg.edit_text(
+                        f"🧹 Cleaning...\nMode: {_label(mode)}\n"
+                        f"Scanned: {scanned}\nDeleted: {deleted}\n"
+                        f"Kept: {kept}\nFailed: {failed}"
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(0.2)
+
+        if pending and not _CANCEL.get(chat_id):
+            d, f = await _delete_ids(client, chat_id, pending)
+            deleted += d
+            failed += f
+
+        final = (
+            f"⏹ Cancelled\nScanned: {scanned}\nDeleted: {deleted}\nKept: {kept}\nFailed: {failed}"
+            if _CANCEL.get(chat_id)
+            else (
+                f"✅ Done\nMode: {_label(mode)}\n"
+                f"Scanned: {scanned}\nDeleted: {deleted}\n"
+                f"Kept: {kept}\nFailed: {failed}\n"
+                f"(last ~{MAX_SCAN} ids)"
+            )
+        )
+        try:
+            await status_msg.edit_text(final)
+        except Exception:
+            try:
+                await client.send_message(chat_id, final)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.exception("run_clean_filtered: %s", e)
+        try:
+            await status_msg.edit_text(f"❌ Error: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+    finally:
+        _RUNNING[chat_id] = False
+        _CANCEL[chat_id] = False
+
+
+async def _run_clean(client: Client, chat_id: int, mode: str, status_msg: Message):
+    if mode == "all":
+        await _run_clean_all(client, chat_id, status_msg)
+    else:
+        await _run_clean_filtered(client, chat_id, mode, status_msg)
 
 
 def register_cleangroup_command(bot: Client):
@@ -312,7 +393,7 @@ def register_cleangroup_command(bot: Client):
                 "👤+👑 Users + Owner — members+owner (bot safe)\n"
                 "🗑 Delete ALL — sab (bot ke bhi)\n"
                 "❌ Cancel\n\n"
-                f"ℹ️ Last ~{MAX_SCAN} messages scan honge.",
+                f"ℹ️ Last ~{MAX_SCAN} message ids scan/delete.",
                 reply_markup=kb,
             )
             try:
@@ -391,7 +472,7 @@ def register_cleangroup_command(bot: Client):
             await _safe_answer(query, "Starting clean...")
             try:
                 await query.message.edit_text(
-                    f"🧹 Cleaning...\nMode: {_label(mode)}\nScanned: 0\nDeleted: 0\nSkipped: 0",
+                    f"🧹 Cleaning...\nMode: {_label(mode)}\nStarting...",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("⏹ Cancel Clean", callback_data=f"cg_stop:{clicker}")]
                     ]),
@@ -404,4 +485,4 @@ def register_cleangroup_command(bot: Client):
             logger.exception("cleangroup_cb: %s", e)
             await _safe_answer(query, f"Error: {type(e).__name__}", show_alert=True)
 
-    logger.info("/cleangroup registered (cmd group=-3, cb group=-15, get_messages scan)")
+    logger.info("/cleangroup registered (all=direct-id-delete, filtered=get_messages)")
