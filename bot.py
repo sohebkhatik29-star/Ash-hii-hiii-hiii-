@@ -102,35 +102,30 @@ register_group_filter_handlers(Bot)
 register_moderation_handlers(Bot)
 register_force_sub_handlers(Bot)
 
-# /done command (bot_commands folder) — fail-safe
 try:
     from handlers.bot_commands.done_cmd import register_done_command
     register_done_command(Bot)
 except Exception as e:
     logger.error(f"done_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
-# /chakspelling command (bot_commands folder) — fail-safe
 try:
     from handlers.bot_commands.chakspelling_cmd import register_chakspelling_command
     register_chakspelling_command(Bot)
 except Exception as e:
     logger.error(f"chakspelling_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
-# /deletefilter command (bot_commands folder) — fail-safe
 try:
     from handlers.bot_commands.delete_filter_cmd import register_delete_filter_command
     register_delete_filter_command(Bot)
 except Exception as e:
     logger.error(f"delete_filter_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
-# /not_available command (bot_commands folder) — fail-safe
 try:
     from handlers.bot_commands.notavailable_cmd import register_notavailable_command
     register_notavailable_command(Bot)
 except Exception as e:
     logger.error(f"notavailable_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
-# /premium command (bot_commands folder) — fail-safe
 try:
     from handlers.bot_commands.premium_cmd import register_premium_command
     register_premium_command(Bot)
@@ -138,14 +133,12 @@ try:
 except Exception as e:
     logger.error(f"premium_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
-# /deleteallfilters command (bot_commands folder) — fail-safe
 try:
     from handlers.bot_commands.delete_all_filters_cmd import register_delete_all_filters_command
     register_delete_all_filters_command(Bot)
 except Exception as e:
     logger.error(f"delete_all_filters_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
-# /cleangroup command (bot_commands folder) — fail-safe
 try:
     from handlers.bot_commands.cleangroup_cmd import register_cleangroup_command
     register_cleangroup_command(Bot)
@@ -153,13 +146,19 @@ try:
 except Exception as e:
     logger.error(f"cleangroup_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
-# /unbanlink + antilink watch (bot_commands folder) — fail-safe
 try:
     from handlers.bot_commands.antilink_cmd import register_antilink_command
     register_antilink_command(Bot)
     logger.info("antilink + /unbanlink registered")
 except Exception as e:
     logger.error(f"antilink_cmd register failed (bot still runs): {type(e).__name__}: {e}")
+
+try:
+    from handlers.bot_commands.warn_cmd import register_warn_command
+    register_warn_command(Bot)
+    logger.info("/warn command registered")
+except Exception as e:
+    logger.error(f"warn_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
 try:
     from handlers.indexing import register_indexing_handlers
@@ -180,12 +179,13 @@ async def setup_bot_commands(bot: Client):
         BotCommand("unban", "User unban (reply / user_id)"),
         BotCommand("done", "Not-found session close"),
         BotCommand("chakspelling", "Check spelling (reply to user)"),
-        BotCommand("deletefilter", "Reply to poster \u2192 remove filter"),
+        BotCommand("deletefilter", "Reply to poster remove filter"),
         BotCommand("not_available", "Not available on Telegram (reply)"),
-        BotCommand("premium", "Premium only \u2014 contact @movies_1780"),
+        BotCommand("premium", "Premium only contact @movies_1780"),
         BotCommand("deleteallfilters", "Delete ALL filters (confirm)"),
         BotCommand("cleangroup", "Clean group messages (admin)"),
         BotCommand("unbanlink", "Unban after link suspend/ban"),
+        BotCommand("warn", "Warn user (reply + reason)"),
     ]
     private_cmds = [
         BotCommand("start", "Bot start / welcome"),
@@ -207,7 +207,7 @@ async def setup_bot_commands(bot: Client):
         logger.warning(f"private cmds: {e}")
     try:
         await bot.set_bot_commands(group_cmds, scope=BotCommandScopeAllGroupChats())
-        logger.info("\u2705 Group commands set")
+        logger.info("Group commands set")
     except Exception as e:
         logger.warning(f"AllGroupChats cmds failed: {e}")
     try:
