@@ -95,21 +95,26 @@ async def _bot_is_admin(client, channel_id):
         return False
 
 
-async def _copy_to_db(bot, message) -> Optional[str]:
+async def _copy_to_db(bot, message, caption_text: str = None) -> Optional[str]:
     media = message.document or message.video or message.audio or message.animation
     if not media:
         return None
+    # prefer provided caption, else original caption, else file name
+    fname = getattr(media, "file_name", None) or ""
+    cap = (caption_text or message.caption or fname or "").strip()
+    if len(cap) > 1024:
+        cap = cap[:1020] + "..."
     db_ch = getattr(Config, "DB_CHANNEL", None)
     if not db_ch:
         return getattr(media, "file_id", None)
     try:
-        copied = await message.copy(int(db_ch))
+        copied = await message.copy(int(db_ch), caption=cap if cap else None)
         m = copied.document or copied.video or copied.audio or copied.animation
         return getattr(m, "file_id", None) if m else getattr(media, "file_id", None)
     except FloodWait as e:
         await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
         try:
-            copied = await message.copy(int(db_ch))
+            copied = await message.copy(int(db_ch), caption=cap if cap else None)
             m = copied.document or copied.video or copied.audio or copied.animation
             return getattr(m, "file_id", None) if m else getattr(media, "file_id", None)
         except Exception:
@@ -170,6 +175,7 @@ def _title_from_name(file_name: str, caption: str = "") -> tuple:
 
 
 async def _post_movie_to_group(bot: Client, movie_id: str) -> bool:
+    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     movie = await db.get_movie(movie_id)
     if not movie:
         return False
@@ -179,7 +185,37 @@ async def _post_movie_to_group(bot: Client, movie_id: str) -> bool:
         return False
     try:
         card_text = build_final_movie_card_text(movie)
-        buttons = build_final_movie_card_buttons(movie, for_group=True)
+        # Build quality buttons + Updates Channel (no Open Movie Bot)
+        qualities = movie.get("qualities") or {}
+        order = {"480p": 0, "720p": 1, "1080p": 2}
+        sorted_q = sorted(
+            qualities.items(),
+            key=lambda item: order.get(str(item[0]), 99),
+        )
+        rows = []
+        for q_name, q_data in sorted_q:
+            size_str = q_data.get("file_size_formatted") or ""
+            if not size_str and q_data.get("file_size"):
+                try:
+                    size_str = format_size(int(q_data["file_size"]))
+                except Exception:
+                    size_str = ""
+            label = f"⬇️ Download {q_name}" + (f" ({size_str})" if size_str else "")
+            channel_msg_id = q_data.get("channel_msg_id")
+            q_slug = str(q_name).replace(" ", "_").lower()
+            bot_user = getattr(Config, "BOT_USERNAME", None) or "Ash_best_movie_bot"
+            if channel_msg_id:
+                url = f"https://t.me/{bot_user}?start=f_{channel_msg_id}"
+            else:
+                url = f"https://t.me/{bot_user}?start=dl_{movie_id}_{q_slug}"
+            rows.append([InlineKeyboardButton(label, url=url)])
+        rows.append([
+            InlineKeyboardButton(
+                "📢 Updates Channel",
+                url="https://t.me/ash_movie_1782",
+            )
+        ])
+        buttons = InlineKeyboardMarkup(rows) if rows else None
         poster_id = movie.get("poster_file_id")
         sent = None
         if poster_id:
@@ -346,7 +382,11 @@ async def run_indexing(
             except Exception:
                 pass
 
-            file_id = await _copy_to_db(bot, msg)
+            cap_txt = f"{title}"
+            if year:
+                cap_txt += f" ({year})"
+            cap_txt += f"\n{file_name}\nQuality: {final_quality}"
+            file_id = await _copy_to_db(bot, msg, caption_text=cap_txt)
             if not file_id:
                 logger.warning("no file_id for msg %s", msg_id)
                 continue
@@ -361,6 +401,7 @@ async def run_indexing(
                 "source_channel_id": channel_id,
                 "source_msg_id": msg_id,
                 "channel_msg_id": None,
+                "caption": cap_txt,
             }
             try:
                 ok = await db.add_quality_to_movie(movie_id, quality_key, quality_data)
