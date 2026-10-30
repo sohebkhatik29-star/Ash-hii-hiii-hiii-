@@ -127,21 +127,58 @@ async def _copy_to_db(bot, message, caption_text: str = None):
         return orig_fid, None
 
 
+async def _stabilize_poster(bot, poster_file_id: str) -> Optional[str]:
+    """Re-send poster to DB_CHANNEL so bot owns a reusable file_id."""
+    if not poster_file_id:
+        return None
+    db_ch = getattr(Config, "DB_CHANNEL", None)
+    if not db_ch:
+        return poster_file_id
+    try:
+        sent = await bot.send_photo(int(db_ch), photo=poster_file_id)
+        if sent and sent.photo:
+            return sent.photo.file_id
+    except FloodWait as e:
+        await asyncio.sleep(int(getattr(e, "value", 3)) + 1)
+        try:
+            sent = await bot.send_photo(int(db_ch), photo=poster_file_id)
+            if sent and sent.photo:
+                return sent.photo.file_id
+        except Exception as e2:
+            logger.warning("stabilize_poster retry: %s", e2)
+    except Exception as e:
+        logger.warning("stabilize_poster: %s", e)
+    return poster_file_id  # fallback — try original id
+
+
 async def _extract_poster_id(bot, message) -> Optional[str]:
+    """Get poster file_id and stabilize it via DB_CHANNEL copy."""
+    raw = None
     try:
         if message.photo:
-            return message.photo.file_id
-        if message.video and getattr(message.video, "thumbs", None):
+            # Prefer full photo; copy to DB for stable id
+            db_ch = getattr(Config, "DB_CHANNEL", None)
+            if db_ch:
+                try:
+                    copied = await message.copy(int(db_ch))
+                    if copied and copied.photo:
+                        return copied.photo.file_id
+                except Exception as e:
+                    logger.warning("poster copy: %s", e)
+            raw = message.photo.file_id
+        elif message.video and getattr(message.video, "thumbs", None):
             thumbs = message.video.thumbs
-            return thumbs[-1].file_id if thumbs else None
-        if message.document and getattr(message.document, "thumbs", None):
+            raw = thumbs[-1].file_id if thumbs else None
+        elif message.document and getattr(message.document, "thumbs", None):
             thumbs = message.document.thumbs
-            return thumbs[-1].file_id if thumbs else None
-        if message.animation and getattr(message.animation, "thumbs", None):
+            raw = thumbs[-1].file_id if thumbs else None
+        elif message.animation and getattr(message.animation, "thumbs", None):
             thumbs = message.animation.thumbs
-            return thumbs[-1].file_id if thumbs else None
+            raw = thumbs[-1].file_id if thumbs else None
     except Exception:
         pass
+    if raw:
+        return await _stabilize_poster(bot, raw)
     return None
 
 
@@ -268,8 +305,28 @@ async def _post_movie_to_group(bot: Client, movie_id: str, force_new: bool = Fal
                         reply_markup=buttons,
                     )
                 except Exception as e:
-                    logger.warning("send_photo: %s", e)
-                    sent = None
+                    logger.warning("send_photo (retry stabilize): %s", e)
+                    # one more try after re-stabilize
+                    try:
+                        stable = await _stabilize_poster(bot, poster_id)
+                        if stable:
+                            sent = await bot.send_photo(
+                                chat_id=int(target),
+                                photo=stable,
+                                caption=_safe(card_text),
+                                reply_markup=buttons,
+                            )
+                            # save better id
+                            try:
+                                if getattr(db, "movies_col", None) is not None:
+                                    await db.movies_col.update_one(
+                                        {"movie_id": movie_id}, {"$set": {"poster_file_id": stable}}
+                                    )
+                            except Exception:
+                                pass
+                    except Exception as e2:
+                        logger.warning("send_photo final fail: %s", e2)
+                        sent = None
             if not sent:
                 sent = await bot.send_message(
                     chat_id=int(target),
@@ -406,7 +463,18 @@ async def run_indexing(
 
                 if msg.photo and not (msg.document or msg.video or msg.audio or msg.animation):
                     try:
-                        pending_poster = msg.photo.file_id
+                        db_ch = getattr(Config, "DB_CHANNEL", None)
+                        if db_ch:
+                            try:
+                                copied = await msg.copy(int(db_ch))
+                                if copied and copied.photo:
+                                    pending_poster = copied.photo.file_id
+                                else:
+                                    pending_poster = msg.photo.file_id
+                            except Exception:
+                                pending_poster = await _stabilize_poster(bot, msg.photo.file_id)
+                        else:
+                            pending_poster = msg.photo.file_id
                     except Exception:
                         pass
                     continue
@@ -477,9 +545,11 @@ async def run_indexing(
                 try:
                     mov = await db.get_movie(movie_id)
                     if mov and not mov.get("poster_file_id"):
-                        pid = await _extract_poster_id(bot, msg) or pending_poster
-                        if pid:
+                        pid = await _extract_poster_id(bot, msg)
+                        if not pid and pending_poster:
+                            pid = pending_poster
                             pending_poster = None
+                        if pid:
                             if getattr(db, "movies_col", None) is not None:
                                 await db.movies_col.update_one(
                                     {"movie_id": movie_id}, {"$set": {"poster_file_id": pid}}
