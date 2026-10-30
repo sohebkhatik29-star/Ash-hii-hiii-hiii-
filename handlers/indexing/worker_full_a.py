@@ -130,7 +130,6 @@ async def _copy_to_db(bot, message, caption_text: str = None):
 async def _extract_poster_id(bot, message) -> Optional[str]:
     try:
         if message.photo:
-            # largest size
             return message.photo.file_id
         if message.video and getattr(message.video, "thumbs", None):
             thumbs = message.video.thumbs
@@ -138,7 +137,6 @@ async def _extract_poster_id(bot, message) -> Optional[str]:
         if message.document and getattr(message.document, "thumbs", None):
             thumbs = message.document.thumbs
             return thumbs[-1].file_id if thumbs else None
-        # sometimes animation
         if message.animation and getattr(message.animation, "thumbs", None):
             thumbs = message.animation.thumbs
             return thumbs[-1].file_id if thumbs else None
@@ -215,16 +213,16 @@ def _build_quality_rows(movie: dict, movie_id: str):
     return rows
 
 
-async def _post_movie_to_group(bot: Client, movie_id: str, force_new: bool = False) -> bool:
-    """Post or update group card with ALL qualities + poster when available."""
+async def _post_movie_to_group(bot: Client, movie_id: str, force_new: bool = False):
+    """Post or update group card. Returns 'new' | 'edit' | None."""
     from pyrogram.types import InlineKeyboardMarkup
     movie = await db.get_movie(movie_id)
     if not movie:
-        return False
+        return None
     target = getattr(Config, "MOVIE_GROUP_ID", None)
     if not target:
         logger.warning("MOVIE_GROUP_ID not set")
-        return False
+        return None
     try:
         card_text = build_final_movie_card_text(movie)
         rows = _build_quality_rows(movie, movie_id)
@@ -244,7 +242,7 @@ async def _post_movie_to_group(bot: Client, movie_id: str, force_new: bool = Fal
                             caption=_safe(card_text),
                             reply_markup=buttons,
                         )
-                        return True
+                        return "edit"
                     except Exception:
                         pass
                 await bot.edit_message_text(
@@ -254,40 +252,59 @@ async def _post_movie_to_group(bot: Client, movie_id: str, force_new: bool = Fal
                     reply_markup=buttons,
                     disable_web_page_preview=True,
                 )
-                return True
+                return "edit"
             except Exception as e:
-                logger.warning("edit group post: %s", e)
+                logger.warning("edit group post failed (will send new): %s", e)
 
-        # Fresh post
+        # Fresh post — always to MOVIE_GROUP_ID
         sent = None
-        if poster_id:
-            try:
-                sent = await bot.send_photo(
+        try:
+            if poster_id:
+                try:
+                    sent = await bot.send_photo(
+                        chat_id=int(target),
+                        photo=poster_id,
+                        caption=_safe(card_text),
+                        reply_markup=buttons,
+                    )
+                except Exception as e:
+                    logger.warning("send_photo: %s", e)
+                    sent = None
+            if not sent:
+                sent = await bot.send_message(
                     chat_id=int(target),
-                    photo=poster_id,
-                    caption=_safe(card_text),
+                    text=_safe(card_text),
                     reply_markup=buttons,
+                    disable_web_page_preview=True,
                 )
-            except Exception as e:
-                logger.warning("send_photo: %s", e)
-                sent = None
-        if not sent:
-            sent = await bot.send_message(
-                chat_id=int(target),
-                text=_safe(card_text),
-                reply_markup=buttons,
-                disable_web_page_preview=True,
-            )
+        except FloodWait as e:
+            wait = int(getattr(e, "value", 5)) + 1
+            logger.warning("FloodWait %ss on group post", wait)
+            await asyncio.sleep(wait)
+            try:
+                sent = await bot.send_message(
+                    chat_id=int(target),
+                    text=_safe(card_text),
+                    reply_markup=buttons,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e2:
+                logger.warning("group post retry fail: %s", e2)
+                return None
+        except Exception as e:
+            logger.warning("group send fail: %s", e)
+            return None
+
         if sent:
             try:
                 if hasattr(db, "update_movie_group_post"):
                     await db.update_movie_group_post(movie_id, sent.chat.id, sent.id)
             except Exception:
                 pass
-            return True
+            return "new"
     except Exception as e:
         logger.warning("post_movie: %s", e)
-    return False
+    return None
 
 
 async def run_indexing(
@@ -330,7 +347,6 @@ async def run_indexing(
         except Exception:
             pass
 
-        # Batch fetch (faster + fewer FloodWaits on big channels)
         BATCH = 40
         last_title = ""
         pending_poster = None
@@ -364,7 +380,6 @@ async def run_indexing(
                 logger.warning("get_messages batch: %s", e)
                 msgs = []
 
-            # map by id for safety
             by_id = {}
             for m in msgs:
                 if m is None:
@@ -389,7 +404,6 @@ async def run_indexing(
                 if not msg or getattr(msg, "empty", False):
                     continue
 
-                # Standalone poster photo → remember for next movie
                 if msg.photo and not (msg.document or msg.video or msg.audio or msg.animation):
                     try:
                         pending_poster = msg.photo.file_id
@@ -413,7 +427,7 @@ async def run_indexing(
                 if not title:
                     continue
 
-                quality_key = final_quality  # only 480p / 720p / 1080p
+                quality_key = final_quality
                 norm = re.sub(r"[^\w\s]", " ", title.lower())
                 norm = re.sub(r"\s+", " ", norm).strip()
                 key = (norm, year)
@@ -421,8 +435,11 @@ async def run_indexing(
                 if current_key is not None and key != current_key:
                     prev = bucket.get(current_key)
                     if prev and prev not in posted_set:
-                        if await _post_movie_to_group(bot, prev):
+                        result = await _post_movie_to_group(bot, prev, force_new=True)
+                        if result == "new":
                             posted += 1
+                            posted_set.add(prev)
+                        elif result:
                             posted_set.add(prev)
                     current_key = key
                 elif current_key is None:
@@ -502,12 +519,18 @@ async def run_indexing(
                     logger.warning("add_quality: %s", e)
                     continue
 
-                # Post first time, or UPDATE existing group card with all qualities
+                # First time this run → always NEW post (appears at top of group).
+                # Later qualities of same movie → EDIT that post (add 720p/1080p buttons).
                 try:
-                    ok = await _post_movie_to_group(bot, movie_id)
-                    if ok and movie_id not in posted_set:
-                        posted += 1
-                        posted_set.add(movie_id)
+                    if movie_id not in posted_set:
+                        result = await _post_movie_to_group(bot, movie_id, force_new=True)
+                        if result == "new":
+                            posted += 1
+                            posted_set.add(movie_id)
+                        elif result:
+                            posted_set.add(movie_id)
+                    else:
+                        await _post_movie_to_group(bot, movie_id, force_new=False)
                 except Exception as e:
                     logger.warning("post/update: %s", e)
 
@@ -517,8 +540,11 @@ async def run_indexing(
 
         for k, mid in list(bucket.items()):
             if mid not in posted_set:
-                if await _post_movie_to_group(bot, mid):
+                result = await _post_movie_to_group(bot, mid, force_new=True)
+                if result == "new":
                     posted += 1
+                    posted_set.add(mid)
+                elif result:
                     posted_set.add(mid)
 
         if status_msg_id:
