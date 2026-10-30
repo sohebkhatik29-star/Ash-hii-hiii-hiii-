@@ -130,11 +130,18 @@ async def _copy_to_db(bot, message, caption_text: str = None):
 async def _extract_poster_id(bot, message) -> Optional[str]:
     try:
         if message.photo:
+            # largest size
             return message.photo.file_id
         if message.video and getattr(message.video, "thumbs", None):
-            return message.video.thumbs[-1].file_id
+            thumbs = message.video.thumbs
+            return thumbs[-1].file_id if thumbs else None
         if message.document and getattr(message.document, "thumbs", None):
-            return message.document.thumbs[-1].file_id
+            thumbs = message.document.thumbs
+            return thumbs[-1].file_id if thumbs else None
+        # sometimes animation
+        if message.animation and getattr(message.animation, "thumbs", None):
+            thumbs = message.animation.thumbs
+            return thumbs[-1].file_id if thumbs else None
     except Exception:
         pass
     return None
@@ -177,8 +184,40 @@ def _title_from_name(file_name: str, caption: str = "") -> tuple:
     return title, year, _norm_quality(q)
 
 
-async def _post_movie_to_group(bot: Client, movie_id: str) -> bool:
-    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+def _build_quality_rows(movie: dict, movie_id: str):
+    from pyrogram.types import InlineKeyboardButton
+    qualities = movie.get("qualities") or {}
+    order = {"480p": 0, "720p": 1, "1080p": 2}
+    sorted_q = sorted(
+        qualities.items(),
+        key=lambda item: order.get(str(item[0]), 99),
+    )
+    rows = []
+    bot_user = (getattr(Config, "BOT_USERNAME", None) or "").lstrip("@") or "Ash_best_movie_bot"
+    for q_name, q_data in sorted_q:
+        size_str = q_data.get("file_size_formatted") or ""
+        if not size_str and q_data.get("file_size"):
+            try:
+                size_str = format_size(int(q_data["file_size"]))
+            except Exception:
+                size_str = ""
+        label = f"⬇️ Download {q_name}" + (f" ({size_str})" if size_str else "")
+        channel_msg_id = q_data.get("channel_msg_id")
+        q_slug = str(q_name).replace(" ", "_").lower()
+        if channel_msg_id:
+            url = f"https://t.me/{bot_user}?start=f_{channel_msg_id}"
+        else:
+            url = f"https://t.me/{bot_user}?start=q_{movie_id}_{q_slug}"
+        rows.append([InlineKeyboardButton(label, url=url)])
+    rows.append([
+        InlineKeyboardButton("📢 Updates Channel", url="https://t.me/ash_movie_1782")
+    ])
+    return rows
+
+
+async def _post_movie_to_group(bot: Client, movie_id: str, force_new: bool = False) -> bool:
+    """Post or update group card with ALL qualities + poster when available."""
+    from pyrogram.types import InlineKeyboardMarkup
     movie = await db.get_movie(movie_id)
     if not movie:
         return False
@@ -188,39 +227,38 @@ async def _post_movie_to_group(bot: Client, movie_id: str) -> bool:
         return False
     try:
         card_text = build_final_movie_card_text(movie)
-        # Build quality buttons + Updates Channel (no Open Movie Bot)
-        qualities = movie.get("qualities") or {}
-        order = {"480p": 0, "720p": 1, "1080p": 2}
-        sorted_q = sorted(
-            qualities.items(),
-            key=lambda item: order.get(str(item[0]), 99),
-        )
-        rows = []
-        for q_name, q_data in sorted_q:
-            size_str = q_data.get("file_size_formatted") or ""
-            if not size_str and q_data.get("file_size"):
-                try:
-                    size_str = format_size(int(q_data["file_size"]))
-                except Exception:
-                    size_str = ""
-            label = f"⬇️ Download {q_name}" + (f" ({size_str})" if size_str else "")
-            channel_msg_id = q_data.get("channel_msg_id")
-            q_slug = str(q_name).replace(" ", "_").lower()
-            bot_user = (getattr(Config, "BOT_USERNAME", None) or "").lstrip("@") or "Ash_best_movie_bot"
-            if channel_msg_id:
-                url = f"https://t.me/{bot_user}?start=f_{channel_msg_id}"
-            else:
-                # start_handler supports q_<movie_id>_<quality>
-                url = f"https://t.me/{bot_user}?start=q_{movie_id}_{q_slug}"
-            rows.append([InlineKeyboardButton(label, url=url)])
-        rows.append([
-            InlineKeyboardButton(
-                "📢 Updates Channel",
-                url="https://t.me/ash_movie_1782",
-            )
-        ])
+        rows = _build_quality_rows(movie, movie_id)
         buttons = InlineKeyboardMarkup(rows) if rows else None
         poster_id = movie.get("poster_file_id")
+
+        # Try edit existing group post (so new qualities appear)
+        g_chat = movie.get("group_chat_id")
+        g_msg = movie.get("group_msg_id")
+        if not force_new and g_chat and g_msg:
+            try:
+                if poster_id:
+                    try:
+                        await bot.edit_message_caption(
+                            chat_id=int(g_chat),
+                            message_id=int(g_msg),
+                            caption=_safe(card_text),
+                            reply_markup=buttons,
+                        )
+                        return True
+                    except Exception:
+                        pass
+                await bot.edit_message_text(
+                    chat_id=int(g_chat),
+                    message_id=int(g_msg),
+                    text=_safe(card_text),
+                    reply_markup=buttons,
+                    disable_web_page_preview=True,
+                )
+                return True
+            except Exception as e:
+                logger.warning("edit group post: %s", e)
+
+        # Fresh post
         sent = None
         if poster_id:
             try:
@@ -295,6 +333,7 @@ async def run_indexing(
         # Batch fetch (faster + fewer FloodWaits on big channels)
         BATCH = 40
         last_title = ""
+        pending_poster = None
         msg_id = start_id
         while msg_id <= end_id:
             if _CANCEL.get(admin_id):
@@ -350,6 +389,14 @@ async def run_indexing(
                 if not msg or getattr(msg, "empty", False):
                     continue
 
+                # Standalone poster photo → remember for next movie
+                if msg.photo and not (msg.document or msg.video or msg.audio or msg.animation):
+                    try:
+                        pending_poster = msg.photo.file_id
+                    except Exception:
+                        pass
+                    continue
+
                 media = msg.document or msg.video or msg.audio or msg.animation
                 if not media:
                     continue
@@ -391,7 +438,8 @@ async def run_indexing(
                     if existing and existing.get("movie_id"):
                         movie_id = existing["movie_id"]
                     else:
-                        poster_file_id = await _extract_poster_id(bot, msg)
+                        poster_file_id = await _extract_poster_id(bot, msg) or pending_poster
+                        pending_poster = None
                         try:
                             doc = await db.create_movie(
                                 title=title,
@@ -412,11 +460,15 @@ async def run_indexing(
                 try:
                     mov = await db.get_movie(movie_id)
                     if mov and not mov.get("poster_file_id"):
-                        pid = await _extract_poster_id(bot, msg)
-                        if pid and getattr(db, "movies_col", None) is not None:
-                            await db.movies_col.update_one(
-                                {"movie_id": movie_id}, {"$set": {"poster_file_id": pid}}
-                            )
+                        pid = await _extract_poster_id(bot, msg) or pending_poster
+                        if pid:
+                            pending_poster = None
+                            if getattr(db, "movies_col", None) is not None:
+                                await db.movies_col.update_one(
+                                    {"movie_id": movie_id}, {"$set": {"poster_file_id": pid}}
+                                )
+                            if getattr(db, "_mem_movies", None) is not None and movie_id in db._mem_movies:
+                                db._mem_movies[movie_id]["poster_file_id"] = pid
                 except Exception:
                     pass
 
@@ -450,11 +502,14 @@ async def run_indexing(
                     logger.warning("add_quality: %s", e)
                     continue
 
-                # Post as soon as movie has at least 1 quality (big-channel friendly)
-                if movie_id not in posted_set:
-                    if await _post_movie_to_group(bot, movie_id):
+                # Post first time, or UPDATE existing group card with all qualities
+                try:
+                    ok = await _post_movie_to_group(bot, movie_id)
+                    if ok and movie_id not in posted_set:
                         posted += 1
                         posted_set.add(movie_id)
+                except Exception as e:
+                    logger.warning("post/update: %s", e)
 
                 await asyncio.sleep(0.08)
 
