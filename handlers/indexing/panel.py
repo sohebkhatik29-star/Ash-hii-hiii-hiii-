@@ -1,6 +1,8 @@
 # handlers/indexing/panel.py — Indexing menu + buttons (idx_*)
+import asyncio
 import logging
 import re
+import time
 from pyrogram import Client, filters, StopPropagation
 from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message
 
@@ -8,6 +10,8 @@ from configs import Config
 
 logger = logging.getLogger("IndexingPanel")
 _STATE = {}
+_LOCKS = {}  # uid -> asyncio.Lock
+_RECENT = {}  # key -> ts  (dedupe replies)
 
 
 def _is_admin(uid: int) -> bool:
@@ -15,6 +19,26 @@ def _is_admin(uid: int) -> bool:
         return int(uid) in (Config.ADMINS or set() or [])
     except Exception:
         return False
+
+
+def _lock_for(uid: int) -> asyncio.Lock:
+    lk = _LOCKS.get(uid)
+    if lk is None:
+        lk = asyncio.Lock()
+        _LOCKS[uid] = lk
+    return lk
+
+
+def _dedupe(key: str, ttl: float = 3.0) -> bool:
+    """Return True if this is the first call within ttl (allow action)."""
+    now = time.time()
+    dead = [k for k, t in _RECENT.items() if now - t > 60]
+    for k in dead:
+        _RECENT.pop(k, None)
+    if key in _RECENT and (now - _RECENT[key]) < ttl:
+        return False
+    _RECENT[key] = now
+    return True
 
 
 def kb_idx_menu():
@@ -40,7 +64,7 @@ async def open_indexing_menu(client: Client, query: CallbackQuery):
     try:
         await query.edit_message_text(text, reply_markup=kb_idx_menu())
     except Exception as e:
-        # Do NOT send a new message — prevents double panels when another handler also ran
+        # Do NOT send a new message — prevents double panels
         logger.warning("open_indexing_menu edit: %s", e)
 
 
@@ -48,7 +72,7 @@ async def _safe_edit(query: CallbackQuery, text: str, reply_markup=None):
     try:
         await query.edit_message_text(text, reply_markup=reply_markup)
     except Exception as e:
-        # No reply fallback — avoids duplicate messages on double-handler races
+        # No reply fallback — avoids duplicate messages
         logger.warning("edit fail: %s", e)
 
 
@@ -109,6 +133,13 @@ def register_indexing_handlers(bot: Client):
     async def _idx_router(client: Client, query: CallbackQuery):
         data = (query.data or "").strip()
         uid = int(query.from_user.id) if query.from_user else 0
+        # Callback-level dedupe (same button pressed / double delivery)
+        if not _dedupe(f"cb:{uid}:{data}", ttl=2.0):
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            raise StopPropagation
         try:
             if not _is_admin(uid):
                 await query.answer("Sirf owner/admin ke liye.", show_alert=True)
@@ -151,85 +182,102 @@ def register_indexing_handlers(bot: Client):
         uid = message.from_user.id if message.from_user else 0
         if not _is_admin(uid):
             return
-        st = _STATE.get(uid) or {}
-        state = st.get("state")
-        if not state or state == "idle":
-            return
-        text = (message.text or "").strip()
+        # Per-user lock so concurrent double-delivery cannot double-reply
+        async with _lock_for(uid):
+            st = _STATE.get(uid) or {}
+            state = st.get("state")
+            if not state or state == "idle":
+                return
+            text = (message.text or "").strip()
 
-        if state == "wait_channel":
-            cid = None
-            if message.forward_from_chat:
-                cid = message.forward_from_chat.id
-            else:
+            if state == "wait_channel":
+                cid = None
+                if message.forward_from_chat:
+                    cid = message.forward_from_chat.id
+                else:
+                    try:
+                        cid = int(text.replace(" ", ""))
+                    except Exception:
+                        if _dedupe(f"msg:{uid}:bad_ch", 2.0):
+                            await message.reply_text("Valid channel ID bhejo (jaise -100...) ya forward karo.")
+                        return
                 try:
-                    cid = int(text.replace(" ", ""))
-                except Exception:
-                    await message.reply_text("Valid channel ID bhejo (jaise -100...) ya forward karo.")
+                    from handlers.indexing import idx_db
+                    title = str(cid)
+                    try:
+                        chat = await client.get_chat(cid)
+                        title = getattr(chat, "title", None) or title
+                    except Exception:
+                        pass
+                    await idx_db.add_channel(cid, title)
+                    _STATE[uid] = {"state": "idle"}
+                    if _dedupe(f"msg:{uid}:ch_set:{cid}", 3.0):
+                        await message.reply_text(
+                            f"✅ Channel set: <b>{title}</b> (<code>{cid}</code>)",
+                            reply_markup=kb_idx_menu(),
+                        )
+                except Exception as e:
+                    if _dedupe(f"msg:{uid}:ch_err", 2.0):
+                        await message.reply_text(f"Error: {type(e).__name__}: {e}")
+                return
+
+            if state == "wait_start":
+                mid = None
+                if message.forward_from_chat and message.forward_from_message_id:
+                    mid = message.forward_from_message_id
+                    st["channel_id"] = message.forward_from_chat.id
+                else:
+                    m = re.search(r"/(\d+)/?$", text) or re.search(r"^(\d+)$", text)
+                    if m:
+                        mid = int(m.group(1))
+                if not mid:
+                    if _dedupe(f"msg:{uid}:need_start", 2.0):
+                        await message.reply_text("Start message ID ya link bhejo.")
                     return
-            try:
-                from handlers.indexing import idx_db
-                title = str(cid)
-                try:
-                    chat = await client.get_chat(cid)
-                    title = getattr(chat, "title", None) or title
-                except Exception:
-                    pass
-                await idx_db.add_channel(cid, title)
-                _STATE[uid] = {"state": "idle"}
-                await message.reply_text(
-                    f"✅ Channel set: <b>{title}</b> (<code>{cid}</code>)",
-                    reply_markup=kb_idx_menu(),
+                # already moved on?
+                if (_STATE.get(uid) or {}).get("state") != "wait_start":
+                    return
+                st["start_id"] = mid
+                st["state"] = "wait_end"
+                _STATE[uid] = st
+                if _dedupe(f"msg:{uid}:start:{mid}", 5.0):
+                    await message.reply_text(
+                        f"✅ Start = <code>{mid}</code>\nAb <b>END</b> message ID/link bhejo."
+                    )
+                return
+
+            if state == "wait_end":
+                mid = None
+                if message.forward_from_chat and message.forward_from_message_id:
+                    mid = message.forward_from_message_id
+                else:
+                    m = re.search(r"/(\d+)/?$", text) or re.search(r"^(\d+)$", text)
+                    if m:
+                        mid = int(m.group(1))
+                if not mid:
+                    if _dedupe(f"msg:{uid}:need_end", 2.0):
+                        await message.reply_text("End message ID ya link bhejo.")
+                    return
+                if (_STATE.get(uid) or {}).get("state") != "wait_end":
+                    return
+                st["end_id"] = mid
+                st["state"] = "idle"
+                _STATE[uid] = st
+                channel_id = st.get("channel_id")
+                start_id = st.get("start_id")
+                end_id = mid
+                # only one indexing job per range
+                if not _dedupe(f"job:{uid}:{channel_id}:{start_id}:{end_id}", 30.0):
+                    return
+                status = await message.reply_text(
+                    f"📥 Indexing start...\nChannel <code>{channel_id}</code>\n"
+                    f"Range <code>{start_id}</code> → <code>{end_id}</code>"
                 )
-            except Exception as e:
-                await message.reply_text(f"Error: {type(e).__name__}: {e}")
-            return
-
-        if state == "wait_start":
-            mid = None
-            if message.forward_from_chat and message.forward_from_message_id:
-                mid = message.forward_from_message_id
-                st["channel_id"] = message.forward_from_chat.id
-            else:
-                m = re.search(r"/(\d+)/?$", text) or re.search(r"^(\d+)$", text)
-                if m:
-                    mid = int(m.group(1))
-            if not mid:
-                await message.reply_text("Start message ID ya link bhejo.")
-                return
-            st["start_id"] = mid
-            st["state"] = "wait_end"
-            _STATE[uid] = st
-            await message.reply_text(f"✅ Start = <code>{mid}</code>\nAb <b>END</b> message ID/link bhejo.")
-            return
-
-        if state == "wait_end":
-            mid = None
-            if message.forward_from_chat and message.forward_from_message_id:
-                mid = message.forward_from_message_id
-            else:
-                m = re.search(r"/(\d+)/?$", text) or re.search(r"^(\d+)$", text)
-                if m:
-                    mid = int(m.group(1))
-            if not mid:
-                await message.reply_text("End message ID ya link bhejo.")
-                return
-            st["end_id"] = mid
-            st["state"] = "idle"
-            _STATE[uid] = st
-            channel_id = st.get("channel_id")
-            start_id = st.get("start_id")
-            end_id = mid
-            status = await message.reply_text(
-                f"📥 Indexing start...\nChannel <code>{channel_id}</code>\n"
-                f"Range <code>{start_id}</code> → <code>{end_id}</code>"
-            )
-            try:
-                from handlers.indexing.worker import run_indexing
-                import asyncio
-                asyncio.create_task(run_indexing(
-                    client, uid, channel_id, start_id, end_id,
-                    message.chat.id, status.id,
-                ))
-            except Exception as e:
-                await status.edit_text(f"❌ Worker error: {type(e).__name__}: {e}")
+                try:
+                    from handlers.indexing.worker import run_indexing
+                    asyncio.create_task(run_indexing(
+                        client, uid, channel_id, start_id, end_id,
+                        message.chat.id, status.id,
+                    ))
+                except Exception as e:
+                    await status.edit_text(f"❌ Worker error: {type(e).__name__}: {e}")
