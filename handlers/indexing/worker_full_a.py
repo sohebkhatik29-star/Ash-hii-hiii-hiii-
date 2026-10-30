@@ -292,132 +292,173 @@ async def run_indexing(
         except Exception:
             pass
 
-        for msg_id in range(start_id, end_id + 1):
+        # Batch fetch (faster + fewer FloodWaits on big channels)
+        BATCH = 40
+        last_title = ""
+        msg_id = start_id
+        while msg_id <= end_id:
             if _CANCEL.get(admin_id):
                 break
-            scanned += 1
-            if status_msg_id and (scanned % 3 == 0 or scanned == total):
-                await _status(
-                    bot, status_chat_id, status_msg_id,
-                    f"Indexing {scanned}/{total}\nSaved: {saved}\nPosted: {posted}",
-                )
 
+            batch_ids = list(range(msg_id, min(msg_id + BATCH, end_id + 1)))
+            msgs = []
             try:
-                msg = await bot.get_messages(channel_id, msg_id)
+                raw = await bot.get_messages(channel_id, batch_ids)
+                if isinstance(raw, list):
+                    msgs = raw
+                elif raw is not None:
+                    msgs = [raw]
             except FloodWait as e:
-                await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
+                wait = int(getattr(e, "value", 5)) + 1
+                logger.warning("FloodWait %ss on get_messages", wait)
+                await asyncio.sleep(wait)
                 try:
-                    msg = await bot.get_messages(channel_id, msg_id)
-                except Exception:
-                    continue
-            except Exception:
-                continue
-
-            if not msg or getattr(msg, "empty", False):
-                continue
-
-            media = msg.document or msg.video or msg.audio or msg.animation
-            if not media:
-                continue
-
-            file_name = (
-                getattr(media, "file_name", None)
-                or (msg.caption or "")[:80]
-                or f"file_{msg_id}"
-            )
-            caption = msg.caption or ""
-            filesize = int(getattr(media, "file_size", 0) or 0)
-
-            title, year, final_quality = _title_from_name(file_name, caption)
-            if not title:
-                continue
-
-            quality_key = final_quality  # only 480p / 720p / 1080p
-            norm = re.sub(r"[^\w\s]", " ", title.lower())
-            norm = re.sub(r"\s+", " ", norm).strip()
-            key = (norm, year)
-
-            if current_key is not None and key != current_key:
-                prev = bucket.get(current_key)
-                if prev and prev not in posted_set:
-                    if await _post_movie_to_group(bot, prev):
-                        posted += 1
-                        posted_set.add(prev)
-                current_key = key
-            elif current_key is None:
-                current_key = key
-
-            movie_id = bucket.get(key)
-            if not movie_id:
-                existing = None
-                try:
-                    existing = await db.find_movie_by_title_year(title, year)
-                except Exception as e:
-                    logger.warning("find_movie: %s", e)
-                if existing and existing.get("movie_id"):
-                    movie_id = existing["movie_id"]
-                else:
-                    poster_file_id = await _extract_poster_id(bot, msg)
-                    try:
-                        doc = await db.create_movie(
-                            title=title,
-                            normalized_title=norm,
-                            year=year,
-                            poster_file_id=poster_file_id,
-                        )
-                        movie_id = doc.get("movie_id") if doc else None
-                    except Exception as e:
-                        logger.warning("create_movie: %s", e)
-                        movie_id = None
-                if movie_id:
-                    bucket[key] = movie_id
-
-            if not movie_id:
-                continue
-
-            try:
-                mov = await db.get_movie(movie_id)
-                if mov and not mov.get("poster_file_id"):
-                    pid = await _extract_poster_id(bot, msg)
-                    if pid and getattr(db, "movies_col", None) is not None:
-                        await db.movies_col.update_one(
-                            {"movie_id": movie_id}, {"$set": {"poster_file_id": pid}}
-                        )
-            except Exception:
-                pass
-
-            cap_txt = f"{title}"
-            if year:
-                cap_txt += f" ({year})"
-            cap_txt += f"\n{file_name}\nQuality: {final_quality}"
-            file_id, channel_msg_id = await _copy_to_db(bot, msg, caption_text=cap_txt)
-            if not file_id:
-                logger.warning("no file_id for msg %s", msg_id)
-                continue
-
-            quality_data = {
-                "file_id": file_id,
-                "file_name": file_name,
-                "file_size": filesize,
-                "file_size_formatted": format_size(filesize) if filesize else "",
-                "label": quality_key,
-                "quality": final_quality,
-                "source_channel_id": channel_id,
-                "source_msg_id": msg_id,
-                "channel_msg_id": channel_msg_id,
-                "caption": cap_txt,
-            }
-            try:
-                ok = await db.add_quality_to_movie(movie_id, quality_key, quality_data)
-                await _prune_qualities(movie_id, keep_key=quality_key)
-                if ok:
-                    saved += 1
-                else:
-                    saved += 1
+                    raw = await bot.get_messages(channel_id, batch_ids)
+                    if isinstance(raw, list):
+                        msgs = raw
+                    elif raw is not None:
+                        msgs = [raw]
+                except Exception as e2:
+                    logger.warning("get_messages retry fail: %s", e2)
+                    msgs = []
             except Exception as e:
-                logger.warning("add_quality: %s", e)
+                logger.warning("get_messages batch: %s", e)
+                msgs = []
 
-            await asyncio.sleep(0.12)
+            # map by id for safety
+            by_id = {}
+            for m in msgs:
+                if m is None:
+                    continue
+                try:
+                    by_id[int(m.id)] = m
+                except Exception:
+                    pass
+
+            for mid in batch_ids:
+                if _CANCEL.get(admin_id):
+                    break
+                scanned += 1
+                if status_msg_id and (scanned % 5 == 0 or scanned == total):
+                    extra = f"\nLast: {last_title[:40]}" if last_title else ""
+                    await _status(
+                        bot, status_chat_id, status_msg_id,
+                        f"Indexing {scanned}/{total}\nSaved: {saved}\nPosted: {posted}{extra}",
+                    )
+
+                msg = by_id.get(mid)
+                if not msg or getattr(msg, "empty", False):
+                    continue
+
+                media = msg.document or msg.video or msg.audio or msg.animation
+                if not media:
+                    continue
+
+                file_name = (
+                    getattr(media, "file_name", None)
+                    or (msg.caption or "")[:80]
+                    or f"file_{mid}"
+                )
+                caption = msg.caption or ""
+                filesize = int(getattr(media, "file_size", 0) or 0)
+
+                title, year, final_quality = _title_from_name(file_name, caption)
+                if not title:
+                    continue
+
+                quality_key = final_quality  # only 480p / 720p / 1080p
+                norm = re.sub(r"[^\w\s]", " ", title.lower())
+                norm = re.sub(r"\s+", " ", norm).strip()
+                key = (norm, year)
+
+                if current_key is not None and key != current_key:
+                    prev = bucket.get(current_key)
+                    if prev and prev not in posted_set:
+                        if await _post_movie_to_group(bot, prev):
+                            posted += 1
+                            posted_set.add(prev)
+                    current_key = key
+                elif current_key is None:
+                    current_key = key
+
+                movie_id = bucket.get(key)
+                if not movie_id:
+                    existing = None
+                    try:
+                        existing = await db.find_movie_by_title_year(title, year)
+                    except Exception as e:
+                        logger.warning("find_movie: %s", e)
+                    if existing and existing.get("movie_id"):
+                        movie_id = existing["movie_id"]
+                    else:
+                        poster_file_id = await _extract_poster_id(bot, msg)
+                        try:
+                            doc = await db.create_movie(
+                                title=title,
+                                normalized_title=norm,
+                                year=year,
+                                poster_file_id=poster_file_id,
+                            )
+                            movie_id = doc.get("movie_id") if doc else None
+                        except Exception as e:
+                            logger.warning("create_movie: %s", e)
+                            movie_id = None
+                    if movie_id:
+                        bucket[key] = movie_id
+
+                if not movie_id:
+                    continue
+
+                try:
+                    mov = await db.get_movie(movie_id)
+                    if mov and not mov.get("poster_file_id"):
+                        pid = await _extract_poster_id(bot, msg)
+                        if pid and getattr(db, "movies_col", None) is not None:
+                            await db.movies_col.update_one(
+                                {"movie_id": movie_id}, {"$set": {"poster_file_id": pid}}
+                            )
+                except Exception:
+                    pass
+
+                cap_txt = f"{title}"
+                if year:
+                    cap_txt += f" ({year})"
+                cap_txt += f"\n{file_name}\nQuality: {final_quality}"
+                file_id, channel_msg_id = await _copy_to_db(bot, msg, caption_text=cap_txt)
+                if not file_id:
+                    logger.warning("no file_id for msg %s", mid)
+                    continue
+
+                quality_data = {
+                    "file_id": file_id,
+                    "file_name": file_name,
+                    "file_size": filesize,
+                    "file_size_formatted": format_size(filesize) if filesize else "",
+                    "label": quality_key,
+                    "quality": final_quality,
+                    "source_channel_id": channel_id,
+                    "source_msg_id": mid,
+                    "channel_msg_id": channel_msg_id,
+                    "caption": cap_txt,
+                }
+                try:
+                    await db.add_quality_to_movie(movie_id, quality_key, quality_data)
+                    await _prune_qualities(movie_id, keep_key=quality_key)
+                    saved += 1
+                    last_title = title
+                except Exception as e:
+                    logger.warning("add_quality: %s", e)
+                    continue
+
+                # Post as soon as movie has at least 1 quality (big-channel friendly)
+                if movie_id not in posted_set:
+                    if await _post_movie_to_group(bot, movie_id):
+                        posted += 1
+                        posted_set.add(movie_id)
+
+                await asyncio.sleep(0.08)
+
+            msg_id += BATCH
 
         for k, mid in list(bucket.items()):
             if mid not in posted_set:
