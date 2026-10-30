@@ -14,6 +14,7 @@ from handlers.movie_card import build_final_movie_card_text, build_final_movie_c
 logger = logging.getLogger("IndexingWorker")
 _CANCEL = {}
 _RUNNING = {}
+_CANCEL_HANDLER_ADDED = False
 
 
 def request_cancel(admin_id: int):
@@ -22,6 +23,40 @@ def request_cancel(admin_id: int):
 
 def is_running(admin_id: int) -> bool:
     return bool(_RUNNING.get(int(admin_id)))
+
+
+def _ensure_cancel_handler(bot: Client):
+    """Register idx_cancel callback once so Cancel button works during indexing."""
+    global _CANCEL_HANDLER_ADDED
+    if _CANCEL_HANDLER_ADDED:
+        return
+    try:
+        from pyrogram import filters as _f
+        from pyrogram.handlers import CallbackQueryHandler
+        from pyrogram.types import CallbackQuery
+
+        async def _on_idx_cancel(client: Client, query: CallbackQuery):
+            uid = int(query.from_user.id) if query.from_user else 0
+            request_cancel(uid)
+            try:
+                await query.answer("⏹ Cancelling indexing...", show_alert=True)
+            except Exception:
+                pass
+            try:
+                await query.edit_message_text(
+                    "⏹ Cancel requested.\nCurrent file ke baad indexing band ho jayegi."
+                )
+            except Exception:
+                pass
+
+        bot.add_handler(
+            CallbackQueryHandler(_on_idx_cancel, _f.regex(r"^idx_cancel$")),
+            group=-11,
+        )
+        _CANCEL_HANDLER_ADDED = True
+        logger.info("idx_cancel handler registered")
+    except Exception as e:
+        logger.warning("cancel handler register fail: %s", e)
 
 
 def _norm_quality(q: str) -> str:
@@ -128,12 +163,37 @@ async def _copy_to_db(bot, message, caption_text: str = None):
 
 
 async def _stabilize_poster(bot, poster_file_id: str) -> Optional[str]:
-    """Re-send poster to DB_CHANNEL so bot owns a reusable file_id."""
+    """Download poster bytes and re-upload to DB_CHANNEL for a stable file_id."""
     if not poster_file_id:
         return None
     db_ch = getattr(Config, "DB_CHANNEL", None)
     if not db_ch:
         return poster_file_id
+
+    # Method 1: download → re-upload (most reliable for thumbs / cross-chat ids)
+    try:
+        from io import BytesIO
+        data = await bot.download_media(poster_file_id, in_memory=True)
+        raw = None
+        if data is not None:
+            if hasattr(data, "getvalue"):
+                raw = data.getvalue()
+            elif hasattr(data, "read"):
+                raw = data.read()
+            elif isinstance(data, (bytes, bytearray)):
+                raw = bytes(data)
+        if raw and len(raw) > 100:
+            bio = BytesIO(raw)
+            bio.name = "poster.jpg"
+            sent = await bot.send_photo(int(db_ch), photo=bio)
+            if sent and sent.photo:
+                return sent.photo.file_id
+    except FloodWait as e:
+        await asyncio.sleep(int(getattr(e, "value", 3)) + 1)
+    except Exception as e:
+        logger.warning("stabilize download: %s", e)
+
+    # Method 2: direct file_id re-send
     try:
         sent = await bot.send_photo(int(db_ch), photo=poster_file_id)
         if sent and sent.photo:
@@ -145,18 +205,30 @@ async def _stabilize_poster(bot, poster_file_id: str) -> Optional[str]:
             if sent and sent.photo:
                 return sent.photo.file_id
         except Exception as e2:
-            logger.warning("stabilize_poster retry: %s", e2)
+            logger.warning("stabilize file_id retry: %s", e2)
     except Exception as e:
-        logger.warning("stabilize_poster: %s", e)
-    return poster_file_id  # fallback — try original id
+        logger.warning("stabilize file_id: %s", e)
+    return None
+
+
+def _best_thumb_id(thumbs) -> Optional[str]:
+    if not thumbs:
+        return None
+    try:
+        best = max(thumbs, key=lambda t: int(getattr(t, "file_size", 0) or 0))
+        return best.file_id
+    except Exception:
+        try:
+            return thumbs[-1].file_id
+        except Exception:
+            return None
 
 
 async def _extract_poster_id(bot, message) -> Optional[str]:
-    """Get poster file_id and stabilize it via DB_CHANNEL copy."""
+    """Get poster file_id and stabilize via download→DB_CHANNEL re-upload."""
     raw = None
     try:
         if message.photo:
-            # Prefer full photo; copy to DB for stable id
             db_ch = getattr(Config, "DB_CHANNEL", None)
             if db_ch:
                 try:
@@ -167,14 +239,11 @@ async def _extract_poster_id(bot, message) -> Optional[str]:
                     logger.warning("poster copy: %s", e)
             raw = message.photo.file_id
         elif message.video and getattr(message.video, "thumbs", None):
-            thumbs = message.video.thumbs
-            raw = thumbs[-1].file_id if thumbs else None
+            raw = _best_thumb_id(message.video.thumbs)
         elif message.document and getattr(message.document, "thumbs", None):
-            thumbs = message.document.thumbs
-            raw = thumbs[-1].file_id if thumbs else None
+            raw = _best_thumb_id(message.document.thumbs)
         elif message.animation and getattr(message.animation, "thumbs", None):
-            thumbs = message.animation.thumbs
-            raw = thumbs[-1].file_id if thumbs else None
+            raw = _best_thumb_id(message.animation.thumbs)
     except Exception:
         pass
     if raw:
@@ -266,7 +335,6 @@ async def _post_movie_to_group(bot: Client, movie_id: str, force_new: bool = Fal
         buttons = InlineKeyboardMarkup(rows) if rows else None
         poster_id = movie.get("poster_file_id")
 
-        # Try edit existing group post (so new qualities appear)
         g_chat = movie.get("group_chat_id")
         g_msg = movie.get("group_msg_id")
         if not force_new and g_chat and g_msg:
@@ -293,7 +361,6 @@ async def _post_movie_to_group(bot: Client, movie_id: str, force_new: bool = Fal
             except Exception as e:
                 logger.warning("edit group post failed (will send new): %s", e)
 
-        # Fresh post — always to MOVIE_GROUP_ID
         sent = None
         try:
             if poster_id:
@@ -306,7 +373,6 @@ async def _post_movie_to_group(bot: Client, movie_id: str, force_new: bool = Fal
                     )
                 except Exception as e:
                     logger.warning("send_photo (retry stabilize): %s", e)
-                    # one more try after re-stabilize
                     try:
                         stable = await _stabilize_poster(bot, poster_id)
                         if stable:
@@ -316,7 +382,6 @@ async def _post_movie_to_group(bot: Client, movie_id: str, force_new: bool = Fal
                                 caption=_safe(card_text),
                                 reply_markup=buttons,
                             )
-                            # save better id
                             try:
                                 if getattr(db, "movies_col", None) is not None:
                                     await db.movies_col.update_one(
@@ -381,6 +446,7 @@ async def run_indexing(
 
     _RUNNING[admin_id] = True
     _CANCEL[admin_id] = False
+    _ensure_cancel_handler(bot)
 
     total = end_id - start_id + 1
     scanned = saved = posted = 0
@@ -589,8 +655,6 @@ async def run_indexing(
                     logger.warning("add_quality: %s", e)
                     continue
 
-                # First time this run → always NEW post (appears at top of group).
-                # Later qualities of same movie → EDIT that post (add 720p/1080p buttons).
                 try:
                     if movie_id not in posted_set:
                         result = await _post_movie_to_group(bot, movie_id, force_new=True)
