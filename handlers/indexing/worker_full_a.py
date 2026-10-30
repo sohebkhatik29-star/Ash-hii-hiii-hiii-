@@ -223,29 +223,18 @@ def _best_thumb_id(thumbs) -> Optional[str]:
 
 
 async def _extract_poster_id(bot, message) -> Optional[str]:
-    """Get poster file_id and stabilize via download→DB_CHANNEL re-upload."""
-    raw = None
+    """Fast: return raw thumb/photo file_id only. Stabilize later at post time."""
     try:
         if message.photo:
-            db_ch = getattr(Config, "DB_CHANNEL", None)
-            if db_ch:
-                try:
-                    copied = await message.copy(int(db_ch))
-                    if copied and copied.photo:
-                        return copied.photo.file_id
-                except Exception as e:
-                    logger.warning("poster copy: %s", e)
-            raw = message.photo.file_id
-        elif message.video and getattr(message.video, "thumbs", None):
-            raw = _best_thumb_id(message.video.thumbs)
-        elif message.document and getattr(message.document, "thumbs", None):
-            raw = _best_thumb_id(message.document.thumbs)
-        elif message.animation and getattr(message.animation, "thumbs", None):
-            raw = _best_thumb_id(message.animation.thumbs)
+            return message.photo.file_id
+        if message.video and getattr(message.video, "thumbs", None):
+            return _best_thumb_id(message.video.thumbs)
+        if message.document and getattr(message.document, "thumbs", None):
+            return _best_thumb_id(message.document.thumbs)
+        if message.animation and getattr(message.animation, "thumbs", None):
+            return _best_thumb_id(message.animation.thumbs)
     except Exception:
         pass
-    if raw:
-        return await _stabilize_poster(bot, raw)
     return None
 
 
@@ -308,10 +297,19 @@ def _title_from_name(file_name: str, caption: str = "") -> tuple:
 
     if title:
         title = _clean_title(title)
-    if not title:
+    if not title or title.lower() in ("untitled movie", "untitled", "unknown"):
         title = _clean_title(file_name or "") or _clean_title(caption or "")
-    if not title:
-        title = (file_name or "Unknown")[:60]
+    if not title or title.lower() in ("untitled movie", "untitled", "unknown"):
+        raw = f"{file_name or ''} {caption or ''}"
+        m = re.search(
+            r"(?i)^(.*?)\b(2160p|1440p|1080p|720p|480p|360p|240p|4k|hdrip|webrip|web-dl|bluray|x264|x265|hevc)\b",
+            raw,
+        )
+        if m and m.group(1).strip():
+            title = _clean_title(m.group(1)) or m.group(1).strip()[:60]
+        else:
+            title = (file_name or caption or "Unknown")[:60]
+            title = re.sub(r"\.[a-z0-9]{2,4}$", "", title, flags=re.I).strip() or "Unknown"
 
     return title, year, _norm_quality(q)
 
@@ -477,7 +475,7 @@ async def run_indexing(
     _ensure_cancel_handler(bot)
 
     total = end_id - start_id + 1
-    scanned = saved = posted = 0
+    scanned = saved = posted = media_found = 0
     bucket = {}
     posted_set = set()
     current_key = None
@@ -544,11 +542,12 @@ async def run_indexing(
                 if _CANCEL.get(admin_id):
                     break
                 scanned += 1
-                if status_msg_id and (scanned % 5 == 0 or scanned == total):
+                if status_msg_id and (scanned % 10 == 0 or scanned == total):
                     extra = f"\nLast: {last_title[:40]}" if last_title else ""
                     await _status(
                         bot, status_chat_id, status_msg_id,
-                        f"Indexing {scanned}/{total}\nSaved: {saved}\nPosted: {posted}{extra}",
+                        f"Indexing {scanned}/{total}\nMedia: {media_found}\n"
+                        f"Saved: {saved}\nPosted: {posted}{extra}",
                     )
 
                 msg = by_id.get(mid)
@@ -557,18 +556,7 @@ async def run_indexing(
 
                 if msg.photo and not (msg.document or msg.video or msg.audio or msg.animation):
                     try:
-                        db_ch = getattr(Config, "DB_CHANNEL", None)
-                        if db_ch:
-                            try:
-                                copied = await msg.copy(int(db_ch))
-                                if copied and copied.photo:
-                                    pending_poster = copied.photo.file_id
-                                else:
-                                    pending_poster = msg.photo.file_id
-                            except Exception:
-                                pending_poster = await _stabilize_poster(bot, msg.photo.file_id)
-                        else:
-                            pending_poster = msg.photo.file_id
+                        pending_poster = msg.photo.file_id
                     except Exception:
                         pass
                     continue
@@ -576,6 +564,7 @@ async def run_indexing(
                 media = msg.document or msg.video or msg.audio or msg.animation
                 if not media:
                     continue
+                media_found += 1
 
                 file_name = (
                     getattr(media, "file_name", None)
@@ -695,7 +684,7 @@ async def run_indexing(
                 except Exception as e:
                     logger.warning("post/update: %s", e)
 
-                await asyncio.sleep(0.08)
+                await asyncio.sleep(0.03)
 
             msg_id += BATCH
 
@@ -712,13 +701,15 @@ async def run_indexing(
             if _CANCEL.get(admin_id):
                 await _status(
                     bot, status_chat_id, status_msg_id,
-                    f"⏹ Cancelled\nScanned: {scanned}/{total}\nSaved: {saved}\nPosted: {posted}",
+                    f"⏹ Cancelled\nScanned: {scanned}/{total}\nMedia: {media_found}\n"
+                    f"Saved: {saved}\nPosted: {posted}",
                     show_cancel=False,
                 )
             else:
                 await _status(
                     bot, status_chat_id, status_msg_id,
-                    f"✅ Done\nScanned: {scanned}/{total}\nSaved: {saved}\nPosted: {posted}",
+                    f"✅ Done\nScanned: {scanned}/{total}\nMedia: {media_found}\n"
+                    f"Saved: {saved}\nPosted: {posted}",
                     show_cancel=False,
                 )
     except Exception as e:
