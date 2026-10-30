@@ -1,7 +1,7 @@
 # handlers/indexing/panel.py — Indexing menu + buttons (idx_*)
 import logging
 import re
-from pyrogram import Client, filters
+from pyrogram import Client, filters, StopPropagation
 from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message
 
 from configs import Config
@@ -40,23 +40,16 @@ async def open_indexing_menu(client: Client, query: CallbackQuery):
     try:
         await query.edit_message_text(text, reply_markup=kb_idx_menu())
     except Exception as e:
+        # Do NOT send a new message — prevents double panels when another handler also ran
         logger.warning("open_indexing_menu edit: %s", e)
-        try:
-            await client.send_message(query.message.chat.id, text, reply_markup=kb_idx_menu())
-        except Exception as e2:
-            logger.warning("open_indexing_menu send: %s", e2)
 
 
 async def _safe_edit(query: CallbackQuery, text: str, reply_markup=None):
     try:
         await query.edit_message_text(text, reply_markup=reply_markup)
-        return
     except Exception as e:
+        # No reply fallback — avoids duplicate messages on double-handler races
         logger.warning("edit fail: %s", e)
-    try:
-        await query.message.reply_text(text, reply_markup=reply_markup)
-    except Exception as e2:
-        logger.warning("reply fail: %s", e2)
 
 
 async def _handle_idx_set_ch(client: Client, query: CallbackQuery, uid: int):
@@ -119,7 +112,7 @@ def register_indexing_handlers(bot: Client):
         try:
             if not _is_admin(uid):
                 await query.answer("Sirf owner/admin ke liye.", show_alert=True)
-                return
+                raise StopPropagation
             try:
                 await query.answer()
             except Exception:
@@ -127,27 +120,31 @@ def register_indexing_handlers(bot: Client):
 
             if data in ("ap_idx_menu", "idx_menu"):
                 await open_indexing_menu(client, query)
-                return
+                raise StopPropagation
             if data == "idx_set_ch":
                 await _handle_idx_set_ch(client, query, uid)
-                return
+                raise StopPropagation
             if data == "idx_list_ch":
                 await _handle_idx_list_ch(client, query, uid)
-                return
+                raise StopPropagation
             if data.startswith("idx_ch:"):
                 try:
                     cid = int(data.split(":", 1)[1])
                 except Exception:
                     await query.answer("Invalid channel", show_alert=True)
-                    return
+                    raise StopPropagation
                 await _handle_idx_ch(client, query, uid, cid)
-                return
+                raise StopPropagation
+            raise StopPropagation
+        except StopPropagation:
+            raise
         except Exception as e:
             logger.exception("idx_router: %s", e)
             try:
                 await query.answer(f"Error: {type(e).__name__}", show_alert=True)
             except Exception:
                 pass
+            raise StopPropagation
 
     @bot.on_message(filters.private & filters.incoming, group=-10)
     async def _idx_text(client: Client, message: Message):
