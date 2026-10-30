@@ -170,7 +170,6 @@ async def _stabilize_poster(bot, poster_file_id: str) -> Optional[str]:
     if not db_ch:
         return poster_file_id
 
-    # Method 1: download → re-upload (most reliable for thumbs / cross-chat ids)
     try:
         from io import BytesIO
         data = await bot.download_media(poster_file_id, in_memory=True)
@@ -193,7 +192,6 @@ async def _stabilize_poster(bot, poster_file_id: str) -> Optional[str]:
     except Exception as e:
         logger.warning("stabilize download: %s", e)
 
-    # Method 2: direct file_id re-send
     try:
         sent = await bot.send_photo(int(db_ch), photo=poster_file_id)
         if sent and sent.photo:
@@ -251,6 +249,42 @@ async def _extract_poster_id(bot, message) -> Optional[str]:
     return None
 
 
+_NOISE_RE = re.compile(
+    r"\b("
+    r"HDTC|HDCAM|HDTS|HDRip|HDRIP|WEBRip|WEB-DL|WEBDL|BluRay|BRRip|BDRip|"
+    r"x264|x265|HEVC|AAC|HC|ESub|CineVood|"
+    r"Hindi|Punjabi|Tamil|Telugu|Malayalam|Marathi|Kannada|English|Eng|Hind|"
+    r"Org|Original|Dual|Audio|Multi|HQ|Proper|REPACK|Extended|Uncut|"
+    r"\d{3,4}p|10bit|8bit"
+    r")\b",
+    re.I,
+)
+
+
+def _clean_title(raw: str) -> str:
+    """Strip quality/lang/source noise so same movie groups together."""
+    if not raw:
+        return ""
+    base = re.sub(r"\.[a-z0-9]{2,4}$", "", str(raw), flags=re.I)
+    base = re.sub(r"\bDUAL\s*A(?:UDIO)?\b", " ", base, flags=re.I)
+    base = re.sub(r"\bMULTI\s*AUDIO\b", " ", base, flags=re.I)
+    base = _NOISE_RE.sub(" ", base)
+    base = re.sub(r"[&]+", " and ", base)
+    base = re.sub(r"[_\.\-\[\]\(\)\{\},:;/+]+", " ", base)
+    base = re.sub(r"\b(19\d{2}|20\d{2})\b", "", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    base = re.sub(r"\b[A-Za-z]\b", " ", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    return base
+
+
+def _norm_key(title: str) -> str:
+    t = _clean_title(title).lower()
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def _title_from_name(file_name: str, caption: str = "") -> tuple:
     meta = {}
     try:
@@ -272,18 +306,12 @@ def _title_from_name(file_name: str, caption: str = "") -> tuple:
     if not q:
         q = _norm_quality(combined)
 
+    if title:
+        title = _clean_title(title)
     if not title:
-        base = re.sub(r"\.[a-z0-9]{2,4}$", "", file_name or "", flags=re.I)
-        base = re.sub(
-            r"\b(HDTC|HDCAM|HDTS|HDRip|WEBRip|WEB-DL|BluRay|BRRip|x264|x265|HEVC|AAC|HC|ESub|CineVood|Hindi|Punjabi|Tamil|Telugu|Malayalam|Marathi|Kannada|\d{3,4}p|10bit|8bit)\b",
-            " ",
-            base,
-            flags=re.I,
-        )
-        base = re.sub(r"[_\.\-\[\]\(\)]+", " ", base)
-        base = re.sub(r"\s+", " ", base).strip()
-        base = re.sub(r"\b(19\d{2}|20\d{2})\b", "", base).strip()
-        title = base or (file_name or "Unknown")[:60]
+        title = _clean_title(file_name or "") or _clean_title(caption or "")
+    if not title:
+        title = (file_name or "Unknown")[:60]
 
     return title, year, _norm_quality(q)
 
@@ -562,8 +590,7 @@ async def run_indexing(
                     continue
 
                 quality_key = final_quality
-                norm = re.sub(r"[^\w\s]", " ", title.lower())
-                norm = re.sub(r"\s+", " ", norm).strip()
+                norm = _norm_key(title)
                 key = (norm, year)
 
                 if current_key is not None and key != current_key:
