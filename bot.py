@@ -75,7 +75,8 @@ async def addmovie_command(bot: Client, cmd: Message):
 @Bot.on_message(filters.command(["finish", "done_upload"]) & filters.private)
 async def finish_command(bot: Client, cmd: Message):
     try:
-        await handle_generate_links_action(bot, cmd)
+        admin_id = cmd.from_user.id if cmd.from_user else 0
+        await handle_generate_links_action(bot, cmd.chat.id, admin_id)
     except Exception as e:
         logger.exception(f"finish: {e}")
 
