@@ -62,10 +62,18 @@ async def addmovie_command(bot: Client, cmd: Message):
         if admin_id not in Config.ADMINS:
             await cmd.reply_text("\u26a0\ufe0f Sirf admin /addmovie use kar sakte hain.", quote=True)
             return
+        status_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Continue Upload", callback_data="session_continue"),
+                InlineKeyboardButton("Generate Links", callback_data="session_generate"),
+            ],
+            [InlineKeyboardButton("Cancel Session", callback_data="session_cancel")],
+        ])
         status_msg = await cmd.reply_text(
             "\U0001f3ac <b>Movie Upload Session Started</b> (v3)\n\n"
             "Pehli video file bhejo. Caption optional hai.\n"
-            "Jab saari files aa jayein to <b>/finish</b> ya Generate Links dabao.",
+            "Saari files aa jayein to <b>Generate Links</b> button dabao.",
+            reply_markup=status_kb,
             quote=True,
         )
         await session_mgr.start_addmovie_session(admin_id, status_msg.id if status_msg else 0, cmd.chat.id)
@@ -193,7 +201,6 @@ async def setup_bot_commands(bot: Client):
         BotCommand("help", "Help & how to use"),
         BotCommand("addmovie", "Start movie upload session"),
         BotCommand("cancel", "Cancel upload session"),
-        BotCommand("finish", "Generate links / finish session"),
     ]
     try:
         await bot.delete_bot_commands(scope=BotCommandScopeDefault())
