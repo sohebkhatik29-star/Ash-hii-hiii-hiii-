@@ -95,33 +95,36 @@ async def _bot_is_admin(client, channel_id):
         return False
 
 
-async def _copy_to_db(bot, message, caption_text: str = None) -> Optional[str]:
+async def _copy_to_db(bot, message, caption_text: str = None):
+    """Copy media to DB_CHANNEL. Returns (file_id, channel_msg_id)."""
     media = message.document or message.video or message.audio or message.animation
     if not media:
-        return None
-    # prefer provided caption, else original caption, else file name
+        return None, None
     fname = getattr(media, "file_name", None) or ""
     cap = (caption_text or message.caption or fname or "").strip()
     if len(cap) > 1024:
         cap = cap[:1020] + "..."
+    orig_fid = getattr(media, "file_id", None)
     db_ch = getattr(Config, "DB_CHANNEL", None)
     if not db_ch:
-        return getattr(media, "file_id", None)
+        return orig_fid, None
     try:
         copied = await message.copy(int(db_ch), caption=cap if cap else None)
         m = copied.document or copied.video or copied.audio or copied.animation
-        return getattr(m, "file_id", None) if m else getattr(media, "file_id", None)
+        fid = getattr(m, "file_id", None) if m else orig_fid
+        return fid, getattr(copied, "id", None)
     except FloodWait as e:
         await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
         try:
             copied = await message.copy(int(db_ch), caption=cap if cap else None)
             m = copied.document or copied.video or copied.audio or copied.animation
-            return getattr(m, "file_id", None) if m else getattr(media, "file_id", None)
+            fid = getattr(m, "file_id", None) if m else orig_fid
+            return fid, getattr(copied, "id", None)
         except Exception:
-            return getattr(media, "file_id", None)
+            return orig_fid, None
     except Exception as e:
         logger.warning("copy_to_db: %s", e)
-        return getattr(media, "file_id", None)
+        return orig_fid, None
 
 
 async def _extract_poster_id(bot, message) -> Optional[str]:
@@ -203,11 +206,12 @@ async def _post_movie_to_group(bot: Client, movie_id: str) -> bool:
             label = f"⬇️ Download {q_name}" + (f" ({size_str})" if size_str else "")
             channel_msg_id = q_data.get("channel_msg_id")
             q_slug = str(q_name).replace(" ", "_").lower()
-            bot_user = getattr(Config, "BOT_USERNAME", None) or "Ash_best_movie_bot"
+            bot_user = (getattr(Config, "BOT_USERNAME", None) or "").lstrip("@") or "Ash_best_movie_bot"
             if channel_msg_id:
                 url = f"https://t.me/{bot_user}?start=f_{channel_msg_id}"
             else:
-                url = f"https://t.me/{bot_user}?start=dl_{movie_id}_{q_slug}"
+                # start_handler supports q_<movie_id>_<quality>
+                url = f"https://t.me/{bot_user}?start=q_{movie_id}_{q_slug}"
             rows.append([InlineKeyboardButton(label, url=url)])
         rows.append([
             InlineKeyboardButton(
@@ -386,7 +390,7 @@ async def run_indexing(
             if year:
                 cap_txt += f" ({year})"
             cap_txt += f"\n{file_name}\nQuality: {final_quality}"
-            file_id = await _copy_to_db(bot, msg, caption_text=cap_txt)
+            file_id, channel_msg_id = await _copy_to_db(bot, msg, caption_text=cap_txt)
             if not file_id:
                 logger.warning("no file_id for msg %s", msg_id)
                 continue
@@ -400,7 +404,7 @@ async def run_indexing(
                 "quality": final_quality,
                 "source_channel_id": channel_id,
                 "source_msg_id": msg_id,
-                "channel_msg_id": None,
+                "channel_msg_id": channel_msg_id,
                 "caption": cap_txt,
             }
             try:
