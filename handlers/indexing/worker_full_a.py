@@ -254,7 +254,8 @@ def _clean_title(raw: str) -> str:
     """Strip quality/lang/source noise so same movie groups together."""
     if not raw:
         return ""
-    base = re.sub(r"\.[a-z0-9]{2,4}$", "", str(raw), flags=re.I)
+    base = re.sub(r"@[\w_]+", " ", str(raw))
+    base = re.sub(r"\.[a-z0-9]{2,4}$", "", base, flags=re.I)
     base = re.sub(r"\bDUAL\s*A(?:UDIO)?\b", " ", base, flags=re.I)
     base = re.sub(r"\bMULTI\s*AUDIO\b", " ", base, flags=re.I)
     base = _NOISE_RE.sub(" ", base)
