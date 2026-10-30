@@ -114,8 +114,9 @@ def build_final_movie_card_buttons(movie: Dict[str, Any], for_group: bool = Fals
             buttons.append([InlineKeyboardButton(label, callback_data=callback_data)])
 
     if for_group:
+        # Same as indexing posts — Updates Channel only
         buttons.append([
-            InlineKeyboardButton("🎬 Open Movie Bot", url=f"https://t.me/{Config.BOT_USERNAME}?start=mov_{movie_id}")
+            InlineKeyboardButton("📢 Updates Channel", url="https://t.me/ash_movie_1782")
         ])
     else:
         channel_url = f"https://t.me/{Config.UPDATES_CHANNEL}" if Config.UPDATES_CHANNEL and not str(Config.UPDATES_CHANNEL).startswith("-") else f"https://t.me/{Config.BOT_USERNAME}"
