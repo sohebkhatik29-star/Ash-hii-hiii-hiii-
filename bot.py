@@ -68,7 +68,7 @@ async def addmovie_command(bot: Client, cmd: Message):
             "Jab saari files aa jayein to <b>/finish</b> ya Generate Links dabao.",
             quote=True,
         )
-        await session_mgr.start_session(admin_id, status_msg.id if status_msg else None)
+        await session_mgr.start_addmovie_session(admin_id, status_msg.id if status_msg else 0, cmd.chat.id)
     except Exception as e:
         logger.exception(f"addmovie: {e}")
 
