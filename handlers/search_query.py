@@ -3,12 +3,13 @@
 #
 # Rules:
 # 1) Year-only → never match
-# 2) Full significant title words in query → match
-#    "FURY IN THE SHADOWS" / "fury shadows" → Fury In The Shadows
-# 3) Single distinctive FIRST word (len >= 5) → match
-#    "PUSHPA" → Pushpa The Rise   (franchise / main name)
+# 2) All query words appear in title → match
+#    "LITTLE KRISHNA" → Little Krishna ...   (NOT Little Thomas)
+# 3) All title words appear in query → match (short titles)
+# 4) Single distinctive FIRST word (len >= 5) → match franchise
+#    "PUSHPA" → Pushpa The Rise
 #    "FURY" (len 4) → NO match on Fury In The Shadows
-# 4) Weak tail-only (RISE, SHADOWS without first word) → NO match
+# 5) Weak tail-only (RISE, SHADOWS without first word) → NO match
 # ============================================================================
 import re
 from typing import List
@@ -72,9 +73,9 @@ def _title_tokens(title: str) -> List[str]:
 def is_strict_title_match(query: str, movie_title: str, movie_year=None) -> bool:
     """
     Hybrid smart match:
-    - Full significant title in query → OK
-    - Query = distinctive first word of title (len >= 5) → OK  (PUSHPA)
-    - Short first word only (FURY len4) when title multi-word → NO
+    - All query words in title → OK  (LITTLE KRISHNA → Little Krishna, not Little Thomas)
+    - All title words in query → OK  (short exact titles)
+    - Query = single distinctive first word (len >= 5) → OK franchise (PUSHPA)
     - Year-only / weak tail-only → NO
     """
     q = clean_search_query(query)
@@ -96,6 +97,7 @@ def is_strict_title_match(query: str, movie_title: str, movie_year=None) -> bool
         return False
 
     q_set = set(q_words)
+    title_set = set(title_words)
 
     # Year constraint when user typed a year
     if q_years and movie_year is not None:
@@ -106,15 +108,21 @@ def is_strict_title_match(query: str, movie_title: str, movie_year=None) -> bool
             if str(movie_year) not in q_years:
                 return False
 
-    # Path A: every significant title word is in the query (full name)
+    # Path A: every query word appears in the title
+    # "LITTLE KRISHNA" matches "Little Krishna Movie 1" but NOT "Little Thomas"
+    if all(qw in title_set for qw in q_words):
+        return True
+
+    # Path B: every significant title word is in the query (query covers full title)
     if all(tw in q_set for tw in title_words):
         return True
 
-    # Path B: distinctive main/franchise name = first title word, len >= 5
-    # PUSHPA → Pushpa The Rise  |  RRR → RRR  |  FURY (4) → blocked
-    first = title_words[0]
-    if len(first) >= 5 and first in q_set:
-        return True
+    # Path C: single-word franchise query — first title word only, len >= 5
+    # "PUSHPA" → Pushpa The Rise  |  "FURY" (len 4) → blocked
+    if len(q_words) == 1:
+        first = title_words[0]
+        if len(first) >= 5 and first == q_words[0]:
+            return True
 
     return False
 
