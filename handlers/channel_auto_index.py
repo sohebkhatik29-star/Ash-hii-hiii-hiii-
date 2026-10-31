@@ -1,17 +1,15 @@
-# ============================================================================
 # handlers/channel_auto_index.py
-# Auto-index: watch channel pe nayi movie files aate hi
-#   - title+year se movie identify
-#   - saari qualities save
-#   - har movie ka alag group post (Pushpa 2021 vs Pushpa 2 2025)
-# Sirf isi file me logic — dusre modules me change nahi.
-# ============================================================================
+# Auto-index: watch channel pe file aate hi save + settle ke baad group post
+# - title+year se movie identify (channel brand clean)
+# - same movie ki qualities collect (debounce)
+# - har movie ka ek hi group post (edit pe update)
+
 from __future__ import annotations
 
 import asyncio
 import logging
 import re
-from typing import Dict, Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
@@ -23,7 +21,6 @@ from handlers.parser import extract_movie_metadata, format_size
 
 logger = logging.getLogger("ChannelAutoIndex")
 
-# User-given watch channel (bot must be admin)
 _DEFAULT_CH = "-1004397160844"
 WATCH_CHANNEL_ID = int(
     __import__("os").environ.get("AUTO_INDEX_CHANNEL_ID")
@@ -31,8 +28,7 @@ WATCH_CHANNEL_ID = int(
     or _DEFAULT_CH
 )
 
-# Same movie ki qualities collect karne ka wait (seconds)
-SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "25") or 25)
+SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "40") or 40)
 
 _pending_finalize: Dict[str, asyncio.Task] = {}
 _key_to_movie: Dict[str, str] = {}
@@ -48,6 +44,35 @@ def _safe(text: Any, fallback: str = "") -> str:
         return fallback
 
 
+def _clean_title(raw: str) -> str:
+    if not raw:
+        return ""
+    t = str(raw)
+    t = re.sub(r"@\w+", " ", t)
+    t = re.sub(
+        r"(?i)\b("
+        r"toonworld4all|toonworld|movies[_\s]?\d+|movie[_\s]?\d+|"
+        r"ash[_\s]?movies?|movies[_\s]?hub|cine[_\s]?hub|"
+        r"netflix[_\s]?\d+|filmcity|mirror[_\s]?leech"
+        r")\b",
+        " ",
+        t,
+    )
+    t = re.sub(
+        r"(?i)\b("
+        r"480p|720p|1080p|2160p|4k|hdrip|web[- ]?dl|bluray|brrip|"
+        r"hdcam|camrip|dvdrip|x264|x265|hevc|aac|dts|dd5\.?1|"
+        r"10bit|8bit|multi\s*audio|esub|dual\s*audio|hindi|"
+        r"mkv|mp4|avi|amzn|nf|dsnp"
+        r")\b",
+        " ",
+        t,
+    )
+    t = re.sub(r"[\[\]\(\)\{\}|_\-]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def _movie_key(title: str, year: Any) -> str:
     t = re.sub(r"[^\w\s]", "", (title or "").lower())
     t = re.sub(r"\s+", " ", t).strip()
@@ -55,8 +80,19 @@ def _movie_key(title: str, year: Any) -> str:
     return f"{t}|{y}"
 
 
+def _norm_quality(q: str) -> str:
+    s = str(q or "").lower()
+    if "1080" in s or "fhd" in s:
+        return "1080p"
+    if "720" in s or re.search(r"\bhd\b", s):
+        return "720p"
+    if "480" in s or "360" in s or "sd" in s:
+        return "480p"
+    return "720p"
+
+
 def _quality_key(meta: dict) -> str:
-    q = (meta.get("quality") or "HD").strip()
+    q = _norm_quality(meta.get("quality") or "")
     season = (meta.get("season") or "").strip()
     episode = (meta.get("episode") or "").strip()
     if episode:
@@ -65,18 +101,20 @@ def _quality_key(meta: dict) -> str:
             parts.append(season)
         parts.append(episode)
         return " ".join(parts)
-    return q or "HD"
+    return q
 
 
 async def _notify(bot: Client, text: str):
-    """Owner / LOG_CHANNEL pe short status."""
     targets = []
     log_ch = getattr(Config, "LOG_CHANNEL", None)
     owner = getattr(Config, "BOT_OWNER", None)
     if log_ch:
         targets.append(int(log_ch))
     if owner:
-        targets.append(int(owner))
+        try:
+            targets.append(int(owner))
+        except Exception:
+            pass
     for t in targets:
         try:
             await bot.send_message(t, _safe(text)[:3500], disable_web_page_preview=True)
@@ -98,24 +136,24 @@ async def _copy_to_db(bot: Client, message: Message, caption_text: str = None) -
     if not db_ch:
         return orig_fid, None
     try:
-        copied = await message.copy(int(db_ch), caption=cap if cap else None)
-        m = copied.document or copied.video or copied.audio or copied.animation
-        return (getattr(m, "file_id", None) if m else orig_fid), getattr(copied, "id", None)
+        sent = await message.copy(int(db_ch), caption=cap if cap else None)
+        m = sent.document or sent.video or sent.audio or sent.animation
+        return (getattr(m, "file_id", None) or orig_fid), (sent.id if sent else None)
     except FloodWait as e:
         await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
         try:
-            copied = await message.copy(int(db_ch), caption=cap if cap else None)
-            m = copied.document or copied.video or copied.audio or copied.animation
-            return (getattr(m, "file_id", None) if m else orig_fid), getattr(copied, "id", None)
+            sent = await message.copy(int(db_ch), caption=cap if cap else None)
+            m = sent.document or sent.video or sent.audio or sent.animation
+            return (getattr(m, "file_id", None) or orig_fid), (sent.id if sent else None)
         except Exception:
             return orig_fid, None
     except Exception as e:
-        logger.warning("auto_index copy_to_db: %s", e)
+        logger.warning("copy_to_db: %s", e)
         return orig_fid, None
 
 
 async def _get_or_create_movie(title: str, year: Any, language: str = None) -> Optional[str]:
-    title = _safe(title) or "Unknown"
+    title = _clean_title(_safe(title)) or "Unknown"
     year_val = None
     try:
         if year is not None and str(year).isdigit():
@@ -166,24 +204,26 @@ async def _post_or_update_group(bot: Client, movie_id: str) -> bool:
     g_chat, g_msg = movie.get("group_chat_id"), movie.get("group_msg_id")
 
     if g_chat and g_msg:
-        try:
-            if poster_id:
-                try:
-                    await bot.edit_message_caption(
-                        int(g_chat), int(g_msg),
-                        caption=_safe(card_text),
-                        reply_markup=buttons,
-                    )
-                    return True
-                except Exception:
-                    pass
-            await bot.edit_message_text(
+        for edit_fn in (
+            lambda: bot.edit_message_caption(
+                int(g_chat), int(g_msg),
+                caption=_safe(card_text),
+                reply_markup=buttons,
+            ),
+            lambda: bot.edit_message_text(
                 int(g_chat), int(g_msg),
                 text=_safe(card_text),
                 reply_markup=buttons,
                 disable_web_page_preview=True,
-            )
-            return True
+            ),
+        ):
+            try:
+                await edit_fn()
+                return True
+            except Exception:
+                continue
+        try:
+            await bot.delete_messages(int(g_chat), int(g_msg))
         except Exception:
             pass
 
@@ -260,10 +300,10 @@ async def _finalize_movie(bot: Client, movie_key: str, movie_id: str):
         )
         await _notify(
             bot,
-            f"✅ Auto-index POSTED\n"
+            f"{'✅' if ok else '⚠️'} Auto-index {'POSTED' if ok else 'POST FAIL'}\n"
             f"🎬 {title}\n"
             f"📦 Qualities: {', '.join(qs) if qs else '-'}\n"
-            f"{'Group me post ho gaya' if ok else '⚠️ Group post fail — logs check karo'}",
+            f"{'Group me post/update ho gaya' if ok else 'Group post fail — bot admin + permission check karo'}",
         )
     except asyncio.CancelledError:
         return
@@ -311,19 +351,23 @@ async def _handle_channel_media(bot: Client, message: Message):
     except Exception:
         meta = {}
 
-    title = _safe(
+    raw_title = _safe(
         meta.get("title")
         or (file_name.rsplit(".", 1)[0] if file_name else "")
-        or (caption[:80] if caption else "")
+        or (caption.split("\n")[0] if caption else "")
         or "Unknown"
     )
+    title = _clean_title(raw_title) or raw_title
     year = meta.get("year")
+    if not year:
+        m = re.search(r"(19|20)\d{2}", f"{file_name} {caption}")
+        if m:
+            year = m.group(0)
     language = meta.get("language") or "Hindi"
     q_key = _quality_key(meta)
 
     if not title or title.lower() in ("unknown", "untitled", ""):
         logger.info("auto_index skip empty title msg=%s fname=%s", message.id, file_name)
-        await _notify(bot, f"⚠️ Auto-index: title nahi mila\nmsg={message.id}\nfile={file_name or caption[:60]}")
         return
 
     file_id, db_msg_id = await _copy_to_db(bot, message, caption_text=caption or file_name)
@@ -332,7 +376,6 @@ async def _handle_channel_media(bot: Client, message: Message):
     if not file_id:
         _stats["errors"] += 1
         logger.warning("auto_index no file_id msg=%s", message.id)
-        await _notify(bot, f"❌ Auto-index: file_id nahi mila msg={message.id}")
         return
 
     movie_id = await _get_or_create_movie(title, year, language=language)
@@ -348,10 +391,11 @@ async def _handle_channel_media(bot: Client, message: Message):
         "file_size": file_size,
         "file_size_formatted": format_size(file_size) if file_size else "?",
         "label": q_key,
-        "quality": meta.get("quality") or "HD",
+        "quality": q_key,
         "season": meta.get("season") or None,
         "episode": meta.get("episode") or None,
         "db_msg_id": db_msg_id,
+        "channel_msg_id": db_msg_id,
         "source_chat_id": chat_id,
         "source_msg_id": int(message.id),
     }
@@ -360,12 +404,10 @@ async def _handle_channel_media(bot: Client, message: Message):
     except Exception as e:
         _stats["errors"] += 1
         logger.error("add_quality: %s", e)
-        await _notify(bot, f"❌ Auto-index add_quality fail: {e}")
         return
 
     _stats["saved"] += 1
 
-    # Thumb as poster if none
     try:
         movie = await db.get_movie(movie_id)
         if movie and not movie.get("poster_file_id"):
@@ -392,67 +434,41 @@ async def _handle_channel_media(bot: Client, message: Message):
         "auto_index SAVED title=%s year=%s quality=%s movie_id=%s msg=%s",
         title, year, q_key, movie_id, message.id,
     )
-    await _notify(
-        bot,
-        f"📥 Auto-index SAVED\n"
-        f"🎬 {title}" + (f" ({year})" if year else "") + "\n"
-        f"📦 {q_key} • {format_size(file_size) if file_size else '?'}\n"
-        f"⏳ Group post ~{SETTLE_SECONDS}s baad (aur qualities wait)",
-    )
 
 
 def register_channel_auto_index(bot: Client):
     """Register watcher for AUTO INDEX channel."""
-    if not WATCH_CHANNEL_ID:
-        logger.warning("Channel auto-index: no WATCH_CHANNEL_ID configured")
-        return
 
-    # Broad filter: any message in that chat; media check inside handler
-    # group=-2 so it runs early and is not blocked by other handlers
-    @bot.on_message(filters.chat(WATCH_CHANNEL_ID), group=-2)
-    async def _on_watch_any(client: Client, message: Message):
+    @bot.on_message(
+        filters.chat(WATCH_CHANNEL_ID)
+        & (filters.document | filters.video | filters.audio | filters.animation),
+        group=0,
+    )
+    async def _on_watch_media(client: Client, message: Message):
         try:
             await _handle_channel_media(client, message)
         except Exception as e:
             _stats["errors"] += 1
-            logger.exception("channel auto-index handler: %s", e)
+            logger.exception("auto_index handler: %s", e)
             try:
                 await _notify(client, f"❌ Auto-index handler error:\n{type(e).__name__}: {e}")
             except Exception:
                 pass
 
-    # Also explicit media filter as backup (some pyrofork builds differ)
-    @bot.on_message(
-        filters.chat(WATCH_CHANNEL_ID)
-        & (filters.document | filters.video | filters.audio | filters.animation),
-        group=-3,
-    )
-    async def _on_watch_media(client: Client, message: Message):
-        # Dedup: if -2 already processed same message, _stats still fine;
-        # add_quality overwrites same quality key — safe.
-        try:
-            await _handle_channel_media(client, message)
-        except Exception as e:
-            logger.exception("channel auto-index media handler: %s", e)
-
-    @bot.on_message(filters.command(["autoindex", "auto_index"]) & filters.private)
+    @bot.on_message(filters.command(["autoindex", "auto_index"]) & filters.private, group=1)
     async def _autoindex_status(client: Client, message: Message):
-        uid = message.from_user.id if message.from_user else 0
-        if uid not in getattr(Config, "ADMINS", set()) and uid != getattr(Config, "BOT_OWNER", 0):
-            return
-        pending = len([t for t in _pending_finalize.values() if t and not t.done()])
+        pending = len([t for t in _pending_finalize.values() if not t.done()])
         await message.reply_text(
-            f"📡 <b>Channel Auto-Index</b>\n\n"
-            f"Watch channel: <code>{WATCH_CHANNEL_ID}</code>\n"
+            f"📡 Channel Auto-Index\n"
+            f"Watch: <code>{WATCH_CHANNEL_ID}</code>\n"
             f"Settle: {SETTLE_SECONDS}s\n"
             f"Seen: {_stats['seen']} | Saved: {_stats['saved']} | "
-            f"Posted: {_stats['posted']} | Errors: {_stats['errors']}\n"
-            f"Pending finalize: {pending}\n\n"
-            f"Is channel me naya video/document daalo — bot auto save + group post karega.",
+            f"Posted: {_stats['posted']} | Err: {_stats['errors']}\n"
+            f"Pending finalize: {pending}",
             quote=True,
         )
 
     logger.info(
-        "Channel auto-index ON — watching %s (settle=%ss)",
+        "Channel auto-index ON watch=%s settle=%ss",
         WATCH_CHANNEL_ID, SETTLE_SECONDS,
     )
