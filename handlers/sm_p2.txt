@@ -70,7 +70,11 @@ async def _handle_generate_links_inner(bot: Client, chat_id: int, admin_id: int)
 
         if sent and Config.MOVIE_GROUP_ID:
             try:
-                await db.update_movie_group_post(movie_id, int(Config.MOVIE_GROUP_ID), sent.id)
+                # sent.chat.id + sent.link = correct private/forum link (fixes Message doesn't exist)
+                chat_id_save = int(getattr(sent.chat, "id", None) or Config.MOVIE_GROUP_ID)
+                msg_id_save = int(sent.id)
+                post_link = getattr(sent, "link", None) or None
+                await db.update_movie_group_post(movie_id, chat_id_save, msg_id_save, post_link=post_link)
             except Exception as up_err:
                 logger.error("update_movie_group_post: %s", type(up_err).__name__)
 
