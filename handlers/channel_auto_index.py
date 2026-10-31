@@ -257,6 +257,7 @@ async def _set_poster_from_message(bot: Client, movie_id: str, message: Message,
 
 
 async def _post_or_update_group(bot: Client, movie_id: str) -> bool:
+    """Hamesha MOVIE_GROUP_ID me NAYA post. Purana delete. Silent edit nahi."""
     from handlers.movie_card import build_final_movie_card_text, build_final_movie_card_buttons
 
     movie = await db.get_movie(movie_id)
@@ -266,105 +267,103 @@ async def _post_or_update_group(bot: Client, movie_id: str) -> bool:
     if not target:
         logger.warning("MOVIE_GROUP_ID not set")
         return False
+    target = int(target)
 
     card_text = build_final_movie_card_text(movie)
     buttons = build_final_movie_card_buttons(movie, for_group=True)
     poster_id = movie.get("poster_file_id")
     g_chat, g_msg = movie.get("group_chat_id"), movie.get("group_msg_id")
 
+    # Purana group post delete — sirf same target group
     if g_chat and g_msg:
-        for edit_fn in (
-            lambda: bot.edit_message_caption(
-                int(g_chat), int(g_msg),
-                caption=_safe(card_text),
-                reply_markup=buttons,
-            ),
-            lambda: bot.edit_message_text(
-                int(g_chat), int(g_msg),
-                text=_safe(card_text),
-                reply_markup=buttons,
-                disable_web_page_preview=True,
-            ),
-        ):
-            try:
-                await edit_fn()
-                return True
-            except Exception:
-                continue
         try:
-            await bot.delete_messages(int(g_chat), int(g_msg))
-        except Exception:
-            pass
+            if int(g_chat) == target:
+                await bot.delete_messages(target, int(g_msg))
+        except Exception as e:
+            logger.debug("delete old group post: %s", e)
 
     sent = None
-    try:
-        if poster_id:
-            try:
-                sent = await bot.send_photo(
-                    int(target),
-                    photo=poster_id,
-                    caption=_safe(card_text),
-                    reply_markup=buttons,
-                )
-            except Exception as e:
-                logger.warning("send_photo fail, try stabilize: %s", e)
-                try:
-                    stable = await _stabilize_poster(bot, poster_id)
-                    if stable:
-                        if getattr(db, "movies_col", None) is not None:
-                            await db.movies_col.update_one(
-                                {"movie_id": movie_id},
-                                {"$set": {"poster_file_id": stable}},
-                            )
-                        sent = await bot.send_photo(
-                            int(target),
-                            photo=stable,
-                            caption=_safe(card_text),
-                            reply_markup=buttons,
-                        )
-                except Exception as e2:
-                    logger.warning("stabilize+photo fail: %s", e2)
-                    sent = None
-        if not sent:
-            sent = await bot.send_message(
-                int(target),
-                text=_safe(card_text),
-                reply_markup=buttons,
-                disable_web_page_preview=True,
-            )
-    except FloodWait as e:
-        await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
-        try:
-            sent = await bot.send_message(
-                int(target),
-                text=_safe(card_text),
-                reply_markup=buttons,
-                disable_web_page_preview=True,
-            )
-        except Exception as e2:
-            logger.warning("auto_index group post flood retry: %s", e2)
-            return False
-    except Exception as e:
-        logger.warning("auto_index group post: %s", e)
-        return False
+    last_err = None
 
-    if sent:
+    if poster_id:
         try:
-            await db.update_movie_group_post(movie_id, sent.chat.id, sent.id)
-            real_link = getattr(sent, "link", None)
-            if real_link and "t.me" in str(real_link):
-                try:
+            sent = await bot.send_photo(
+                target,
+                photo=poster_id,
+                caption=_safe(card_text),
+                reply_markup=buttons,
+            )
+        except Exception as e:
+            last_err = e
+            logger.warning("send_photo fail: %s", e)
+            try:
+                stable = await _stabilize_poster(bot, poster_id)
+                if stable:
                     if getattr(db, "movies_col", None) is not None:
                         await db.movies_col.update_one(
                             {"movie_id": movie_id},
-                            {"$set": {"group_post_link": str(real_link).strip()}},
+                            {"$set": {"poster_file_id": stable}},
                         )
-                except Exception:
-                    pass
+                    sent = await bot.send_photo(
+                        target,
+                        photo=stable,
+                        caption=_safe(card_text),
+                        reply_markup=buttons,
+                    )
+            except Exception as e2:
+                last_err = e2
+                logger.warning("stabilize+photo fail: %s", e2)
+                sent = None
+
+    if not sent:
+        try:
+            sent = await bot.send_message(
+                target,
+                text=_safe(card_text),
+                reply_markup=buttons,
+                disable_web_page_preview=True,
+            )
+        except FloodWait as e:
+            await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
+            try:
+                sent = await bot.send_message(
+                    target,
+                    text=_safe(card_text),
+                    reply_markup=buttons,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e2:
+                last_err = e2
+                logger.warning("group post flood retry: %s", e2)
+                return False
         except Exception as e:
-            logger.warning("update_movie_group_post: %s", e)
-        return True
-    return False
+            last_err = e
+            logger.warning("group send_message: %s", e)
+            return False
+
+    if not sent:
+        logger.warning("group post failed movie=%s err=%s", movie_id, last_err)
+        return False
+
+    real_link = getattr(sent, "link", None) or ""
+    try:
+        await db.update_movie_group_post(movie_id, sent.chat.id, sent.id)
+        if real_link and "t.me" in str(real_link):
+            if getattr(db, "movies_col", None) is not None:
+                await db.movies_col.update_one(
+                    {"movie_id": movie_id},
+                    {"$set": {"group_post_link": str(real_link).strip()}},
+                )
+    except Exception as e:
+        logger.warning("update_movie_group_post: %s", e)
+
+    logger.info(
+        "group NEW post movie=%s chat=%s msg=%s link=%s",
+        movie_id, sent.chat.id, sent.id, real_link,
+    )
+    _post_or_update_group.last_link = str(real_link) if real_link else f"chat={sent.chat.id} msg={sent.id}"
+    _post_or_update_group.last_chat = int(sent.chat.id)
+    return True
 
 
 async def _finalize_movie(bot: Client, movie_key: str, movie_id: str):
@@ -384,12 +383,15 @@ async def _finalize_movie(bot: Client, movie_key: str, movie_id: str):
             "auto_index FINALIZE movie=%s title=%s qualities=%s posted=%s",
             movie_id, title, qs, ok,
         )
+        link = getattr(_post_or_update_group, "last_link", "") or ""
+        chat = getattr(_post_or_update_group, "last_chat", "") or ""
         await _notify(
             bot,
             f"{'✅' if ok else '⚠️'} Auto-index {'POSTED' if ok else 'POST FAIL'}\n"
             f"🎬 {title}\n"
             f"📦 Qualities: {', '.join(qs) if qs else '-'}\n"
-            f"{'Group me post/update ho gaya' if ok else 'Group post fail'}",
+            f"{'Group NEW post' if ok else 'Group post fail'}\n"
+            f"chat={chat}\n{link}",
         )
     except asyncio.CancelledError:
         return
@@ -543,11 +545,12 @@ def register_channel_auto_index(bot: Client):
             f"Settle: {SETTLE_SECONDS}s\n"
             f"Seen: {_stats['seen']} | Saved: {_stats['saved']} | "
             f"Posted: {_stats['posted']} | Err: {_stats['errors']}\n"
-            f"Pending finalize: {pending}",
+            f"Pending finalize: {pending}\n"
+            f"MOVIE_GROUP_ID: <code>{getattr(Config, 'MOVIE_GROUP_ID', None)}</code>",
             quote=True,
         )
 
     logger.info(
-        "Channel auto-index ON watch=%s settle=%ss",
-        WATCH_CHANNEL_ID, SETTLE_SECONDS,
+        "Channel auto-index ON watch=%s settle=%ss group=%s",
+        WATCH_CHANNEL_ID, SETTLE_SECONDS, getattr(Config, "MOVIE_GROUP_ID", None),
     )
