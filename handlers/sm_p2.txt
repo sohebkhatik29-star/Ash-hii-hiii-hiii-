@@ -70,11 +70,23 @@ async def _handle_generate_links_inner(bot: Client, chat_id: int, admin_id: int)
 
         if sent and Config.MOVIE_GROUP_ID:
             try:
-                # sent.chat.id + sent.link = correct private/forum link (fixes Message doesn't exist)
+                # Always use actual sent.chat.id + sent.id (not Config alone)
                 chat_id_save = int(getattr(sent.chat, "id", None) or Config.MOVIE_GROUP_ID)
                 msg_id_save = int(sent.id)
-                post_link = getattr(sent, "link", None) or None
-                await db.update_movie_group_post(movie_id, chat_id_save, msg_id_save, post_link=post_link)
+                await db.update_movie_group_post(movie_id, chat_id_save, msg_id_save)
+                # Prefer Telegram's own message.link when available (forum-safe)
+                real_link = getattr(sent, "link", None)
+                if real_link and "t.me" in str(real_link):
+                    try:
+                        if getattr(db, "movies_col", None) is not None:
+                            await db.movies_col.update_one(
+                                {"movie_id": movie_id},
+                                {"$set": {"group_post_link": str(real_link).strip()}},
+                            )
+                        if movie_id in getattr(db, "_mem_movies", {}):
+                            db._mem_movies[movie_id]["group_post_link"] = str(real_link).strip()
+                    except Exception:
+                        pass
             except Exception as up_err:
                 logger.error("update_movie_group_post: %s", type(up_err).__name__)
 
