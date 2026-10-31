@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from io import BytesIO
 from typing import Any, Dict, Optional, Tuple
 
 from pyrogram import Client, filters
@@ -26,14 +27,12 @@ WATCH_CHANNEL_ID = int(
     or _DEFAULT_CH
 )
 
-# Chhota settle — qualities collect + fast post (addmovie feel)
 SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "12") or 12)
 
 _pending_finalize: Dict[str, asyncio.Task] = {}
 _key_to_movie: Dict[str, str] = {}
 _lock = asyncio.Lock()
 _stats = {"seen": 0, "saved": 0, "posted": 0, "errors": 0}
-# msg_id dedupe (double handler / resend)
 _seen_msgs: Dict[int, float] = {}
 
 
@@ -59,7 +58,6 @@ def _clean_title(raw: str) -> str:
         " ",
         t,
     )
-    # quality/codec noise — lekin "Movie 2" / "Part 2" mat hatao
     t = re.sub(
         r"(?i)\b("
         r"480p|720p|1080p|2160p|4k|hdrip|web[- ]?dl|bluray|brrip|"
@@ -84,7 +82,6 @@ def _movie_key(title: str, year: Any) -> str:
 
 
 def _detect_quality(file_name: str, caption: str, meta_q: str = "") -> str:
-    """Filename + caption se quality — order high→low taaki overwrite na ho."""
     blob = f"{file_name or ''} {caption or ''} {meta_q or ''}"
     checks = [
         (r"(?i)\b(2160p|4k|uhd)\b", "2160p"),
@@ -196,8 +193,37 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
         return None
 
 
-async def _set_poster_from_message(movie_id: str, message: Message, media) -> None:
-    """Poster: photo file_id ya video/document thumb."""
+async def _stabilize_poster(bot: Client, poster_file_id: str) -> Optional[str]:
+    """Thumb/document id ko real photo file_id banata hai (DB channel pe re-upload)."""
+    if not poster_file_id:
+        return None
+    db_ch = getattr(Config, "DB_CHANNEL", None)
+    if not db_ch:
+        return poster_file_id
+    try:
+        data = await bot.download_media(poster_file_id, in_memory=True)
+        if data is None:
+            raise RuntimeError("download empty")
+        if hasattr(data, "getvalue"):
+            raw = data.getvalue()
+        else:
+            raw = data.read() if hasattr(data, "read") else bytes(data)
+        if raw:
+            bio = BytesIO(raw)
+            bio.name = "poster.jpg"
+            sent = await bot.send_photo(int(db_ch), photo=bio)
+            return sent.photo.file_id if sent and sent.photo else poster_file_id
+    except Exception as e:
+        logger.warning("stabilize download: %s", e)
+    try:
+        sent = await bot.send_photo(int(db_ch), photo=poster_file_id)
+        return sent.photo.file_id if sent and sent.photo else poster_file_id
+    except Exception:
+        return poster_file_id
+
+
+async def _set_poster_from_message(bot: Client, movie_id: str, message: Message, media) -> None:
+    """Poster: photo ya video/document thumb → stabilize → save."""
     try:
         movie = await db.get_movie(movie_id)
         if movie and movie.get("poster_file_id"):
@@ -212,16 +238,19 @@ async def _set_poster_from_message(movie_id: str, message: Message, media) -> No
                 fid = getattr(t, "file_id", None)
         if not fid:
             return
+        stable = await _stabilize_poster(bot, fid)
+        if not stable:
+            return
         if hasattr(db, "update_movie_poster"):
             try:
-                await db.update_movie_poster(movie_id, fid, "channel_thumb")
+                await db.update_movie_poster(movie_id, stable, "channel_thumb")
                 return
             except Exception:
                 pass
         if getattr(db, "movies_col", None) is not None:
             await db.movies_col.update_one(
                 {"movie_id": movie_id},
-                {"$set": {"poster_file_id": fid}},
+                {"$set": {"poster_file_id": stable}},
             )
     except Exception as e:
         logger.debug("poster set: %s", e)
@@ -277,8 +306,25 @@ async def _post_or_update_group(bot: Client, movie_id: str) -> bool:
                     caption=_safe(card_text),
                     reply_markup=buttons,
                 )
-            except Exception:
-                sent = None
+            except Exception as e:
+                logger.warning("send_photo fail, try stabilize: %s", e)
+                try:
+                    stable = await _stabilize_poster(bot, poster_id)
+                    if stable:
+                        if getattr(db, "movies_col", None) is not None:
+                            await db.movies_col.update_one(
+                                {"movie_id": movie_id},
+                                {"$set": {"poster_file_id": stable}},
+                            )
+                        sent = await bot.send_photo(
+                            int(target),
+                            photo=stable,
+                            caption=_safe(card_text),
+                            reply_markup=buttons,
+                        )
+                except Exception as e2:
+                    logger.warning("stabilize+photo fail: %s", e2)
+                    sent = None
         if not sent:
             sent = await bot.send_message(
                 int(target),
@@ -415,7 +461,6 @@ async def _handle_channel_media(bot: Client, message: Message):
             year = m.group(0)
     language = meta.get("language") or "Hindi"
 
-    # CRITICAL: quality filename+caption se (meta pe depend mat karo)
     q = _detect_quality(file_name, caption, meta.get("quality") or "")
     q_key = _quality_key(q, meta)
 
@@ -460,7 +505,7 @@ async def _handle_channel_media(bot: Client, message: Message):
         return
 
     _stats["saved"] += 1
-    await _set_poster_from_message(movie_id, message, media)
+    await _set_poster_from_message(bot, movie_id, message, media)
 
     mkey = _movie_key(title, year)
     _schedule_finalize(bot, mkey, movie_id)
