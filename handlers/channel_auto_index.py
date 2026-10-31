@@ -27,7 +27,8 @@ WATCH_CHANNEL_ID = int(
     or _DEFAULT_CH
 )
 
-SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "12") or 12)
+# Wait long enough so 480/720/1080 all arrive before first group post
+SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "40") or 40)
 
 _pending_finalize: Dict[str, asyncio.Task] = {}
 _key_to_movie: Dict[str, str] = {}
@@ -45,15 +46,17 @@ def _safe(text: Any, fallback: str = "") -> str:
 
 
 def _clean_title(raw: str) -> str:
+    """Clean channel brand/quality noise but KEEP 'Movie 2' / Part N in title."""
     if not raw:
         return ""
     t = str(raw)
     t = re.sub(r"@\w+", " ", t)
+    # channel brands only (NOT generic 'movie 2' — that is part of title)
     t = re.sub(
         r"(?i)\b("
-        r"toonworld4all|toonworld|movies[_\s]?\d+|movie[_\s]?\d+|"
-        r"ash[_\s]?movies?|movies[_\s]?hub|cine[_\s]?hub|"
-        r"netflix[_\s]?\d+|filmcity|mirror[_\s]?leech"
+        r"toonworld4all|toonworld|movies_\d+|ash[_\s]?movies?|"
+        r"movies[_\s]?hub|cine[_\s]?hub|netflix_\d+|filmcity|"
+        r"mirror[_\s]?leech|movies[_\s]?1782"
         r")\b",
         " ",
         t,
@@ -62,22 +65,24 @@ def _clean_title(raw: str) -> str:
         r"(?i)\b("
         r"480p|720p|1080p|2160p|4k|hdrip|web[- ]?dl|bluray|brrip|"
         r"hdcam|camrip|dvdrip|x264|x265|hevc|aac|dts|dd5\.?1|"
-        r"10bit|8bit|multi\s*audio|esub|dual\s*audio|"
-        r"mkv|mp4|avi|amzn|nf|dsnp"
+        r"dd2\.?0|10bit|8bit|multi\s*audio|esub|dual\s*audio|"
+        r"mkv|mp4|avi|amzn|nf|dsnp|webdl"
         r")\b",
         " ",
         t,
     )
     t = re.sub(r"(?i)\b(hindi|english|tamil|telugu)\b", " ", t)
-    t = re.sub(r"[\[\]\(\)\{\}|_\-]+", " ", t)
+    t = re.sub(r"[\[\]\{\}|_]+", " ", t)
+    t = re.sub(r"[\(\)]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
 
 def _movie_key(title: str, year: Any) -> str:
-    t = re.sub(r"[^\w\s]", "", (title or "").lower())
+    t = (title or "").lower()
+    t = re.sub(r"[^\w\s]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
-    y = str(year or "")
+    y = str(year or "").strip()
     return f"{t}|{y}"
 
 
@@ -510,10 +515,17 @@ async def _handle_channel_media(bot: Client, message: Message):
     await _set_poster_from_message(bot, movie_id, message, media)
 
     mkey = _movie_key(title, year)
+    # current quality count from DB
+    qcount = 0
+    try:
+        mdoc = await db.get_movie(movie_id)
+        qcount = len((mdoc or {}).get("qualities") or {})
+    except Exception:
+        pass
     _schedule_finalize(bot, mkey, movie_id)
     logger.info(
-        "auto_index SAVED title=%s year=%s quality=%s movie_id=%s msg=%s",
-        title, year, q_key, movie_id, msg_id,
+        "auto_index SAVED title=%s year=%s quality=%s movie_id=%s msg=%s qcount=%s settle=%ss",
+        title, year, q_key, movie_id, msg_id, qcount, SETTLE_SECONDS,
     )
 
 
