@@ -27,8 +27,8 @@ WATCH_CHANNEL_ID = int(
     or _DEFAULT_CH
 )
 
-# Wait long enough so 480/720/1080 all arrive before first group post
-SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "40") or 40)
+# Wait so 480/720/1080 collect, but not too slow (~18s)
+SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "18") or 18)
 
 _pending_finalize: Dict[str, asyncio.Task] = {}
 _key_to_movie: Dict[str, str] = {}
@@ -84,6 +84,17 @@ def _movie_key(title: str, year: Any) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     y = str(year or "").strip()
     return f"{t}|{y}"
+
+
+def _core_title(title: str) -> str:
+    """Match key: 'Movie 2' / Part N hata ke core name (same film merge)."""
+    t = (title or "").lower()
+    t = re.sub(r"\bmovie\s*\d*\b", " ", t)
+    t = re.sub(r"\bpart\s*\d+\b", " ", t)
+    t = re.sub(r"\b(the|a|an)\b", " ", t)
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 
 def _detect_quality(file_name: str, caption: str, meta_q: str = "") -> str:
@@ -182,8 +193,53 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
         logger.debug("find movie: %s", e)
         existing = None
 
+    # Soft match: same year + same core title (Movie 2 variants merge)
+    if not existing and getattr(db, "movies_col", None) is not None:
+        try:
+            core = _core_title(title)
+            best = None
+            best_ts = ""
+            async for doc in db.movies_col.find({}):
+                dy = doc.get("year")
+                if year_val is not None:
+                    try:
+                        if dy is None or int(dy) != year_val:
+                            continue
+                    except Exception:
+                        continue
+                dcore = _core_title(doc.get("title") or doc.get("normalized_title") or "")
+                if not core or not dcore:
+                    continue
+                if core == dcore or core in dcore or dcore in core:
+                    ts = str(doc.get("updated_at") or doc.get("added_at") or "")
+                    if best is None or ts >= best_ts:
+                        best = doc
+                        best_ts = ts
+            if best and best.get("movie_id"):
+                existing = best
+                logger.info(
+                    "auto_index soft-match title=%s -> existing=%s (%s)",
+                    title, best.get("title"), best.get("movie_id"),
+                )
+        except Exception as e:
+            logger.debug("soft match: %s", e)
+
     if existing and existing.get("movie_id"):
-        return existing["movie_id"]
+        mid = existing["movie_id"]
+        # Prefer longer/cleaner display title
+        try:
+            old_t = (existing.get("title") or "").strip()
+            if title and len(title) > len(old_t) and getattr(db, "movies_col", None) is not None:
+                await db.movies_col.update_one(
+                    {"movie_id": mid},
+                    {"$set": {
+                        "title": title,
+                        "normalized_title": re.sub(r"[^\w\s]", "", title.lower()).strip(),
+                    }},
+                )
+        except Exception:
+            pass
+        return mid
 
     try:
         doc = await db.create_movie(
@@ -390,6 +446,32 @@ async def _finalize_movie(bot: Client, movie_key: str, movie_id: str):
         )
         link = getattr(_post_or_update_group, "last_link", "") or ""
         chat = getattr(_post_or_update_group, "last_chat", "") or ""
+
+        # Near-duplicate cleanup: same core title+year, different movie_id → delete extra
+        if ok and getattr(db, "movies_col", None) is not None and hasattr(db, "delete_movie"):
+            try:
+                core = _core_title(title)
+                y = (movie or {}).get("year")
+                async for doc in db.movies_col.find({}):
+                    other = doc.get("movie_id")
+                    if not other or other == movie_id:
+                        continue
+                    if y is not None:
+                        try:
+                            if doc.get("year") is None or int(doc.get("year")) != int(y):
+                                continue
+                        except Exception:
+                            continue
+                    ocore = _core_title(doc.get("title") or "")
+                    if core and ocore and (core == ocore or core in ocore or ocore in core):
+                        try:
+                            await db.delete_movie(other)
+                            logger.info("auto_index deleted duplicate movie_id=%s title=%s", other, doc.get("title"))
+                        except Exception as de:
+                            logger.debug("dup delete: %s", de)
+            except Exception as ce:
+                logger.debug("dup cleanup: %s", ce)
+
         await _notify(
             bot,
             f"{'✅' if ok else '⚠️'} Auto-index {'POSTED' if ok else 'POST FAIL'}\n"
