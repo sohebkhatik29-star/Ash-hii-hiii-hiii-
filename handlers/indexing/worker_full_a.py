@@ -10,6 +10,7 @@ from handlers.movie_card import build_final_movie_card_text
 
 logger = logging.getLogger("IndexingWorker")
 _CANCEL, _RUNNING = {}, {}
+_LAST_POST_ERR = None  # last group-post failure reason
 _CANCEL_HANDLER_ADDED = False
 
 def request_cancel(admin_id: int):
@@ -64,44 +65,49 @@ async def _prune_qualities(movie_id: str, keep_key: str = None):
     except Exception as e:
         logger.warning("prune: %s", e)
 
-def _safe(t: str) -> str:
-    return (t or "")[:4000]
+def _safe(text, fallback=""):
+    try:
+        s = str(text if text is not None else fallback)
+        return s.encode("utf-8", "surrogatepass").decode("utf-8", "ignore")
+    except Exception:
+        return fallback
 
 async def _status(bot, chat_id, msg_id, text, show_cancel=True):
-    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="idx_cancel")]]) if show_cancel else None
     try:
-        await bot.edit_message_text(chat_id, msg_id, text, reply_markup=kb)
+        from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="idx_cancel")]]) if show_cancel else None
+        await bot.edit_message_text(chat_id, msg_id, _safe(text), reply_markup=kb, disable_web_page_preview=True)
     except Exception:
         pass
 
 async def _bot_is_admin(client, channel_id):
     try:
-        m = await client.get_chat_member(channel_id, "me")
-        st = str(getattr(m.status, "value", m.status) or m.status).lower()
-        return any(x in st for x in ("administrator", "owner", "creator"))
+        me = await client.get_me()
+        m = await client.get_chat_member(int(channel_id), me.id)
+        return str(getattr(m, "status", "")).lower() in ("administrator", "creator", "owner")
     except Exception:
         return False
 
 async def _copy_to_db(bot, message, caption_text=None):
     media = message.document or message.video or message.audio or message.animation
-    if not media: return None, None
+    if not media:
+        return None, None
     fname = getattr(media, "file_name", None) or ""
     cap = (caption_text or message.caption or fname or "").strip()
-    if len(cap) > 1024: cap = cap[:1020] + "..."
+    if len(cap) > 1024:
+        cap = cap[:1020] + "..."
     orig_fid = getattr(media, "file_id", None)
     db_ch = getattr(Config, "DB_CHANNEL", None)
-    if not db_ch: return orig_fid, None
+    if not db_ch:
+        return orig_fid, None
     try:
-        copied = await message.copy(int(db_ch), caption=cap if cap else None)
-        m = copied.document or copied.video or copied.audio or copied.animation
-        return (getattr(m, "file_id", None) if m else orig_fid), getattr(copied, "id", None)
+        sent = await message.copy(int(db_ch), caption=cap if cap else None)
+        return (getattr(sent.document or sent.video or sent.audio or sent.animation, "file_id", None) or orig_fid), (sent.id if sent else None)
     except FloodWait as e:
         await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
         try:
-            copied = await message.copy(int(db_ch), caption=cap if cap else None)
-            m = copied.document or copied.video or copied.audio or copied.animation
-            return (getattr(m, "file_id", None) if m else orig_fid), getattr(copied, "id", None)
+            sent = await message.copy(int(db_ch), caption=cap if cap else None)
+            return (getattr(sent.document or sent.video or sent.audio or sent.animation, "file_id", None) or orig_fid), (sent.id if sent else None)
         except Exception:
             return orig_fid, None
     except Exception as e:
@@ -115,89 +121,77 @@ async def _stabilize_poster(bot, poster_file_id: str) -> Optional[str]:
     try:
         from io import BytesIO
         data = await bot.download_media(poster_file_id, in_memory=True)
-        raw = None
-        if data is not None:
-            if hasattr(data, "getvalue"): raw = data.getvalue()
-            elif hasattr(data, "read"): raw = data.read()
-            elif isinstance(data, (bytes, bytearray)): raw = bytes(data)
-        if raw and len(raw) > 100:
+        if data is None:
+            raise RuntimeError("download empty")
+        if hasattr(data, "getvalue"):
+            raw = data.getvalue()
+        else:
+            raw = data.read() if hasattr(data, "read") else bytes(data)
+        if raw:
             bio = BytesIO(raw); bio.name = "poster.jpg"
             sent = await bot.send_photo(int(db_ch), photo=bio)
-            if sent and sent.photo: return sent.photo.file_id
+            return sent.photo.file_id if sent and sent.photo else poster_file_id
     except Exception as e:
-        logger.warning("stabilize: %s", e)
+        logger.warning("stabilize download: %s", e)
     try:
         sent = await bot.send_photo(int(db_ch), photo=poster_file_id)
-        if sent and sent.photo: return sent.photo.file_id
+        return sent.photo.file_id if sent and sent.photo else poster_file_id
+    except Exception:
+        return poster_file_id
+
+def _extract_poster_from_media(message):
+    try:
+        if message.photo:
+            return message.photo.file_id
+        for attr in ("video", "document", "animation"):
+            m = getattr(message, attr, None)
+            if m and getattr(m, "thumbs", None):
+                thumbs = m.thumbs
+                if thumbs:
+                    return thumbs[-1].file_id
     except Exception:
         pass
     return None
-
-def _best_thumb_id(thumbs):
-    if not thumbs: return None
-    try:
-        return max(thumbs, key=lambda t: int(getattr(t, "file_size", 0) or 0)).file_id
-    except Exception:
-        try: return thumbs[-1].file_id
-        except Exception: return None
 
 async def _extract_poster_id(bot, message) -> Optional[str]:
     try:
-        if message.photo: return message.photo.file_id
-        if message.video and getattr(message.video, "thumbs", None):
-            return _best_thumb_id(message.video.thumbs)
-        if message.document and getattr(message.document, "thumbs", None):
-            return _best_thumb_id(message.document.thumbs)
+        return _extract_poster_from_media(message)
     except Exception:
-        pass
-    return None
-
-_NOISE_RE = re.compile(
-    r"\b(HDTC|HDCAM|HDTS|HDRip|HDRIP|WEBRip|WEB-DL|WEBDL|BluRay|BRRip|BDRip|"
-    r"x264|x265|HEVC|AAC|HC|ESub|CineVood|Hindi|Punjabi|Tamil|Telugu|Malayalam|"
-    r"Marathi|Kannada|English|Eng|Hind|Org|Original|Dual|Audio|Multi|HQ|Proper|"
-    r"REPACK|Extended|Uncut|\d{3,4}p|10bit|8bit)\b", re.I)
+        return None
 
 def _clean_title(raw: str) -> str:
     if not raw: return ""
-    base = re.sub(r"@[\w_]+", " ", str(raw))
-    base = re.sub(r"\.[a-z0-9]{2,4}$", "", base, flags=re.I)
-    base = re.sub(r"\bDUAL\s*A(?:UDIO)?\b", " ", base, flags=re.I)
-    base = _NOISE_RE.sub(" ", base)
-    base = re.sub(r"[&]+", " and ", base)
-    base = re.sub(r"[_\.\-\[\]\(\)\{\},:;/+]+", " ", base)
-    base = re.sub(r"\b(19\d{2}|20\d{2})\b", "", base)
-    base = re.sub(r"\s+", " ", base).strip()
-    base = re.sub(r"\b[A-Za-z]\b", " ", base)
+    base = str(raw)
+    base = re.sub(r"(?i)\b(480p|720p|1080p|2160p|4k|hdrip|web[- ]?dl|bluray|brrip|hdcam|camrip|dvdrip|x264|x265|hevc|aac|dts|dd5\.?1|10bit|8bit|multi\s*audio)\b", " ", base)
+    base = re.sub(r"(?i)\b(mkv|mp4|avi|m4v|mov)\b", " ", base)
+    base = re.sub(r"(?i)^\s*(?:@?[\w]*toonworld[\w]*|@?movies?[_\d]*|@?[\w]*movies?[_\d]*)\b\s*", " ", base)
+    base = re.sub(r"^\s*[A-Z0-9_]{10,}\s+", " ", base)
+    base = re.sub(r"[\[\]\(\)\{\}|_\-]+", " ", base)
     return re.sub(r"\s+", " ", base).strip()
 
-def _norm_key(title: str) -> str:
-    t = _clean_title(title).lower()
-    t = re.sub(r"[^\w\s]", " ", t)
+def _norm_key(t: str) -> str:
+    t = (t or "").lower()
+    t = re.sub(r"[^\w\s]", "", t)
     return re.sub(r"\s+", " ", t).strip()
 
-def _title_from_name(file_name: str, caption: str = "") -> tuple:
+def _title_from_name(file_name: str, caption: str = ""):
     meta = {}
     try:
         meta = extract_movie_metadata(file_name or "", caption or "") or {}
     except Exception:
-        pass
-    title = (meta.get("title") or "").strip()
+        meta = {}
+    title = meta.get("title") or ""
     year = meta.get("year")
-    q = meta.get("quality_label") or meta.get("quality") or ""
-    combined = f"{file_name or ''} {caption or ''}".strip()
-    if not year:
-        ym = re.search(r"\b(19\d{2}|20\d{2})\b", combined)
-        if ym:
-            try: year = int(ym.group(1))
-            except Exception: year = None
-    if not q: q = _norm_quality(combined)
-    if title: title = _clean_title(title)
-    if not title or title.lower() in ("untitled movie", "untitled", "unknown"):
-        title = _clean_title(file_name or "") or _clean_title(caption or "")
-    if not title or title.lower() in ("untitled movie", "untitled", "unknown"):
-        title = (file_name or caption or "Unknown")[:60]
-        title = re.sub(r"\.[a-z0-9]{2,4}$", "", title, flags=re.I).strip() or "Unknown"
+    q = meta.get("quality") or ""
+    if not title:
+        raw = (caption or file_name or "").strip()
+        title = _clean_title(raw.split("\n")[0] if raw else "")
+        if not year:
+            m = re.search(r"(19|20)\d{2}", raw)
+            if m: year = m.group(0)
+    title = _clean_title(title) or title
+    if not title:
+        title = re.sub(r"\.[a-z0-9]{2,4}$", "", file_name or "", flags=re.I).strip() or "Unknown"
     return title, year, _norm_quality(q)
 
 def _build_quality_rows(movie: dict, movie_id: str):
@@ -224,11 +218,17 @@ def _build_quality_rows(movie: dict, movie_id: str):
     return rows
 
 async def _post_movie_to_group(bot: Client, movie_id: str, force_new: bool = False):
+    """Group me movie card post / edit. Fail pe reason logger me + last_error set."""
     from pyrogram.types import InlineKeyboardMarkup
+    global _LAST_POST_ERR
     movie = await db.get_movie(movie_id)
-    if not movie: return None
+    if not movie:
+        _LAST_POST_ERR = "movie not in db"
+        return None
     target = getattr(Config, "MOVIE_GROUP_ID", None)
-    if not target: return None
+    if not target:
+        _LAST_POST_ERR = "MOVIE_GROUP_ID missing"
+        return None
     try:
         card_text = build_final_movie_card_text(movie)
         rows = _build_quality_rows(movie, movie_id)
@@ -246,41 +246,65 @@ async def _post_movie_to_group(bot: Client, movie_id: str, force_new: bool = Fal
                 await bot.edit_message_text(int(g_chat), int(g_msg), text=_safe(card_text), reply_markup=buttons, disable_web_page_preview=True)
                 return "edit"
             except Exception:
-                pass
+                pass  # fall through → new post
+
         sent = None
-        try:
-            if poster_id:
+        # 1) poster try
+        if poster_id:
+            try:
+                sent = await bot.send_photo(int(target), photo=poster_id, caption=_safe(card_text), reply_markup=buttons)
+            except FloodWait as e:
+                await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
                 try:
                     sent = await bot.send_photo(int(target), photo=poster_id, caption=_safe(card_text), reply_markup=buttons)
-                except Exception:
-                    try:
-                        stable = await _stabilize_poster(bot, poster_id)
-                        if stable:
-                            sent = await bot.send_photo(int(target), photo=stable, caption=_safe(card_text), reply_markup=buttons)
-                            if getattr(db, "movies_col", None) is not None:
-                                await db.movies_col.update_one({"movie_id": movie_id}, {"$set": {"poster_file_id": stable}})
-                    except Exception:
-                        sent = None
-            if not sent:
-                sent = await bot.send_message(int(target), text=_safe(card_text), reply_markup=buttons, disable_web_page_preview=True)
-        except FloodWait as e:
-            await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
+                except Exception as e2:
+                    logger.warning("post photo flood-retry fail %s: %s", movie_id, e2)
+            except Exception as e:
+                logger.warning("post photo fail %s: %s", movie_id, e)
+                try:
+                    stable = await _stabilize_poster(bot, poster_id)
+                    if stable:
+                        sent = await bot.send_photo(int(target), photo=stable, caption=_safe(card_text), reply_markup=buttons)
+                        if getattr(db, "movies_col", None) is not None:
+                            await db.movies_col.update_one({"movie_id": movie_id}, {"$set": {"poster_file_id": stable}})
+                except Exception as e3:
+                    logger.warning("post stabilize fail %s: %s", movie_id, e3)
+                    sent = None
+
+        # 2) text fallback (always if photo failed)
+        if not sent:
             try:
-                sent = await bot.send_message(int(target), text=_safe(card_text), reply_markup=buttons, disable_web_page_preview=True)
-            except Exception:
+                sent = await bot.send_message(
+                    int(target), text=_safe(card_text), reply_markup=buttons, disable_web_page_preview=True
+                )
+            except FloodWait as e:
+                await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
+                try:
+                    sent = await bot.send_message(
+                        int(target), text=_safe(card_text), reply_markup=buttons, disable_web_page_preview=True
+                    )
+                except Exception as e2:
+                    _LAST_POST_ERR = f"text flood-retry: {type(e2).__name__}: {e2}"
+                    logger.warning("group text send fail %s: %s", movie_id, e2)
+                    return None
+            except Exception as e:
+                _LAST_POST_ERR = f"text: {type(e).__name__}: {e}"
+                logger.warning("group text send fail %s: %s", movie_id, e)
                 return None
-        except Exception as e:
-            logger.warning("group send: %s", e)
-            return None
+
         if sent:
             try:
                 if hasattr(db, "update_movie_group_post"):
                     await db.update_movie_group_post(movie_id, sent.chat.id, sent.id)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("update_movie_group_post: %s", e)
+            _LAST_POST_ERR = None
             return "new"
+        _LAST_POST_ERR = "sent is None"
+        return None
     except Exception as e:
-        logger.warning("post_movie: %s", e)
+        _LAST_POST_ERR = f"{type(e).__name__}: {e}"
+        logger.warning("post_movie %s: %s", movie_id, e)
     return None
 
 async def run_indexing(bot, admin_id, channel_id, start_id, end_id, status_chat_id, status_msg_id=None):
@@ -332,7 +356,7 @@ async def run_indexing(bot, admin_id, channel_id, start_id, end_id, status_chat_
                     mid = int(msg.id)
                 except Exception:
                     continue
-                if status_msg_id and (scanned % 10 == 0 or media_found <= 1):
+                if status_msg_id and (scanned % 25 == 0 or media_found <= 1):
                     extra = f"\nLast: {last_title[:40]}" if last_title else ""
                     await _status(bot, status_chat_id, status_msg_id,
                         f"Indexing {scanned}/{total}\nMedia: {media_found}\n"
@@ -382,14 +406,13 @@ async def run_indexing(bot, admin_id, channel_id, start_id, end_id, status_chat_
                         pending_poster = None
                         try:
                             doc = await db.create_movie(title=title, normalized_title=norm, year=year, poster_file_id=poster_file_id)
-                            movie_id = doc.get("movie_id") if doc else None
+                            movie_id = (doc or {}).get("movie_id") or (doc.get("_id") if isinstance(doc, dict) else None)
                         except Exception as e:
                             logger.warning("create_movie: %s", e)
-                            movie_id = None
-                    if movie_id:
-                        bucket[key] = movie_id
-                if not movie_id:
-                    continue
+                            continue
+                    if not movie_id:
+                        continue
+                    bucket[key] = movie_id
                 try:
                     mov = await db.get_movie(movie_id)
                     if mov and not mov.get("poster_file_id"):
@@ -430,7 +453,7 @@ async def run_indexing(bot, admin_id, channel_id, start_id, end_id, status_chat_
                         await _post_movie_to_group(bot, movie_id, force_new=False)
                 except Exception as e:
                     logger.warning("post: %s", e)
-                await asyncio.sleep(0.03)
+                await asyncio.sleep(0.02)
             msg_id += BATCH
         for mid in list(bucket.values()):
             if mid not in posted_set:
@@ -440,8 +463,9 @@ async def run_indexing(bot, admin_id, channel_id, start_id, end_id, status_chat_
                     posted_set.add(mid)
         if status_msg_id:
             tag = "Cancelled" if _CANCEL.get(admin_id) else "Done"
+            err = f"\n⚠️ Post err: {_LAST_POST_ERR}" if (posted == 0 and _LAST_POST_ERR) else ""
             await _status(bot, status_chat_id, status_msg_id,
-                f"{tag}\nScanned: {scanned}/{total}\nMedia: {media_found}\nSaved: {saved}\nPosted: {posted}",
+                f"{tag}\nScanned: {scanned}/{total}\nMedia: {media_found}\nSaved: {saved}\nPosted: {posted}{err}",
                 show_cancel=False)
     except Exception as e:
         logger.exception("run_indexing: %s", e)
