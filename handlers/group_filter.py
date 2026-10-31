@@ -47,7 +47,7 @@ def _display_title(raw: str) -> str:
 
 
 def dedupe_by_title_year(results: list) -> list:
-    """Same clean title + same year → sirf ek (pehle upload). Alag year alag rahe."""
+    """Same clean title + same year → sirf ek. Prefer record with valid group link (latest)."""
     best = {}
     for m in results or []:
         key = (_norm_title(_display_title(m.get("title"))), str(m.get("year") or ""))
@@ -55,12 +55,20 @@ def dedupe_by_title_year(results: list) -> list:
         if prev is None:
             best[key] = m
             continue
-        a = str(m.get("added_at") or "")
-        b = str(prev.get("added_at") or "")
-        if a and (not b or a < b):  # pehle upload wala rakho
+        m_link = bool(m.get("group_msg_id") or m.get("group_post_link"))
+        p_link = bool(prev.get("group_msg_id") or prev.get("group_post_link"))
+        if m_link and not p_link:
+            best[key] = m
+            continue
+        if p_link and not m_link:
+            continue
+        # Both have / both missing link → keep latest (fresh group_msg_id more likely valid)
+        a = str(m.get("updated_at") or m.get("added_at") or "")
+        b = str(prev.get("updated_at") or prev.get("added_at") or "")
+        if a >= b:
             best[key] = m
     out = list(best.values())
-    out.sort(key=lambda x: str(x.get("added_at") or ""))  # pehle upload upar
+    out.sort(key=lambda x: str(x.get("added_at") or ""))  # display: pehle upload upar
     return out
 
 
