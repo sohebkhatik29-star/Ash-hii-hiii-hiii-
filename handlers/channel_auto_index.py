@@ -1,8 +1,6 @@
 # handlers/channel_auto_index.py
-# Auto-index: watch channel pe file aate hi save + settle ke baad group post
-# - title+year se movie identify (channel brand clean)
-# - same movie ki qualities collect (debounce)
-# - har movie ka ek hi group post (edit pe update)
+# Auto-index: watch channel — fast save + group post (addmovie jaisa feel)
+# Sirf isi file me logic.
 
 from __future__ import annotations
 
@@ -28,12 +26,15 @@ WATCH_CHANNEL_ID = int(
     or _DEFAULT_CH
 )
 
-SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "40") or 40)
+# Chhota settle — qualities collect + fast post (addmovie feel)
+SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "12") or 12)
 
 _pending_finalize: Dict[str, asyncio.Task] = {}
 _key_to_movie: Dict[str, str] = {}
 _lock = asyncio.Lock()
 _stats = {"seen": 0, "saved": 0, "posted": 0, "errors": 0}
+# msg_id dedupe (double handler / resend)
+_seen_msgs: Dict[int, float] = {}
 
 
 def _safe(text: Any, fallback: str = "") -> str:
@@ -58,16 +59,18 @@ def _clean_title(raw: str) -> str:
         " ",
         t,
     )
+    # quality/codec noise — lekin "Movie 2" / "Part 2" mat hatao
     t = re.sub(
         r"(?i)\b("
         r"480p|720p|1080p|2160p|4k|hdrip|web[- ]?dl|bluray|brrip|"
         r"hdcam|camrip|dvdrip|x264|x265|hevc|aac|dts|dd5\.?1|"
-        r"10bit|8bit|multi\s*audio|esub|dual\s*audio|hindi|"
+        r"10bit|8bit|multi\s*audio|esub|dual\s*audio|"
         r"mkv|mp4|avi|amzn|nf|dsnp"
         r")\b",
         " ",
         t,
     )
+    t = re.sub(r"(?i)\b(hindi|english|tamil|telugu)\b", " ", t)
     t = re.sub(r"[\[\]\(\)\{\}|_\-]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
@@ -80,19 +83,25 @@ def _movie_key(title: str, year: Any) -> str:
     return f"{t}|{y}"
 
 
-def _norm_quality(q: str) -> str:
-    s = str(q or "").lower()
-    if "1080" in s or "fhd" in s:
-        return "1080p"
-    if "720" in s or re.search(r"\bhd\b", s):
+def _detect_quality(file_name: str, caption: str, meta_q: str = "") -> str:
+    """Filename + caption se quality — order high→low taaki overwrite na ho."""
+    blob = f"{file_name or ''} {caption or ''} {meta_q or ''}"
+    checks = [
+        (r"(?i)\b(2160p|4k|uhd)\b", "2160p"),
+        (r"(?i)\b(1080p|fhd)\b", "1080p"),
+        (r"(?i)\b(720p)\b", "720p"),
+        (r"(?i)\b(480p)\b", "480p"),
+        (r"(?i)\b(360p|240p|sd)\b", "360p"),
+    ]
+    for pat, label in checks:
+        if re.search(pat, blob):
+            return label
+    if re.search(r"(?i)\bhd\b", blob):
         return "720p"
-    if "480" in s or "360" in s or "sd" in s:
-        return "480p"
-    return "720p"
+    return "HD"
 
 
-def _quality_key(meta: dict) -> str:
-    q = _norm_quality(meta.get("quality") or "")
+def _quality_key(q: str, meta: dict) -> str:
     season = (meta.get("season") or "").strip()
     episode = (meta.get("episode") or "").strip()
     if episode:
@@ -101,7 +110,7 @@ def _quality_key(meta: dict) -> str:
             parts.append(season)
         parts.append(episode)
         return " ".join(parts)
-    return q
+    return q or "HD"
 
 
 async def _notify(bot: Client, text: str):
@@ -185,6 +194,37 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
     except Exception as e:
         logger.error("create_movie: %s", e)
         return None
+
+
+async def _set_poster_from_message(movie_id: str, message: Message, media) -> None:
+    """Poster: photo file_id ya video/document thumb."""
+    try:
+        movie = await db.get_movie(movie_id)
+        if movie and movie.get("poster_file_id"):
+            return
+        fid = None
+        if message.photo:
+            fid = message.photo.file_id
+        if not fid and media:
+            thumbs = getattr(media, "thumbs", None)
+            if thumbs:
+                t = thumbs[-1] if isinstance(thumbs, list) else thumbs
+                fid = getattr(t, "file_id", None)
+        if not fid:
+            return
+        if hasattr(db, "update_movie_poster"):
+            try:
+                await db.update_movie_poster(movie_id, fid, "channel_thumb")
+                return
+            except Exception:
+                pass
+        if getattr(db, "movies_col", None) is not None:
+            await db.movies_col.update_one(
+                {"movie_id": movie_id},
+                {"$set": {"poster_file_id": fid}},
+            )
+    except Exception as e:
+        logger.debug("poster set: %s", e)
 
 
 async def _post_or_update_group(bot: Client, movie_id: str) -> bool:
@@ -303,7 +343,7 @@ async def _finalize_movie(bot: Client, movie_key: str, movie_id: str):
             f"{'✅' if ok else '⚠️'} Auto-index {'POSTED' if ok else 'POST FAIL'}\n"
             f"🎬 {title}\n"
             f"📦 Qualities: {', '.join(qs) if qs else '-'}\n"
-            f"{'Group me post/update ho gaya' if ok else 'Group post fail — bot admin + permission check karo'}",
+            f"{'Group me post/update ho gaya' if ok else 'Group post fail'}",
         )
     except asyncio.CancelledError:
         return
@@ -327,19 +367,29 @@ async def _handle_channel_media(bot: Client, message: Message):
         return
 
     chat_id = int(message.chat.id)
+    msg_id = int(message.id)
+
+    import time as _time
+    now = _time.time()
+    if msg_id in _seen_msgs and (now - _seen_msgs[msg_id]) < 120:
+        return
+    _seen_msgs[msg_id] = now
+    if len(_seen_msgs) > 500:
+        cutoff = now - 300
+        for k in [k for k, v in _seen_msgs.items() if v < cutoff]:
+            _seen_msgs.pop(k, None)
+
     _stats["seen"] += 1
     logger.info(
         "auto_index SEEN chat=%s msg=%s type=%s",
-        chat_id, message.id, getattr(message.chat, "type", None),
+        chat_id, msg_id, getattr(message.chat, "type", None),
     )
 
     if chat_id != int(WATCH_CHANNEL_ID):
-        logger.info("auto_index skip wrong chat %s != %s", chat_id, WATCH_CHANNEL_ID)
         return
 
     media = message.document or message.video or message.audio or message.animation
     if not media:
-        logger.info("auto_index skip non-media msg=%s", message.id)
         return
 
     file_name = getattr(media, "file_name", None) or ""
@@ -364,10 +414,13 @@ async def _handle_channel_media(bot: Client, message: Message):
         if m:
             year = m.group(0)
     language = meta.get("language") or "Hindi"
-    q_key = _quality_key(meta)
+
+    # CRITICAL: quality filename+caption se (meta pe depend mat karo)
+    q = _detect_quality(file_name, caption, meta.get("quality") or "")
+    q_key = _quality_key(q, meta)
 
     if not title or title.lower() in ("unknown", "untitled", ""):
-        logger.info("auto_index skip empty title msg=%s fname=%s", message.id, file_name)
+        logger.info("auto_index skip empty title msg=%s fname=%s", msg_id, file_name)
         return
 
     file_id, db_msg_id = await _copy_to_db(bot, message, caption_text=caption or file_name)
@@ -375,7 +428,7 @@ async def _handle_channel_media(bot: Client, message: Message):
         file_id = getattr(media, "file_id", None)
     if not file_id:
         _stats["errors"] += 1
-        logger.warning("auto_index no file_id msg=%s", message.id)
+        logger.warning("auto_index no file_id msg=%s", msg_id)
         return
 
     movie_id = await _get_or_create_movie(title, year, language=language)
@@ -397,7 +450,7 @@ async def _handle_channel_media(bot: Client, message: Message):
         "db_msg_id": db_msg_id,
         "channel_msg_id": db_msg_id,
         "source_chat_id": chat_id,
-        "source_msg_id": int(message.id),
+        "source_msg_id": msg_id,
     }
     try:
         await db.add_quality_to_movie(movie_id, q_key, quality_data)
@@ -407,32 +460,13 @@ async def _handle_channel_media(bot: Client, message: Message):
         return
 
     _stats["saved"] += 1
-
-    try:
-        movie = await db.get_movie(movie_id)
-        if movie and not movie.get("poster_file_id"):
-            thumb = getattr(media, "thumbs", None)
-            if thumb:
-                t = thumb[-1] if isinstance(thumb, list) else thumb
-                tid = getattr(t, "file_id", None)
-                if tid and hasattr(db, "update_movie_poster"):
-                    try:
-                        await db.update_movie_poster(movie_id, tid, "channel_thumb")
-                    except Exception:
-                        pass
-                elif tid and getattr(db, "movies_col", None) is not None:
-                    await db.movies_col.update_one(
-                        {"movie_id": movie_id},
-                        {"$set": {"poster_file_id": tid}},
-                    )
-    except Exception:
-        pass
+    await _set_poster_from_message(movie_id, message, media)
 
     mkey = _movie_key(title, year)
     _schedule_finalize(bot, mkey, movie_id)
     logger.info(
         "auto_index SAVED title=%s year=%s quality=%s movie_id=%s msg=%s",
-        title, year, q_key, movie_id, message.id,
+        title, year, q_key, movie_id, msg_id,
     )
 
 
