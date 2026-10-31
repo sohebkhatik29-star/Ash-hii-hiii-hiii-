@@ -51,13 +51,19 @@ def build_final_movie_card_text(movie: Dict[str, Any]) -> str:
     Title = clean name only + (YEAR). Quality/codec NOT in title.
     """
     title = movie.get("title", "Untitled") or "Untitled"
-    # defensive: strip leftover tech tokens + year so card stays clean
+    # defensive: strip channel brand + tech tokens + year so card stays clean
     _year = movie.get("year")
     _t = re.sub(
-        r"(?i)\b(2160p|1440p|1080p|720p|540p|480p|360p|240p|4k|hevc|x264|x265|webrip|web-dl|bluray|uncut|dual\s*audio|"
-        r"hindi|english|esub|10bit|8bit|mkv|mp4)\b",
+        r"(?i)\b(toonworld\d*all|movies?[\w_]*\d+|cinemaghar|netflix[\w_]*\d*|"
+        r"channeldata\w*|dk\s*drama|movies?safari|ash\s*movies?[\w_]*)\b",
         " ",
         str(title),
+    )
+    _t = re.sub(
+        r"(?i)\b(2160p|1440p|1080p|720p|540p|480p|360p|240p|4k|hevc|x264|x265|webrip|web-dl|bluray|uncut|dual\s*audio|"
+        r"hindi|english|esub|10bit|8bit|mkv|mp4|amzn|web)\b",
+        " ",
+        _t,
     )
     _t = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", _t)
     _t = re.sub(r"\s+", " ", _t).strip() or str(title)
