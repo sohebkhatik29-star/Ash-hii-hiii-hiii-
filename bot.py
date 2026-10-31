@@ -38,22 +38,22 @@ logging.basicConfig(
 logger = logging.getLogger("AshMovieBot")
 
 Bot = Client(
-    name=Config.BOT_USERNAME or "AshMovieBot",
+    "AshMovieBot",
     api_id=Config.API_ID,
     api_hash=Config.API_HASH,
     bot_token=Config.BOT_TOKEN,
     workers=100,
-    plugins=dict(root="handlers") if False else None,
+    max_concurrent_transmissions=10,
 )
 
+
 @Bot.on_message(filters.private, group=-1)
-async def private_status_guard(bot: Client, cmd: Message):
+async def user_status_handler(bot: Client, message: Message):
     try:
-        if cmd.from_user and await handle_user_status(bot, cmd):
-            await cmd.reply_text("\U0001f6ab **Aapko is bot se ban kiya gaya hai.**", quote=True)
-            return
+        await handle_user_status(bot, message)
     except Exception as e:
-        logger.debug(f"status guard: {e}")
+        logger.exception(f"user_status: {e}")
+
 
 @Bot.on_message(filters.command(["addmovie", "newmovie"]) & filters.private)
 async def addmovie_command(bot: Client, cmd: Message):
@@ -80,6 +80,7 @@ async def addmovie_command(bot: Client, cmd: Message):
     except Exception as e:
         logger.exception(f"addmovie: {e}")
 
+
 @Bot.on_message(filters.command(["finish", "done_upload"]) & filters.private)
 async def finish_command(bot: Client, cmd: Message):
     try:
@@ -87,6 +88,7 @@ async def finish_command(bot: Client, cmd: Message):
         await handle_generate_links_action(bot, cmd.chat.id, admin_id)
     except Exception as e:
         logger.exception(f"finish: {e}")
+
 
 @Bot.on_message(filters.command(["cancel"]) & filters.private)
 async def cancel_command(bot: Client, cmd: Message):
@@ -97,6 +99,7 @@ async def cancel_command(bot: Client, cmd: Message):
     except Exception as e:
         logger.exception(f"cancel: {e}")
 
+
 @Bot.on_message(filters.private & (filters.document | filters.video | filters.audio | filters.animation))
 async def private_media_handler(bot: Client, message: Message):
     try:
@@ -104,12 +107,21 @@ async def private_media_handler(bot: Client, message: Message):
     except Exception as e:
         logger.exception(f"private media: {e}")
 
+
 register_start_handlers(Bot)
 register_admin_handlers(Bot)
 register_callback_handlers(Bot)
 register_group_filter_handlers(Bot)
 register_moderation_handlers(Bot)
+
 register_force_sub_handlers(Bot)
+
+# Channel auto-index (alag file — watch channel pe auto save + post)
+try:
+    from handlers.channel_auto_index import register_channel_auto_index
+    register_channel_auto_index(Bot)
+except Exception as _e:
+    logging.getLogger("AshMovieBot").warning("channel_auto_index not loaded: %s", _e)
 
 try:
     from handlers.bot_commands.done_cmd import register_done_command
@@ -138,7 +150,6 @@ except Exception as e:
 try:
     from handlers.bot_commands.premium_cmd import register_premium_command
     register_premium_command(Bot)
-    logger.info("/premium command registered")
 except Exception as e:
     logger.error(f"premium_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
@@ -151,116 +162,71 @@ except Exception as e:
 try:
     from handlers.bot_commands.cleangroup_cmd import register_cleangroup_command
     register_cleangroup_command(Bot)
-    logger.info("/cleangroup command registered")
 except Exception as e:
     logger.error(f"cleangroup_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
 try:
-    from handlers.bot_commands.antilink_cmd import register_antilink_command
-    register_antilink_command(Bot)
-    logger.info("antilink + /unbanlink registered")
-except Exception as e:
-    logger.error(f"antilink_cmd register failed (bot still runs): {type(e).__name__}: {e}")
-
-try:
     from handlers.bot_commands.warn_cmd import register_warn_command
     register_warn_command(Bot)
-    logger.info("/warn command registered")
 except Exception as e:
     logger.error(f"warn_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
 try:
-    from handlers.indexing import register_indexing_handlers
-    register_indexing_handlers(Bot)
+    from handlers.bot_commands.antilink_cmd import register_antilink_handlers
+    register_antilink_handlers(Bot)
 except Exception as e:
-    logger.error(f"indexing register failed (bot still runs): {type(e).__name__}: {e}")
+    logger.error(f"antilink_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
-try:
-    from handlers.admin_panel import register_admin_panel_handlers
-    register_admin_panel_handlers(Bot)
-except Exception as e:
-    logger.error(f"admin_panel register failed (bot still runs): {type(e).__name__}: {e}")
 
-async def setup_bot_commands(bot: Client):
-    group_cmds = [
-        BotCommand("start", "Bot start / welcome"),
-        BotCommand("ban", "User ban (reply / user_id)"),
-        BotCommand("unban", "User unban (reply / user_id)"),
-        BotCommand("done", "Not-found session close"),
-        BotCommand("chakspelling", "Check spelling (reply to user)"),
-        BotCommand("deletefilter", "Reply to poster remove filter"),
-        BotCommand("not_available", "Not available on Telegram (reply)"),
-        BotCommand("premium", "Premium only contact @movies_1780"),
-        BotCommand("deleteallfilters", "Delete ALL filters (confirm)"),
-        BotCommand("cleangroup", "Clean group messages (admin)"),
-        BotCommand("unbanlink", "Unban after link suspend/ban"),
-        BotCommand("warn", "Warn user (reply + reason)"),
-    ]
-    private_cmds = [
-        BotCommand("start", "Bot start / welcome"),
-        BotCommand("help", "Help & how to use"),
-        BotCommand("addmovie", "Start movie upload session"),
-        BotCommand("cancel", "Cancel upload session"),
-    ]
+async def setup_bot_commands():
     try:
-        await bot.delete_bot_commands(scope=BotCommandScopeDefault())
-    except Exception:
-        try:
-            await bot.set_bot_commands([], scope=BotCommandScopeDefault())
-        except Exception as e:
-            logger.warning(f"clear default: {e}")
-    try:
-        await bot.set_bot_commands(private_cmds, scope=BotCommandScopeAllPrivateChats())
+        private_cmds = [
+            BotCommand("start", "Start the bot"),
+            BotCommand("addmovie", "Start movie upload session"),
+            BotCommand("finish", "Finish upload and generate links"),
+            BotCommand("cancel", "Cancel current session"),
+            BotCommand("status", "Show bot status"),
+        ]
+        await Bot.set_bot_commands(private_cmds, scope=BotCommandScopeAllPrivateChats())
+        logger.info("Private commands set")
     except Exception as e:
-        logger.warning(f"private cmds: {e}")
+        logger.warning(f"set private commands: {e}")
     try:
-        await bot.set_bot_commands(group_cmds, scope=BotCommandScopeAllGroupChats())
+        group_cmds = [
+            BotCommand("find", "Search movie"),
+            BotCommand("cleangroup", "Clean group messages"),
+        ]
+        await Bot.set_bot_commands(group_cmds, scope=BotCommandScopeAllGroupChats())
         logger.info("Group commands set")
     except Exception as e:
-        logger.warning(f"AllGroupChats cmds failed: {e}")
-    try:
-        await bot.set_bot_commands(group_cmds, scope=BotCommandScopeAllChatAdministrators())
-    except Exception as e:
-        logger.warning(f"AllChatAdministrators: {e}")
+        logger.warning(f"set group commands: {e}")
     try:
         gid = int(getattr(Config, "MOVIE_GROUP_ID", 0) or 0)
         if gid:
-            try:
-                await bot.set_bot_commands(group_cmds, scope=BotCommandScopeChat(chat_id=gid))
-            except Exception as e1:
-                logger.warning(f"ScopeChat: {e1}")
-            try:
-                await bot.set_bot_commands(group_cmds, scope=BotCommandScopeChatAdministrators(chat_id=gid))
-            except Exception as e2:
-                logger.warning(f"ChatAdministrators: {e2}")
+            admin_cmds = [
+                BotCommand("warn", "Warn a user"),
+                BotCommand("cleangroup", "Clean group messages"),
+            ]
+            await Bot.set_bot_commands(admin_cmds, scope=BotCommandScopeChatAdministrators(chat_id=gid))
     except Exception as e:
-        logger.warning(f"group-specific cmds: {e}")
+        logger.warning(f"set admin commands: {e}")
+
 
 async def main():
-    logger.info("Initializing Ash Movie Store Bot...")
+    await db.connect()
     await Bot.start()
     try:
-        await db.init_indexes()
-        await session_mgr.restore_from_db()
-        await db.sync_from_group_and_channel(Bot)
+        await setup_bot_commands()
     except Exception as e:
-        logger.error(f"Startup warning: {e}")
-    await setup_bot_commands(Bot)
-    if Config.LOG_CHANNEL:
-        try:
-            bot_info = await Bot.get_me()
-            await Bot.send_message(
-                chat_id=Config.LOG_CHANNEL,
-                text=f"\U0001f3ac <b>@{bot_info.username or Config.BOT_USERNAME} is RESTARTED \u2705</b>\n\n"
-                     f"\u26a1 <b>Status:</b> Live (v3)\n"
-                     f"\U0001f37f <b>{Config.BRAND_NAME}</b>\n"
-                     f"\U0001f451 @{Config.OWNER_USERNAME}"
-            )
-        except Exception as err:
-            logger.warning(f"LOG_CHANNEL: {err}")
-    logger.info("Bot is fully online (v3).")
+        logger.warning(f"setup commands: {e}")
+    me = await Bot.get_me()
+    logger.info("Bot is fully online (v3). @%s", me.username)
     await idle()
     await Bot.stop()
 
+
 if __name__ == "__main__":
-    Bot.run(main())
+    try:
+        asyncio.get_event_loop().run_until_complete(main())
+    except KeyboardInterrupt:
+        pass
