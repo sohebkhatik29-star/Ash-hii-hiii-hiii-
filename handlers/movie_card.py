@@ -74,9 +74,10 @@ def build_final_movie_card_text(movie: Dict[str, Any]) -> str:
     lang_str = " • ".join(languages) if languages else "Hindi"
 
     qualities = movie.get("qualities", {}) or {}
-    # Primary quality label for display
+    # Show ALL available qualities (sorted low→high), not just first key
     q_names = list(qualities.keys()) if qualities else []
-    primary_q = q_names[0] if q_names else "HD"
+    sorted_q = sorted(q_names, key=quality_sort_key) if q_names else []
+    primary_q = " • ".join(sorted_q) if sorted_q else "HD"
 
     tag = re.sub(r"[^a-zA-Z0-9]", "", title_upper)
     year_tag = f"{year}" if year else ""
@@ -95,8 +96,10 @@ def build_final_movie_card_buttons(movie: Dict[str, Any], for_group: bool = Fals
 
     buttons = []
     for q_name, q_data in sorted_qualities:
-        size_str = q_data.get("file_size_formatted", "") or ""
-        if not size_str and q_data.get("file_size"):
+        size_str = ""
+        if q_data.get("file_size_formatted"):
+            size_str = q_data["file_size_formatted"]
+        elif q_data.get("file_size"):
             try:
                 from handlers.parser import format_size
                 size_str = format_size(int(q_data["file_size"]))
