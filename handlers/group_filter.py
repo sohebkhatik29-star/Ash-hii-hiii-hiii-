@@ -24,20 +24,44 @@ def _norm_title(t) -> str:
     return t
 
 
+def _display_title(raw: str) -> str:
+    """Channel brand / tech noise hatao display ke liye."""
+    t = str(raw or "")
+    t = re.sub(r"@[\w_]+", " ", t)
+    t = re.sub(
+        r"(?i)\b(toonworld\d*all|movies?[\w_]*\d+|cinemaghar|netflix[\w_]*\d*|"
+        r"channeldata\w*|dk\s*drama|movies?safari|ash\s*movies?[\w_]*)\b",
+        " ",
+        t,
+    )
+    t = re.sub(
+        r"(?i)\b(2160p|1440p|1080p|720p|540p|480p|360p|240p|4k|hevc|x264|x265|"
+        r"webrip|web-dl|webdl|bluray|uncut|dual\s*audio|hindi|english|esub|"
+        r"10bit|8bit|mkv|mp4|amzn|web)\b",
+        " ",
+        t,
+    )
+    t = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", t)
+    t = re.sub(r"[\[\]\(\)\{\}_.\-]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip() or str(raw or "Unknown")
+
+
 def dedupe_by_title_year(results: list) -> list:
-    """Same title + same year → sirf ek (latest). Alag year alag rahe."""
+    """Same clean title + same year → sirf ek (pehle upload). Alag year alag rahe."""
     best = {}
     for m in results or []:
-        key = (_norm_title(m.get("title")), str(m.get("year") or ""))
+        key = (_norm_title(_display_title(m.get("title"))), str(m.get("year") or ""))
         prev = best.get(key)
         if prev is None:
             best[key] = m
             continue
         a = str(m.get("added_at") or "")
         b = str(prev.get("added_at") or "")
-        if a >= b:
+        if a and (not b or a < b):  # pehle upload wala rakho
             best[key] = m
-    return list(best.values())
+    out = list(best.values())
+    out.sort(key=lambda x: str(x.get("added_at") or ""))  # pehle upload upar
+    return out
 
 
 def _get_post_link(m: dict) -> str:
@@ -57,7 +81,7 @@ def _get_post_link(m: dict) -> str:
 def build_link_results_text(query: str, results: list) -> str:
     lines = [f"🔎 <b>Results for:</b> <code>{query}</code>", f"📄 Total: {len(results)}", ""]
     for i, m in enumerate(results, start=1):
-        title = m.get("title") or "Unknown"
+        title = _display_title(m.get("title") or "Unknown")
         year = m.get("year")
         name = f"{title}" + (f" ({year})" if year else "")
         link = _get_post_link(m)
