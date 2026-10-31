@@ -27,16 +27,12 @@ WATCH_CHANNEL_ID = int(
     or _DEFAULT_CH
 )
 
-# Wait long enough so 480/720/1080 all arrive before first group post
-# 12s = fast enough for group post, still covers multi-quality forward gaps
-SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "12") or 12)
+# Wait so 480/720/1080 collect, but not too slow (~18s)
+SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "18") or 18)
 
 _pending_finalize: Dict[str, asyncio.Task] = {}
 _key_to_movie: Dict[str, str] = {}
-_first_seen: Dict[str, float] = {}  # movie_key -> earliest channel msg timestamp
-_ready: Dict[str, str] = {}  # movie_key -> movie_id (settle done, waiting post order)
 _lock = asyncio.Lock()
-_posting = False
 _stats = {"seen": 0, "saved": 0, "posted": 0, "errors": 0}
 _seen_msgs: Dict[int, float] = {}
 
@@ -146,99 +142,3 @@ async def _notify(bot: Client, text: str):
             return
         except Exception:
             continue
-
-
-async def _copy_to_db(bot: Client, message: Message, caption_text: str = None) -> Tuple[Optional[str], Optional[int]]:
-    media = message.document or message.video or message.audio or message.animation
-    if not media:
-        return None, None
-    fname = getattr(media, "file_name", None) or ""
-    cap = (caption_text or message.caption or fname or "").strip()
-    if len(cap) > 1024:
-        cap = cap[:1020] + "..."
-    orig_fid = getattr(media, "file_id", None)
-    db_ch = getattr(Config, "DB_CHANNEL", None)
-    if not db_ch:
-        return orig_fid, None
-    try:
-        sent = await message.copy(int(db_ch), caption=cap if cap else None)
-        m = sent.document or sent.video or sent.audio or sent.animation
-        return (getattr(m, "file_id", None) or orig_fid), (sent.id if sent else None)
-    except FloodWait as e:
-        await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
-        try:
-            sent = await message.copy(int(db_ch), caption=cap if cap else None)
-            m = sent.document or sent.video or sent.audio or sent.animation
-            return (getattr(m, "file_id", None) or orig_fid), (sent.id if sent else None)
-        except Exception:
-            return orig_fid, None
-    except Exception as e:
-        logger.warning("copy_to_db: %s", e)
-        return orig_fid, None
-
-
-async def _get_or_create_movie(title: str, year: Any, language: str = None) -> Optional[str]:
-    title = _clean_title(_safe(title)) or "Unknown"
-    year_val = None
-    try:
-        if year is not None and str(year).isdigit():
-            year_val = int(year)
-    except Exception:
-        year_val = None
-
-    existing = None
-    try:
-        if hasattr(db, "find_movie_by_title_year"):
-            existing = await db.find_movie_by_title_year(title, year=year_val)
-        elif hasattr(db, "find_movie_by_title"):
-            existing = await db.find_movie_by_title(title, year=year_val)
-    except Exception as e:
-        logger.debug("find movie: %s", e)
-        existing = None
-
-    # Soft match ONLY same year + exact core title (no full-DB scan, no substring)
-    # "Little Krishna Movie 2" aur "Little Krishna Movie 3" alag rahenge
-    if not existing and getattr(db, "movies_col", None) is not None and year_val is not None:
-        try:
-            core = _core_title(title)
-            if core and len(core) > 6:
-                cursor = db.movies_col.find({"year": year_val}).sort("added_at", -1).limit(80)
-                async for doc in cursor:
-                    dcore = _core_title(doc.get("title") or doc.get("normalized_title") or "")
-                    if core and dcore and core == dcore:
-                        existing = doc
-                        logger.info(
-                            "auto_index soft-match title=%s -> existing=%s (%s)",
-                            title, doc.get("title"), doc.get("movie_id"),
-                        )
-                        break
-        except Exception as e:
-            logger.debug("soft match: %s", e)
-
-    if existing and existing.get("movie_id"):
-        mid = existing["movie_id"]
-        try:
-            old_t = (existing.get("title") or "").strip()
-            if title and len(title) > len(old_t) and getattr(db, "movies_col", None) is not None:
-                await db.movies_col.update_one(
-                    {"movie_id": mid},
-                    {"$set": {
-                        "title": title,
-                        "normalized_title": re.sub(r"[^\w\s]", "", title.lower()).strip(),
-                    }},
-                )
-        except Exception:
-            pass
-        return mid
-
-    try:
-        doc = await db.create_movie(
-            title=title,
-            normalized_title=(title or "").lower(),
-            year=year_val,
-            languages=[language] if language and language != "Unknown" else ["Hindi"],
-        )
-        return doc.get("movie_id") if doc else None
-    except Exception as e:
-        logger.error("create_movie: %s", e)
-        return None
