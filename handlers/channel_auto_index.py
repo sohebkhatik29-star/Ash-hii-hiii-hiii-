@@ -94,7 +94,7 @@ def _core_title(title: str) -> str:
     t = (title or "").lower()
     t = re.sub(r"\bmovie\s*\d*\b", " ", t)
     t = re.sub(r"\bpart\s*\d+\b", " ", t)
-    t = re.sub(r"\b(the|a|an)\b", " ", t)
+    t = re.sub(r"\b(the|a|an|eng|hin|org)\b", " ", t)
     t = re.sub(r"[^\w\s]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
@@ -197,21 +197,33 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
         existing = None
 
     # Soft match: same core title (year flexible ±2 so 2021/2022 variants merge)
+    # Weak titles (Untitled) → attach to most recently updated movie (multi-quality batch)
     if not existing and getattr(db, "movies_col", None) is not None:
         try:
             core = _core_title(title)
+            is_weak = (not core) or core in ("unknown", "untitled", "untitled movie", "movie") or len(core) < 4
             best = None
             best_ts = ""
-            # limit scan to recent movies to stay fast
-            cursor = db.movies_col.find({}).sort("added_at", -1).limit(400)
+            cursor = db.movies_col.find({}).sort("updated_at", -1).limit(300)
             async for doc in cursor:
-                dcore = _core_title(doc.get("title") or doc.get("normalized_title") or "")
-                if not core or not dcore or len(core) < 4:
+                dtitle = doc.get("title") or doc.get("normalized_title") or ""
+                dcore = _core_title(dtitle)
+                if is_weak:
+                    # attach to newest non-weak movie updated in last few minutes
+                    if not dcore or dcore in ("unknown", "untitled", "movie"):
+                        continue
+                    ts = str(doc.get("updated_at") or doc.get("added_at") or "")
+                    if best is None or ts >= best_ts:
+                        best = doc
+                        best_ts = ts
+                    # only consider first (newest) good candidate for weak titles
+                    if best is not None:
+                        break
                     continue
-                # strong core match required
-                if not (core == dcore or (len(core) >= 8 and (core in dcore or dcore in core))):
+                if not dcore or len(dcore) < 4:
                     continue
-                # year: prefer same, allow ±2, or missing
+                if not (core == dcore or (len(core) >= 6 and (core in dcore or dcore in core))):
+                    continue
                 dy = doc.get("year")
                 year_ok = True
                 if year_val is not None and dy is not None:
@@ -228,8 +240,8 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
             if best and best.get("movie_id"):
                 existing = best
                 logger.info(
-                    "auto_index soft-match title=%s -> existing=%s (%s)",
-                    title, best.get("title"), best.get("movie_id"),
+                    "auto_index soft-match title=%s -> existing=%s (%s) weak=%s",
+                    title, best.get("title"), best.get("movie_id"), is_weak,
                 )
         except Exception as e:
             logger.debug("soft match: %s", e)
@@ -546,20 +558,44 @@ async def _handle_channel_media(bot: Client, message: Message):
     except Exception:
         meta = {}
 
-    raw_title = _safe(
-        meta.get("title")
-        or (file_name.rsplit(".", 1)[0] if file_name else "")
-        or (caption.split("\n")[0] if caption else "")
-        or "Unknown"
-    )
+    # Build best raw title from caption / filename / parser (prefer human caption)
+    cap0 = (caption.split("\n")[0] if caption else "").strip()
+    fname0 = (file_name.rsplit(".", 1)[0] if file_name else "").strip()
+    meta_title = _safe(meta.get("title") or "")
+    # Prefer caption, then filename, then parser — parser often returns Untitled
+    candidates = [cap0, fname0, meta_title]
+    raw_title = "Unknown"
+    for c in candidates:
+        if not c:
+            continue
+        cl = c.lower().strip()
+        if cl in ("unknown", "untitled", "untitled movie", ""):
+            continue
+        raw_title = c
+        break
+    if raw_title == "Unknown":
+        raw_title = cap0 or fname0 or meta_title or "Unknown"
+
     title = _clean_title(raw_title) or raw_title
-    # if clean wiped everything, try caption first line harder
-    if not title or title.lower() in ("unknown", "untitled", ""):
-        cap0 = (caption.split("\n")[0] if caption else "") or file_name
-        title = _clean_title(cap0) or cap0.strip() or "Unknown"
+    # second pass: if still weak, strip quality tokens manually from longest source
+    if not title or title.lower() in ("unknown", "untitled", "untitled movie", ""):
+        blob = cap0 or fname0 or meta_title
+        blob = re.sub(
+            r"(?i)\b(480p|720p|1080p|2160p|4k|hdrip|web[- ]?dl|bluray|brrip|"
+            r"hdcam|camrip|dvdrip|x264|x265|hevc|aac|dts|dd5\.?1|dd2\.?0|"
+            r"10bit|8bit|multi\s*audio|esub|dual\s*audio|mkv|mp4|avi|"
+            r"amzn|nf|dsnp|webdl|org\.?|proper|repack|eng\s*hin|hin\s*eng|"
+            r"dual|msubs|subs?|hindi|english|tamil|telugu)\b",
+            " ",
+            blob or "",
+        )
+        blob = re.sub(r"[\[\]\{\}|_\(\)]+", " ", blob)
+        blob = re.sub(r"\s+(19|20)\d{2}\s*", " ", blob)
+        blob = re.sub(r"\s+", " ", blob).strip()
+        title = blob or "Unknown"
+
     year = meta.get("year")
     if not year:
-        # prefer year in parentheses near title, else any 19xx/20xx
         blob = f"{file_name} {caption}"
         m = re.search(r"[\(\[]\s*((?:19|20)\d{2})\s*[\)\]]", blob)
         if not m:
@@ -571,9 +607,15 @@ async def _handle_channel_media(bot: Client, message: Message):
     q = _detect_quality(file_name, caption, meta.get("quality") or "")
     q_key = _quality_key(q, meta)
 
-    if not title or title.lower() in ("unknown", "untitled", ""):
-        logger.info("auto_index skip empty title msg=%s fname=%s", msg_id, file_name)
-        return
+    weak_title = (not title) or title.lower().strip() in (
+        "unknown", "untitled", "untitled movie", "movie", ""
+    )
+    if weak_title:
+        logger.warning(
+            "auto_index weak title msg=%s fname=%s cap=%s — will soft-match recent",
+            msg_id, (file_name or "")[:60], (caption or "")[:60],
+        )
+        title = title if title and title.lower() not in ("unknown", "") else "Unknown"
 
     file_id, db_msg_id = await _copy_to_db(bot, message, caption_text=caption or file_name)
     if not file_id:
