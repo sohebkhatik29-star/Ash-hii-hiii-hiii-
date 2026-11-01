@@ -629,6 +629,51 @@ def _schedule_finalize(bot: Client, movie_key: str, movie_id: str):
     )
 
 
+
+# Quality rank: higher = keep preferred. Same rank → larger file wins.
+_Q_RANK = {"2160p": 5, "1080p": 4, "720p": 3, "480p": 2, "360p": 1}
+
+
+def _quality_rank(q: str) -> int:
+    q = (q or "").lower().strip()
+    for k, v in _Q_RANK.items():
+        if k in q:
+            return v
+    return 0
+
+
+async def _trim_qualities_to_three(movie_id: str) -> None:
+    """Bot max 3 qualities per movie rakhe — best 1080/720/480."""
+    if not movie_id or getattr(db, "movies_col", None) is None:
+        return
+    movie = await db.get_movie(movie_id)
+    if not movie:
+        return
+    quals = dict(movie.get("qualities") or {})
+    if len(quals) <= 3:
+        return
+
+    def sort_key(item):
+        qk, qd = item
+        size = 0
+        try:
+            size = int((qd or {}).get("file_size") or 0)
+        except Exception:
+            size = 0
+        return (_quality_rank(qk), size)
+
+    ranked = sorted(quals.items(), key=sort_key, reverse=True)
+    keep = {k: v for k, v in ranked[:3]}
+    drop = [k for k in quals if k not in keep]
+    if not drop:
+        return
+    await db.movies_col.update_one(
+        {"movie_id": movie_id},
+        {"$set": {"qualities": keep}},
+    )
+    logger.info("auto_index trim movie=%s keep=%s drop=%s", movie_id, list(keep.keys()), drop)
+
+
 async def _handle_channel_media(bot: Client, message: Message):
     if not message or message.chat is None:
         return
@@ -778,6 +823,12 @@ async def _handle_channel_media(bot: Client, message: Message):
         _stats["errors"] += 1
         logger.error("add_quality: %s", e)
         return
+
+    # Keep only best 3 qualities per movie (prefer 1080p > 720p > 480p > others)
+    try:
+        await _trim_qualities_to_three(movie_id)
+    except Exception as e:
+        logger.debug("trim qualities: %s", e)
 
     _stats["saved"] += 1
     await _set_poster_from_message(bot, movie_id, message, media)
