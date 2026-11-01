@@ -199,18 +199,10 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
                 return mid_r
 
     existing = None
-    try:
-        if hasattr(db, "find_movie_by_title_year"):
-            existing = await db.find_movie_by_title_year(title, year=year_val)
-        elif hasattr(db, "find_movie_by_title"):
-            existing = await db.find_movie_by_title(title, year=year_val)
-    except Exception as e:
-        logger.debug("find movie: %s", e)
-        existing = None
 
-    # Soft match: same core title (year flexible ±2 so 2021/2022 variants merge)
-    # Weak titles (Untitled) → attach to most recently updated movie (multi-quality batch)
-    if not existing and getattr(db, "movies_col", None) is not None:
+    # FIRST: soft-match by core title (ignore year) so 2021/2022 never split
+    # This runs BEFORE year-strict DB find — critical for already-split movies in DB
+    if getattr(db, "movies_col", None) is not None:
         try:
             core = _core_title(title)
             is_weak = (not core) or core in ("unknown", "untitled", "untitled movie", "movie") or len(core) < 4
@@ -264,8 +256,27 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
                         year_ok = True
                 if not year_ok:
                     continue
+                # prefer more qualities, then more recent
+                nfiles = 0
+                try:
+                    files = doc.get("files") or doc.get("qualities") or {}
+                    if isinstance(files, dict):
+                        nfiles = len(files)
+                    elif isinstance(files, list):
+                        nfiles = len(files)
+                except Exception:
+                    nfiles = 0
                 ts = str(doc.get("updated_at") or doc.get("added_at") or "")
-                if best is None or ts >= best_ts:
+                score = (nfiles, ts)
+                best_score = (0, "")
+                if best is not None:
+                    try:
+                        bf = best.get("files") or best.get("qualities") or {}
+                        bn = len(bf) if isinstance(bf, (dict, list)) else 0
+                    except Exception:
+                        bn = 0
+                    best_score = (bn, best_ts)
+                if best is None or score >= best_score:
                     best = doc
                     best_ts = ts
             if best and best.get("movie_id"):
@@ -276,6 +287,17 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
                 )
         except Exception as e:
             logger.debug("soft match: %s", e)
+
+    # Fallback: year-strict DB find only if soft-match found nothing
+    if not existing:
+        try:
+            if hasattr(db, "find_movie_by_title_year"):
+                existing = await db.find_movie_by_title_year(title, year=year_val)
+            elif hasattr(db, "find_movie_by_title"):
+                existing = await db.find_movie_by_title(title, year=year_val)
+        except Exception as e:
+            logger.debug("find movie: %s", e)
+            existing = None
 
     if existing and existing.get("movie_id"):
         mid = existing["movie_id"]
