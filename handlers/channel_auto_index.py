@@ -35,6 +35,8 @@ _key_to_movie: Dict[str, str] = {}
 _lock = asyncio.Lock()
 _stats = {"seen": 0, "saved": 0, "posted": 0, "errors": 0}
 _seen_msgs: Dict[int, float] = {}
+# concurrent batch merge: same core title within 30s → same movie_id (stops 2021/2022 split)
+_recent_cores: Dict[str, tuple] = {}  # core -> (movie_id, monotonic_ts)
 
 
 def _safe(text: Any, fallback: str = "") -> str:
@@ -186,6 +188,16 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
     except Exception:
         year_val = None
 
+    # Fast path: same core title already resolved in this batch (concurrent handlers)
+    core_quick = _core_title(title)
+    if core_quick and len(core_quick) >= 4 and core_quick not in ("unknown", "untitled", "untitled movie", "movie"):
+        rec = _recent_cores.get(core_quick)
+        if rec:
+            mid_r, ts_r = rec
+            if (__import__("time").monotonic() - ts_r) < 30 and mid_r:
+                logger.info("auto_index recent-core hit title=%s -> %s", title, mid_r)
+                return mid_r
+
     existing = None
     try:
         if hasattr(db, "find_movie_by_title_year"):
@@ -241,9 +253,11 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
                     continue
                 if not (core == dcore or (len(core) >= 6 and (core in dcore or dcore in core))):
                     continue
+                # same core title = same movie (ignore year — 2021/2022 caption noise)
                 dy = doc.get("year")
                 year_ok = True
-                if year_val is not None and dy is not None:
+                # only enforce year if cores are partial/fuzzy match, not exact
+                if core != dcore and year_val is not None and dy is not None:
                     try:
                         year_ok = abs(int(dy) - int(year_val)) <= 2
                     except Exception:
@@ -286,6 +300,8 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
                 )
         except Exception:
             pass
+        if core_quick and len(core_quick) >= 4:
+            _recent_cores[core_quick] = (mid, __import__("time").monotonic())
         return mid
 
     # NEVER create a new movie from weak/Untitled titles — causes split posts
@@ -317,7 +333,10 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
             year=year_val,
             languages=[language] if language and language != "Unknown" else ["Hindi"],
         )
-        return doc.get("movie_id") if doc else None
+        mid = doc.get("movie_id") if doc else None
+        if mid and core_quick and len(core_quick) >= 4:
+            _recent_cores[core_quick] = (mid, __import__("time").monotonic())
+        return mid
     except Exception as e:
         logger.error("create_movie: %s", e)
         return None
