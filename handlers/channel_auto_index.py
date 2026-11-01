@@ -27,8 +27,8 @@ WATCH_CHANNEL_ID = int(
     or _DEFAULT_CH
 )
 
-# Wait so 480/720/1080 collect, fast (~2s)
-SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "2") or 2)
+# Wait so 480/720/1080 collect, fast (~5s, reliable multi-quality)
+SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "5") or 5)
 
 _pending_finalize: Dict[str, asyncio.Task] = {}
 _key_to_movie: Dict[str, str] = {}
@@ -66,15 +66,18 @@ def _clean_title(raw: str) -> str:
         r"480p|720p|1080p|2160p|4k|hdrip|web[- ]?dl|bluray|brrip|"
         r"hdcam|camrip|dvdrip|x264|x265|hevc|aac|dts|dd5\.?1|"
         r"dd2\.?0|10bit|8bit|multi\s*audio|esub|dual\s*audio|"
-        r"mkv|mp4|avi|amzn|nf|dsnp|webdl"
+        r"mkv|mp4|avi|amzn|nf|dsnp|webdl|org\.?|proper|repack|"
+        r"eng\s*hin|hin\s*eng|dual|msubs|subs?"
         r")\b",
         " ",
         t,
     )
-    t = re.sub(r"(?i)\b(hindi|english|tamil|telugu)\b", " ", t)
+    t = re.sub(r"(?i)\b(hindi|english|tamil|telugu|or)\b", " ", t)
     t = re.sub(r"[\[\]\{\}|_]+", " ", t)
     t = re.sub(r"[\(\)]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
+    # drop trailing year if it is alone (we keep year separately)
+    t = re.sub(r"\s+(19|20)\d{2}\s*$", "", t).strip()
     return t
 
 
@@ -193,28 +196,35 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
         logger.debug("find movie: %s", e)
         existing = None
 
-    # Soft match: same year + same core title (Movie 2 variants merge)
+    # Soft match: same core title (year flexible ±2 so 2021/2022 variants merge)
     if not existing and getattr(db, "movies_col", None) is not None:
         try:
             core = _core_title(title)
             best = None
             best_ts = ""
-            async for doc in db.movies_col.find({}):
-                dy = doc.get("year")
-                if year_val is not None:
-                    try:
-                        if dy is None or int(dy) != year_val:
-                            continue
-                    except Exception:
-                        continue
+            # limit scan to recent movies to stay fast
+            cursor = db.movies_col.find({}).sort("added_at", -1).limit(400)
+            async for doc in cursor:
                 dcore = _core_title(doc.get("title") or doc.get("normalized_title") or "")
-                if not core or not dcore:
+                if not core or not dcore or len(core) < 4:
                     continue
-                if core == dcore or core in dcore or dcore in core:
-                    ts = str(doc.get("updated_at") or doc.get("added_at") or "")
-                    if best is None or ts >= best_ts:
-                        best = doc
-                        best_ts = ts
+                # strong core match required
+                if not (core == dcore or (len(core) >= 8 and (core in dcore or dcore in core))):
+                    continue
+                # year: prefer same, allow ±2, or missing
+                dy = doc.get("year")
+                year_ok = True
+                if year_val is not None and dy is not None:
+                    try:
+                        year_ok = abs(int(dy) - int(year_val)) <= 2
+                    except Exception:
+                        year_ok = True
+                if not year_ok:
+                    continue
+                ts = str(doc.get("updated_at") or doc.get("added_at") or "")
+                if best is None or ts >= best_ts:
+                    best = doc
+                    best_ts = ts
             if best and best.get("movie_id"):
                 existing = best
                 logger.info(
@@ -543,11 +553,19 @@ async def _handle_channel_media(bot: Client, message: Message):
         or "Unknown"
     )
     title = _clean_title(raw_title) or raw_title
+    # if clean wiped everything, try caption first line harder
+    if not title or title.lower() in ("unknown", "untitled", ""):
+        cap0 = (caption.split("\n")[0] if caption else "") or file_name
+        title = _clean_title(cap0) or cap0.strip() or "Unknown"
     year = meta.get("year")
     if not year:
-        m = re.search(r"(19|20)\d{2}", f"{file_name} {caption}")
+        # prefer year in parentheses near title, else any 19xx/20xx
+        blob = f"{file_name} {caption}"
+        m = re.search(r"[\(\[]\s*((?:19|20)\d{2})\s*[\)\]]", blob)
+        if not m:
+            m = re.search(r"(?<!\d)((?:19|20)\d{2})(?!\d)", blob)
         if m:
-            year = m.group(0)
+            year = m.group(1)
     language = meta.get("language") or "Hindi"
 
     q = _detect_quality(file_name, caption, meta.get("quality") or "")
