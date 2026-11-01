@@ -27,8 +27,8 @@ WATCH_CHANNEL_ID = int(
     or _DEFAULT_CH
 )
 
-# Wait so 480/720/1080 collect, fast (~4s)
-SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "4") or 4)
+# Wait so 480/720/1080 collect, fast (~3s)
+SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "3") or 3)
 
 _pending_finalize: Dict[str, asyncio.Task] = {}
 _key_to_movie: Dict[str, str] = {}
