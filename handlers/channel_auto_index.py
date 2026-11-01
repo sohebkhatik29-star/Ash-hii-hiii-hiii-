@@ -48,39 +48,47 @@ def _safe(text: Any, fallback: str = "") -> str:
 
 
 def _clean_title(raw: str) -> str:
-    """Clean channel brand/quality noise but KEEP 'Movie 2' / Part N in title."""
+    """Clean channel brand/quality/audio noise but KEEP 'Movie 2' / Part N / Chapter N in title."""
     if not raw:
         return ""
     t = str(raw)
     t = re.sub(r"@\w+", " ", t)
-    # channel brands only (NOT generic 'movie 2' — that is part of title)
+    # channel brands
     t = re.sub(
         r"(?i)\b("
         r"toonworld4all|toonworld|movies_\d+|ash[_\s]?movies?|"
         r"movies[_\s]?hub|cine[_\s]?hub|netflix_\d+|filmcity|"
-        r"mirror[_\s]?leech|movies[_\s]?1782"
+        r"mirror[_\s]?leech|movies[_\s]?1782|thednk|thed nk"
         r")\b",
         " ",
         t,
     )
+    # quality + codec + audio tags (aggressive so all qualities of same film share title)
     t = re.sub(
         r"(?i)\b("
-        r"480p|720p|1080p|2160p|4k|hdrip|web[- ]?dl|bluray|brrip|"
-        r"hdcam|camrip|dvdrip|x264|x265|hevc|aac|dts|dd5\.?1|"
-        r"dd2\.?0|10bit|8bit|multi\s*audio|esub|dual\s*audio|"
+        r"480p|720p|1080p|2160p|4k|uhd|fhd|hdrip|web[- ]?dl|bluray|brrip|"
+        r"hdcam|camrip|dvdrip|x264|x265|hevc|h265|h264|aac|dts|ddp?|"
+        r"dd\+?|dd5\.?1|dd2\.?0|5\.1|2\.0|10bit|8bit|multi\s*audio|"
+        r"esubs?|msubs?|subs?|dual\s*audio|dual|"
         r"mkv|mp4|avi|amzn|nf|dsnp|webdl|org\.?|proper|repack|"
-        r"eng\s*hin|hin\s*eng|dual|msubs|subs?"
+        r"eng\s*hin|hin\s*eng|"
+        r"\d+\s*kbps|kbps|bitrate"
         r")\b",
         " ",
         t,
     )
+    # leftover audio markers like "DD+" "5.1" "2.0"
+    t = re.sub(r"(?i)\bdd\+?", " ", t)
+    t = re.sub(r"(?i)\b\d+(\.\d+)?\s*(kbps|ch)\b", " ", t)
     t = re.sub(r"(?i)\b(hindi|english|tamil|telugu|or)\b", " ", t)
-    t = re.sub(r"[\[\]\{\}|_]+", " ", t)
+    t = re.sub(r"[\[\]\{\}|_\-+]+", " ", t)
     t = re.sub(r"[\(\)]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
-    # drop trailing year if it is alone (we keep year separately)
-    t = re.sub(r"\s+(19|20)\d{2}\s*$", "", t).strip()
+    # drop year tokens (year kept separately) — mid or trailing
+    t = re.sub(r"\b(19|20)\d{2}\b", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
     return t
+
 
 
 def _movie_key(title: str, year: Any) -> str:
@@ -92,14 +100,28 @@ def _movie_key(title: str, year: Any) -> str:
 
 
 def _core_title(title: str) -> str:
-    """Match key: 'Movie 2' / Part N hata ke core name (same film merge)."""
+    """Stable match key: strip quality/audio/year noise, keep Chapter/Part numbers."""
     t = (title or "").lower()
-    t = re.sub(r"\bmovie\s*\d*\b", " ", t)
-    t = re.sub(r"\bpart\s*\d+\b", " ", t)
-    t = re.sub(r"\b(the|a|an|eng|hin|org)\b", " ", t)
+    # strip leftover quality/audio that may survive clean_title
+    t = re.sub(
+        r"(?i)\b("
+        r"480p|720p|1080p|2160p|4k|uhd|hdrip|web[- ]?dl|bluray|"
+        r"x264|x265|hevc|h265|h264|aac|dts|ddp?|dd\+?|5\.1|2\.0|"
+        r"esubs?|msubs?|subs?|dual|kbps|mkv|mp4|avi|amzn|nf|"
+        r"thednk|org|proper|repack|hindi|english|tamil|telugu"
+        r")\b",
+        " ",
+        t,
+    )
+    t = re.sub(r"\b(the|a|an|eng|hin)\b", " ", t)
+    # strip years — year is a separate field
+    t = re.sub(r"\b(19|20)\d{2}\b", " ", t)
+    # normalize dots in K.G.F etc
+    t = re.sub(r"\.", "", t)
     t = re.sub(r"[^\w\s]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
+
 
 
 def _detect_quality(file_name: str, caption: str, meta_q: str = "") -> str:
