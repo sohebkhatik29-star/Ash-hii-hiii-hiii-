@@ -28,7 +28,7 @@ WATCH_CHANNEL_ID = int(
 )
 
 # Wait so 480/720/1080 collect, fast (~5s, reliable multi-quality)
-SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "1") or 1)
+SETTLE_SECONDS = int(__import__("os").environ.get("AUTO_INDEX_SETTLE_SEC", "2") or 2)
 
 _pending_finalize: Dict[str, asyncio.Task] = {}
 _key_to_movie: Dict[str, str] = {}
@@ -37,6 +37,7 @@ _stats = {"seen": 0, "saved": 0, "posted": 0, "errors": 0}
 _seen_msgs: Dict[int, float] = {}
 # concurrent batch merge: same core title within 30s → same movie_id (stops 2021/2022 split)
 _recent_cores: Dict[str, tuple] = {}  # core -> (movie_id, monotonic_ts)
+_core_locks: Dict[str, asyncio.Lock] = {}  # per-core lock to prevent concurrent creates
 
 
 def _safe(text: Any, fallback: str = "") -> str:
@@ -72,7 +73,10 @@ def _clean_title(raw: str) -> str:
         r"esubs?|msubs?|subs?|dual\s*audio|dual|"
         r"mkv|mp4|avi|amzn|nf|dsnp|webdl|org\.?|proper|repack|"
         r"eng\s*hin|hin\s*eng|"
-        r"\d+\s*kbps|kbps|bitrate"
+        r"\d+\s*kbps|kbps|bitrate|"
+        r"hq\s*fan\s*dubbed|fan\s*dubbed|fan\s*dub|dubbed|"
+        r"uncut|no\s*ads|voice\s*over|voiceover|unofficial|"
+        r"dual\s*audio|multi\s*audio"
         r")\b",
         " ",
         t,
@@ -210,180 +214,174 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
     except Exception:
         year_val = None
 
-    # Fast path: same core title already resolved in this batch (concurrent handlers)
     core_quick = _core_title(title)
-    if core_quick and len(core_quick) >= 4 and core_quick not in ("unknown", "untitled", "untitled movie", "movie"):
+    weak_core = (
+        (not core_quick)
+        or core_quick in ("unknown", "untitled", "untitled movie", "movie")
+        or len(core_quick) < 4
+    )
+
+    # Fast path without lock
+    if not weak_core:
         rec = _recent_cores.get(core_quick)
         if rec:
             mid_r, ts_r = rec
-            if (__import__("time").monotonic() - ts_r) < 30 and mid_r:
+            if (__import__("time").monotonic() - ts_r) < 60 and mid_r:
                 logger.info("auto_index recent-core hit title=%s -> %s", title, mid_r)
                 return mid_r
 
-    existing = None
+    # Per-core lock: concurrent forwards of same movie share ONE create
+    clock = None
+    if not weak_core:
+        async with _lock:
+            if core_quick not in _core_locks:
+                _core_locks[core_quick] = asyncio.Lock()
+            clock = _core_locks[core_quick]
 
-    # FIRST: soft-match by core title (ignore year) so 2021/2022 never split
-    # This runs BEFORE year-strict DB find — critical for already-split movies in DB
-    if getattr(db, "movies_col", None) is not None:
-        try:
-            core = _core_title(title)
-            is_weak = (not core) or core in ("unknown", "untitled", "untitled movie", "movie") or len(core) < 4
-            best = None
-            best_ts = ""
-            cursor = db.movies_col.find({}).sort("updated_at", -1).limit(300)
-            async for doc in cursor:
-                dtitle = doc.get("title") or doc.get("normalized_title") or ""
-                dcore = _core_title(dtitle)
-                if is_weak:
-                    # ONLY attach to non-weak movie updated in last 90 seconds (same batch)
-                    if not dcore or dcore in ("unknown", "untitled", "movie"):
-                        continue
-                    ts_raw = doc.get("updated_at") or doc.get("added_at")
-                    if not ts_raw:
-                        continue
-                    try:
-                        from datetime import datetime, timezone
-                        if hasattr(ts_raw, "timestamp"):
-                            age = datetime.now(timezone.utc).timestamp() - ts_raw.timestamp()
-                        else:
-                            # iso string
-                            s = str(ts_raw).replace("Z", "+00:00")
-                            dt = datetime.fromisoformat(s)
-                            if dt.tzinfo is None:
-                                dt = dt.replace(tzinfo=timezone.utc)
-                            age = datetime.now(timezone.utc).timestamp() - dt.timestamp()
-                        if age > 90:
+    async def _resolve() -> Optional[str]:
+        # Re-check cache under lock
+        if not weak_core:
+            rec = _recent_cores.get(core_quick)
+            if rec:
+                mid_r, ts_r = rec
+                if (__import__("time").monotonic() - ts_r) < 60 and mid_r:
+                    return mid_r
+
+        existing = None
+
+        # Soft-match by core title (ignore year)
+        if getattr(db, "movies_col", None) is not None:
+            try:
+                core = core_quick
+                is_weak = weak_core
+                best = None
+                best_score = (-1, "")
+                cursor = db.movies_col.find({}).sort("updated_at", -1).limit(400)
+                async for doc in cursor:
+                    dtitle = doc.get("title") or doc.get("normalized_title") or ""
+                    dcore = _core_title(dtitle)
+                    if is_weak:
+                        if not dcore or dcore in ("unknown", "untitled", "movie"):
                             continue
-                    except Exception:
+                        ts_raw = doc.get("updated_at") or doc.get("added_at")
+                        if not ts_raw:
+                            continue
+                        try:
+                            from datetime import datetime, timezone
+                            if hasattr(ts_raw, "timestamp"):
+                                age = datetime.now(timezone.utc).timestamp() - ts_raw.timestamp()
+                            else:
+                                s = str(ts_raw).replace("Z", "+00:00")
+                                dt = datetime.fromisoformat(s)
+                                if dt.tzinfo is None:
+                                    dt = dt.replace(tzinfo=timezone.utc)
+                                age = datetime.now(timezone.utc).timestamp() - dt.timestamp()
+                            if age > 120:
+                                continue
+                        except Exception:
+                            continue
+                        nfiles = len(doc.get("qualities") or doc.get("files") or {})
+                        ts = str(ts_raw)
+                        score = (nfiles, ts)
+                        if best is None or score >= best_score:
+                            best = doc
+                            best_score = score
                         continue
-                    ts = str(ts_raw)
-                    if best is None or ts >= best_ts:
-                        best = doc
-                        best_ts = ts
-                    if best is not None:
-                        break
-                    continue
-                if not dcore or len(dcore) < 4:
-                    continue
-                if not (core == dcore or (len(core) >= 6 and (core in dcore or dcore in core))):
-                    continue
-                # same core title = same movie (ignore year — 2021/2022 caption noise)
-                dy = doc.get("year")
-                year_ok = True
-                # only enforce year if cores are partial/fuzzy match, not exact
-                if core != dcore and year_val is not None and dy is not None:
-                    try:
-                        year_ok = abs(int(dy) - int(year_val)) <= 2
-                    except Exception:
-                        year_ok = True
-                if not year_ok:
-                    continue
-                # prefer more qualities, then more recent
-                nfiles = 0
-                try:
-                    files = doc.get("files") or doc.get("qualities") or {}
-                    if isinstance(files, dict):
-                        nfiles = len(files)
-                    elif isinstance(files, list):
-                        nfiles = len(files)
-                except Exception:
+                    if not dcore or len(dcore) < 4:
+                        continue
+                    if not (core == dcore or (len(core) >= 6 and (core in dcore or dcore in core))):
+                        continue
+                    # same core = same movie
                     nfiles = 0
-                ts = str(doc.get("updated_at") or doc.get("added_at") or "")
-                score = (nfiles, ts)
-                best_score = (0, "")
-                if best is not None:
                     try:
-                        bf = best.get("files") or best.get("qualities") or {}
-                        bn = len(bf) if isinstance(bf, (dict, list)) else 0
+                        files = doc.get("files") or doc.get("qualities") or {}
+                        nfiles = len(files) if isinstance(files, (dict, list)) else 0
                     except Exception:
-                        bn = 0
-                    best_score = (bn, best_ts)
-                if best is None or score >= best_score:
-                    best = doc
-                    best_ts = ts
-            if best and best.get("movie_id"):
-                existing = best
-                logger.info(
-                    "auto_index soft-match title=%s -> existing=%s (%s) weak=%s",
-                    title, best.get("title"), best.get("movie_id"), is_weak,
+                        nfiles = 0
+                    ts = str(doc.get("updated_at") or doc.get("added_at") or "")
+                    score = (nfiles, ts)
+                    if best is None or score >= best_score:
+                        best = doc
+                        best_score = score
+                if best and best.get("movie_id"):
+                    existing = best
+                    logger.info(
+                        "auto_index soft-match title=%s -> existing=%s (%s) weak=%s",
+                        title, best.get("title"), best.get("movie_id"), is_weak,
+                    )
+            except Exception as e:
+                logger.debug("soft match: %s", e)
+
+        if not existing:
+            try:
+                if hasattr(db, "find_movie_by_title_year"):
+                    existing = await db.find_movie_by_title_year(title, year=year_val)
+                elif hasattr(db, "find_movie_by_title"):
+                    existing = await db.find_movie_by_title(title, year=year_val)
+            except Exception as e:
+                logger.debug("find movie: %s", e)
+                existing = None
+
+        if existing and existing.get("movie_id"):
+            mid = existing["movie_id"]
+            try:
+                old_t = (existing.get("title") or "").strip()
+                weak_new = (not title) or title.lower().strip() in (
+                    "unknown", "untitled", "untitled movie", "movie", ""
                 )
-        except Exception as e:
-            logger.debug("soft match: %s", e)
+                if (
+                    title
+                    and not weak_new
+                    and len(title) > len(old_t)
+                    and getattr(db, "movies_col", None) is not None
+                ):
+                    await db.movies_col.update_one(
+                        {"movie_id": mid},
+                        {"$set": {
+                            "title": title,
+                            "normalized_title": re.sub(r"[^\w\s]", "", title.lower()).strip(),
+                        }},
+                    )
+            except Exception:
+                pass
+            if not weak_core:
+                _recent_cores[core_quick] = (mid, __import__("time").monotonic())
+            return mid
 
-    # Fallback: year-strict DB find only if soft-match found nothing
-    if not existing:
-        try:
-            if hasattr(db, "find_movie_by_title_year"):
-                existing = await db.find_movie_by_title_year(title, year=year_val)
-            elif hasattr(db, "find_movie_by_title"):
-                existing = await db.find_movie_by_title(title, year=year_val)
-        except Exception as e:
-            logger.debug("find movie: %s", e)
-            existing = None
-
-    if existing and existing.get("movie_id"):
-        mid = existing["movie_id"]
-        # Prefer longer/cleaner display title (never overwrite good title with Untitled)
-        try:
-            old_t = (existing.get("title") or "").strip()
-            weak_new = (not title) or title.lower().strip() in (
-                "unknown", "untitled", "untitled movie", "movie", ""
+        if weak_core:
+            for mid in list(_key_to_movie.values()):
+                if mid:
+                    logger.info(
+                        "auto_index weak title attach to pending movie_id=%s title=%s",
+                        mid, title,
+                    )
+                    return mid
+            logger.warning(
+                "auto_index skip create for weak title=%s (no recent match)",
+                title,
             )
-            if (
-                title
-                and not weak_new
-                and len(title) > len(old_t)
-                and getattr(db, "movies_col", None) is not None
-            ):
-                await db.movies_col.update_one(
-                    {"movie_id": mid},
-                    {"$set": {
-                        "title": title,
-                        "normalized_title": re.sub(r"[^\w\s]", "", title.lower()).strip(),
-                    }},
-                )
-        except Exception:
-            pass
-        if core_quick and len(core_quick) >= 4:
-            _recent_cores[core_quick] = (mid, __import__("time").monotonic())
-        return mid
+            return None
 
-    # NEVER create a new movie from weak/Untitled titles — causes split posts
-    core_now = _core_title(title)
-    is_weak_now = (
-        (not core_now)
-        or core_now in ("unknown", "untitled", "untitled movie", "movie")
-        or len(core_now) < 4
-    )
-    if is_weak_now:
-        # attach to any movie currently settling (same multi-forward batch)
-        for mid in list(_key_to_movie.values()):
-            if mid:
-                logger.info(
-                    "auto_index weak title attach to pending movie_id=%s title=%s",
-                    mid, title,
-                )
-                return mid
-        logger.warning(
-            "auto_index skip create for weak title=%s (no recent match)",
-            title,
-        )
-        return None
+        # Create new movie — register placeholder FIRST so concurrent waiters join
+        try:
+            doc = await db.create_movie(
+                title=title,
+                normalized_title=(title or "").lower(),
+                year=year_val,
+                languages=[language] if language and language != "Unknown" else ["Hindi"],
+            )
+            mid = doc.get("movie_id") if doc else None
+            if mid and not weak_core:
+                _recent_cores[core_quick] = (mid, __import__("time").monotonic())
+            return mid
+        except Exception as e:
+            logger.error("create_movie: %s", e)
+            return None
 
-    try:
-        doc = await db.create_movie(
-            title=title,
-            normalized_title=(title or "").lower(),
-            year=year_val,
-            languages=[language] if language and language != "Unknown" else ["Hindi"],
-        )
-        mid = doc.get("movie_id") if doc else None
-        if mid and core_quick and len(core_quick) >= 4:
-            _recent_cores[core_quick] = (mid, __import__("time").monotonic())
-        return mid
-    except Exception as e:
-        logger.error("create_movie: %s", e)
-        return None
+    if clock is not None:
+        async with clock:
+            return await _resolve()
+    return await _resolve()
 
 
 async def _stabilize_poster(bot: Client, poster_file_id: str) -> Optional[str]:
