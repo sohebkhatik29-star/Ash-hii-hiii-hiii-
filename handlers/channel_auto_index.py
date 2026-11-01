@@ -209,14 +209,31 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
                 dtitle = doc.get("title") or doc.get("normalized_title") or ""
                 dcore = _core_title(dtitle)
                 if is_weak:
-                    # attach to newest non-weak movie updated in last few minutes
+                    # ONLY attach to non-weak movie updated in last 90 seconds (same batch)
                     if not dcore or dcore in ("unknown", "untitled", "movie"):
                         continue
-                    ts = str(doc.get("updated_at") or doc.get("added_at") or "")
+                    ts_raw = doc.get("updated_at") or doc.get("added_at")
+                    if not ts_raw:
+                        continue
+                    try:
+                        from datetime import datetime, timezone
+                        if hasattr(ts_raw, "timestamp"):
+                            age = datetime.now(timezone.utc).timestamp() - ts_raw.timestamp()
+                        else:
+                            # iso string
+                            s = str(ts_raw).replace("Z", "+00:00")
+                            dt = datetime.fromisoformat(s)
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            age = datetime.now(timezone.utc).timestamp() - dt.timestamp()
+                        if age > 90:
+                            continue
+                    except Exception:
+                        continue
+                    ts = str(ts_raw)
                     if best is None or ts >= best_ts:
                         best = doc
                         best_ts = ts
-                    # only consider first (newest) good candidate for weak titles
                     if best is not None:
                         break
                     continue
@@ -248,10 +265,18 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
 
     if existing and existing.get("movie_id"):
         mid = existing["movie_id"]
-        # Prefer longer/cleaner display title
+        # Prefer longer/cleaner display title (never overwrite good title with Untitled)
         try:
             old_t = (existing.get("title") or "").strip()
-            if title and len(title) > len(old_t) and getattr(db, "movies_col", None) is not None:
+            weak_new = (not title) or title.lower().strip() in (
+                "unknown", "untitled", "untitled movie", "movie", ""
+            )
+            if (
+                title
+                and not weak_new
+                and len(title) > len(old_t)
+                and getattr(db, "movies_col", None) is not None
+            ):
                 await db.movies_col.update_one(
                     {"movie_id": mid},
                     {"$set": {
@@ -262,6 +287,28 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
         except Exception:
             pass
         return mid
+
+    # NEVER create a new movie from weak/Untitled titles — causes split posts
+    core_now = _core_title(title)
+    is_weak_now = (
+        (not core_now)
+        or core_now in ("unknown", "untitled", "untitled movie", "movie")
+        or len(core_now) < 4
+    )
+    if is_weak_now:
+        # attach to any movie currently settling (same multi-forward batch)
+        for mid in list(_key_to_movie.values()):
+            if mid:
+                logger.info(
+                    "auto_index weak title attach to pending movie_id=%s title=%s",
+                    mid, title,
+                )
+                return mid
+        logger.warning(
+            "auto_index skip create for weak title=%s (no recent match)",
+            title,
+        )
+        return None
 
     try:
         doc = await db.create_movie(
@@ -627,9 +674,8 @@ async def _handle_channel_media(bot: Client, message: Message):
 
     movie_id = await _get_or_create_movie(title, year, language=language)
     if not movie_id:
-        _stats["errors"] += 1
-        logger.error("auto_index could not create movie title=%s", title)
-        await _notify(bot, f"❌ Auto-index: movie create fail\n{title}")
+        # weak/Untitled with no batch to attach → skip quietly (not a hard error)
+        logger.warning("auto_index no movie_id for title=%s msg — skipped", title)
         return
 
     # Order lock: indexing channel me jo movie pehle aayi uska added_at earliest rakho
@@ -673,8 +719,8 @@ async def _handle_channel_media(bot: Client, message: Message):
     _stats["saved"] += 1
     await _set_poster_from_message(bot, movie_id, message, media)
 
-    mkey = _movie_key(title, year)
-    # current quality count from DB
+    # Always settle by movie_id so all qualities (even weak titles) share ONE timer
+    mkey = str(movie_id)
     qcount = 0
     try:
         mdoc = await db.get_movie(movie_id)
