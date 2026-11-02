@@ -243,11 +243,33 @@ def extract_movie_metadata(filename: str, caption: str = "") -> Dict[str, Any]:
     season = extract_season(combined)
     episode = extract_episode_or_part(combined)
 
-    # Prefer filename for title base; caption only if filename empty/generic
-    base = filename if filename else caption
-    # strip extension
-    base = re.sub(r"\.[a-z0-9]{2,4}$", "", base, flags=re.I)
+    # Prefer the more descriptive of filename vs caption (forwarded files often have empty name)
+    def _base(s: str) -> str:
+        s = re.sub(r"\.[a-z0-9]{2,4}$", "", s or "", flags=re.I).strip()
+        return s
+    fn_base = _base(filename)
+    cap_base = _base(caption)
+    # Prefer longer non-generic source
+    generic = {"", "video", "document", "movie", "file", "media", "unknown"}
+    candidates = []
+    if fn_base and fn_base.lower() not in generic:
+        candidates.append(fn_base)
+    if cap_base and cap_base.lower() not in generic:
+        candidates.append(cap_base)
+    if not candidates:
+        candidates = [fn_base or cap_base or ""]
+    # pick longest (usually full title+tags)
+    base = max(candidates, key=len)
     title = clean_movie_title(base, year)
+    # If still Untitled, try the other candidate
+    if (not title or title.lower() == "untitled movie") and len(candidates) > 1:
+        for c in sorted(candidates, key=len, reverse=True):
+            t2 = clean_movie_title(c, year)
+            if t2 and t2.lower() != "untitled movie":
+                title = t2
+                break
+    if not title or not title.strip():
+        title = "Untitled Movie"
 
     return {
         "title": title,
