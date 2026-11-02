@@ -145,3 +145,101 @@ def register_admin_handlers(bot: Client):
                 "🖼 Photo received. Poster set karne ke liye pehle <b>/addmovie</b> se session shuru karein.",
                 quote=True
             )
+
+
+    @bot.on_message(filters.private & filters.text & ~filters.command([
+        "start", "status", "movies", "delete", "stats", "addmovie", "newmovie",
+        "finish", "done_upload", "cancel", "broadcast", "users",
+    ]))
+    async def session_edit_title_handler(client: Client, message: Message):
+        """Edit Name button ke baad admin naya title bhejta hai."""
+        admin_id = message.from_user.id if message.from_user else 0
+        if admin_id not in getattr(Config, "ADMINS", set()):
+            return
+        session = await session_mgr.get_session(admin_id)
+        if not session or not session.get("awaiting_edit"):
+            return
+
+        from handlers.parser import sanitize_text, normalize_title, clean_movie_title
+        import re as _re
+        raw = sanitize_text((message.text or "").strip())
+        if not raw or len(raw) < 2:
+            await message.reply_text(
+                "Valid movie name bhejo. Example: <code>Ant-Man and the Wasp 2018</code>",
+                quote=True,
+            )
+            return
+
+        year = None
+        ym = _re.search(r"\b(19\d{2}|20\d{2})\b", raw)
+        if ym:
+            try:
+                year = int(ym.group(1))
+            except Exception:
+                year = None
+        title = clean_movie_title(raw, year)
+        if not title or title.lower() == "untitled movie":
+            title = raw
+            if year:
+                title = _re.sub(r"\b" + str(year) + r"\b", "", title).strip(" -_.")
+
+        session["title"] = title
+        if year:
+            session["year"] = year
+        session["normalized_title"] = normalize_title(title)
+        session["awaiting_edit"] = False
+        session_mgr.active_sessions[admin_id] = session
+        try:
+            await db.set_active_session(admin_id, session)
+        except Exception:
+            pass
+
+        movie_id = session.get("movie_id")
+        if movie_id:
+            try:
+                upd = {"title": title, "normalized_title": normalize_title(title)}
+                if year:
+                    upd["year"] = year
+                if getattr(db, "movies_col", None) is not None:
+                    await db.movies_col.update_one({"movie_id": movie_id}, {"$set": upd})
+                if movie_id in getattr(db, "_mem_movies", {}):
+                    db._mem_movies[movie_id].update(upd)
+            except Exception as e:
+                logger.error("edit title db: %s", e)
+
+        year_str = f" ({session.get('year')})" if session.get("year") else ""
+        q_str = ", ".join(session.get("qualities") or []) or "—"
+        status_text = (
+            f"Movie Session Active (v3.3)\n\n"
+            f"Title: `{title}`{year_str}\n"
+            f"Year: `{session.get('year') or 'N/A'}`\n\n"
+            f"All qualities: `{q_str}`\n\n"
+            f"✅ Name update ho gaya. Aur quality bhejo ya Generate Links dabaao."
+        )
+        markup = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Continue Upload", callback_data="session_continue"),
+                InlineKeyboardButton("Generate Links", callback_data="session_generate"),
+            ],
+            [
+                InlineKeyboardButton("✏️ Edit Name", callback_data="session_edit"),
+                InlineKeyboardButton("Cancel Session", callback_data="session_cancel"),
+            ],
+        ])
+        try:
+            sid = session.get("status_msg_id")
+            cid = session.get("status_chat_id") or message.chat.id
+            if sid:
+                await client.edit_message_text(cid, sid, status_text, reply_markup=markup)
+        except Exception:
+            try:
+                sent = await message.reply_text(status_text, quote=True, reply_markup=markup)
+                session["status_msg_id"] = sent.id
+                session["status_chat_id"] = message.chat.id
+                session_mgr.active_sessions[admin_id] = session
+            except Exception:
+                pass
+        await message.reply_text(
+            f"✅ Title set: <b>{title}{year_str}</b>\nAb Generate Links dabao — yahi name group me jayega.",
+            quote=True,
+        )
