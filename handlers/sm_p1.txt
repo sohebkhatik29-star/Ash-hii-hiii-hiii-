@@ -58,7 +58,10 @@ _SESSION_MARKUP = InlineKeyboardMarkup([
         InlineKeyboardButton("Continue Upload", callback_data="session_continue"),
         InlineKeyboardButton("Generate Links", callback_data="session_generate"),
     ],
-    [InlineKeyboardButton("Cancel Session", callback_data="session_cancel")],
+    [
+        InlineKeyboardButton("✏️ Edit Name", callback_data="session_edit"),
+        InlineKeyboardButton("Cancel Session", callback_data="session_cancel"),
+    ],
 ])
 
 
@@ -190,6 +193,15 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
         or (file_name.rsplit(".", 1)[0] if file_name else "")
         or "Unknown"
     )
+    # Untitled / weak title → caption se dubara try
+    if (not title or title.lower() in ("untitled movie", "unknown", "video", "document")) and caption:
+        try:
+            from handlers.parser import clean_movie_title
+            t2 = clean_movie_title(caption, meta.get("year") or session.get("year"))
+            if t2 and t2.lower() not in ("untitled movie", "unknown"):
+                title = _safe(t2)
+        except Exception:
+            pass
     year = meta.get("year") or session.get("year")
     final_quality = meta.get("quality") or meta.get("quality_label") or "HD"
     season = (meta.get("season") or "").strip()
