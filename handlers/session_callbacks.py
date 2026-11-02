@@ -96,7 +96,10 @@ def register_callback_handlers(bot: Client):
             )
             markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔗 Generate Links", callback_data="session_generate")],
-                [InlineKeyboardButton("❌ Cancel Session", callback_data="session_cancel")]
+                [
+                    InlineKeyboardButton("✏️ Edit Name", callback_data="session_edit"),
+                    InlineKeyboardButton("❌ Cancel Session", callback_data="session_cancel"),
+                ],
             ])
             try:
                 await query.message.edit_text(text, reply_markup=markup)
@@ -114,6 +117,37 @@ def register_callback_handlers(bot: Client):
             raise StopPropagation
 
         # 5. Session Cancel
+        elif data == "session_edit":
+            if user_id not in Config.ADMINS:
+                await query.answer("Admin only", show_alert=True)
+                return
+            session = await session_mgr.get_session(user_id)
+            if not session:
+                await query.answer("Koi active session nahi hai", show_alert=True)
+                return
+            session["awaiting_edit"] = True
+            session_mgr.active_sessions[user_id] = session
+            try:
+                await db.set_active_session(user_id, session)
+            except Exception:
+                pass
+            cur = session.get("title") or "Untitled"
+            yr = session.get("year") or ""
+            try:
+                await query.message.reply_text(
+                    "✏️ <b>Naya movie name bhejo</b>\n\n"
+                    f"Abhi: <code>{cur}" + (f" ({yr})" if yr else "") + "</code>\n\n"
+                    "Format: <code>Movie Name 2018</code>\n"
+                    "Example: <code>Ant-Man and the Wasp 2018</code>\n\n"
+                    "Sirf name bhi chalega (year optional).\n"
+                    "Jo name doge wahi group me post + filter hoga.",
+                    quote=True,
+                )
+            except Exception:
+                pass
+            await query.answer("Name type karke bhejo")
+            return
+
         elif data == "session_cancel":
             if user_id not in Config.ADMINS:
                 return
