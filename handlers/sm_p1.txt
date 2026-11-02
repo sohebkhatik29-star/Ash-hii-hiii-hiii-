@@ -140,8 +140,22 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
 
     session = await session_mgr.get_session(admin_id)
     if not session:
-        # Silent when no session (indexing/other flows)
-        return
+        # Admin ne /addmovie ke bina hi movie bheji → auto session start (same flow)
+        try:
+            status_msg = await message.reply_text(
+                "🎬 <b>Movie Upload Session Started</b> (auto)\n\n"
+                "File process ho rahi hai...\n"
+                "Saari qualities bhejo, phir <b>Generate Links</b> dabao.",
+                reply_markup=_SESSION_MARKUP,
+                quote=True,
+            )
+        except Exception:
+            status_msg = None
+        session = await session_mgr.start_addmovie_session(
+            admin_id,
+            status_msg.id if status_msg else 0,
+            message.chat.id,
+        )
 
     file_id = None
     filesize = 0
