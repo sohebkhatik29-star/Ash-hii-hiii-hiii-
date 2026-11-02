@@ -224,6 +224,15 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
 
         if not movie_id:
             poster_file_id = session.get("poster_file_id")
+            # First file pe poster sync nikaalo (bg race se miss na ho)
+            if not poster_file_id:
+                try:
+                    poster_file_id = await asyncio.wait_for(
+                        extract_poster_from_message(bot, message), timeout=15.0
+                    )
+                except Exception as e:
+                    logger.debug("sync poster first-file: %s", type(e).__name__)
+                    poster_file_id = None
             existing = None
             try:
                 existing = await db.find_movie_by_title(active_title, year=active_year)
@@ -348,3 +357,4 @@ async def _bg_extract_poster(bot, message, movie_id, admin_id):
         logger.info("bg poster ok movie=%s", movie_id)
     except Exception as e:
         logger.warning("bg poster fail: %s: %s", type(e).__name__, e)
+
