@@ -271,6 +271,12 @@ def extract_movie_metadata(filename: str, caption: str = "") -> Dict[str, Any]:
     if not title or not title.strip():
         title = "Untitled Movie"
 
+    # Series: keep season in title so S01 / S02 of same year stay separate movies
+    # (e.g. Vikings S01 vs Vikings S02). Same-season qualities still merge under one post.
+    # If user intentionally puts multiple seasons in ONE upload session, session grouping still wins.
+    if season and season.upper() not in title.upper():
+        title = f"{title} {season}".strip()
+
     return {
         "title": title,
         "normalized_title": normalize_title(title),
