@@ -137,6 +137,13 @@ except Exception as e:
     logger.error(f"delete_filter_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
 try:
+    from handlers.bot_commands.deletemovie_cmd import register_deletemovie_command
+    register_deletemovie_command(Bot)
+    logger.info("/deletemovie command registered")
+except Exception as e:
+    logger.error(f"deletemovie_cmd register failed (bot still runs): {type(e).__name__}: {e}")
+
+try:
     from handlers.bot_commands.notavailable_cmd import register_notavailable_command
     register_notavailable_command(Bot)
 except Exception as e:
@@ -196,6 +203,7 @@ async def setup_bot_commands(bot: Client):
         BotCommand("done", "Not-found session close"),
         BotCommand("chakspelling", "Check spelling (reply to user)"),
         BotCommand("deletefilter", "Reply to poster remove filter"),
+        BotCommand("deletemovie", "Delete all filters by movie name"),
         BotCommand("not_available", "Not available on Telegram (reply)"),
         BotCommand("premium", "Premium only contact @movies_1780"),
         BotCommand("cleangroup", "Clean group messages"),
