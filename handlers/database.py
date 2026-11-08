@@ -144,12 +144,19 @@ class Database:
             if not year_ok:
                 return False
             # language guard: same title+year but different known language = different movie
-            # Boss (2013) Hindi != Boss (2013) Bengali
+            # Non-Hindi (Bengali/Tamil/...) ONLY matches docs that explicitly have that language.
+            # Hindi can match Hindi or empty (legacy).
             if lang_in:
                 dlangs = _doc_langs(doc)
                 specific = [x for x in dlangs if x and x not in ("unknown", "unk")]
-                if specific and lang_in not in specific:
-                    return False
+                if lang_in not in ("hindi", "hin"):
+                    # strict: must already be tagged with this language
+                    if lang_in not in specific:
+                        return False
+                else:
+                    # Hindi: reject if doc is ONLY other languages
+                    if specific and "hindi" not in specific and "hin" not in specific:
+                        return False
             return True
 
         if self.has_mongo and self.movies_col is not None:

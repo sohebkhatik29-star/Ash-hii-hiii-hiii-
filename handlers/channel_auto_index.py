@@ -16,7 +16,7 @@ from pyrogram.types import Message
 
 from configs import Config
 from handlers.database import db
-from handlers.parser import extract_movie_metadata, format_size
+from handlers.parser import extract_movie_metadata, format_size, disambiguate_title_by_language
 
 logger = logging.getLogger("ChannelAutoIndex")
 
@@ -297,15 +297,19 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
                         continue
                     if not (core == dcore or (len(core) >= 6 and (core in dcore or dcore in core))):
                         continue
-                    # language guard: Boss Hindi != Boss Bengali
+                    # language guard: non-Hindi must match explicitly
                     if lang_key:
                         raw = doc.get("languages") or doc.get("language") or []
                         if isinstance(raw, str):
                             raw = [raw]
                         dlangs = [str(x).strip().lower() for x in raw if str(x).strip()]
                         specific = [x for x in dlangs if x and x not in ("unknown", "unk")]
-                        if specific and lang_key not in specific:
-                            continue
+                        if lang_key not in ("hindi", "hin"):
+                            if lang_key not in specific:
+                                continue
+                        else:
+                            if specific and "hindi" not in specific and "hin" not in specific:
+                                continue
                     # same core + compatible language = same movie
                     nfiles = 0
                     try:
@@ -797,6 +801,12 @@ async def _handle_channel_media(bot: Client, message: Message):
             msg_id, (file_name or "")[:60], (caption or "")[:60],
         )
         title = title if title and title.lower() not in ("unknown", "") else "Unknown"
+
+    # Non-Hindi → unique title (Boss Bengali stays separate from Boss Hindi)
+    try:
+        title = disambiguate_title_by_language(title, language)
+    except Exception:
+        pass
 
     file_id, db_msg_id = await _copy_to_db(bot, message, caption_text=caption or file_name)
     if not file_id:

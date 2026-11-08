@@ -300,3 +300,21 @@ def is_title_match(active_title: str, incoming_title: str, threshold: float = 0.
         return True
     ratio = difflib.SequenceMatcher(None, a, b).ratio()
     return ratio >= threshold
+
+
+def disambiguate_title_by_language(title: str, language: str = None) -> str:
+    """Same name+year different language → unique title.
+    Boss + Bengali → Boss (Bengali). Hindi/Unknown stay as-is.
+    """
+    t = (title or "").strip()
+    if not t:
+        return t
+    lang = (language or "").strip()
+    if not lang or lang.lower() in ("unknown", "unk", "hindi", "hin"):
+        return t
+    # already has language tag?
+    low = t.lower()
+    if lang.lower() in low or f"({lang.lower()})" in low:
+        return t
+    return f"{t} ({lang})"
+

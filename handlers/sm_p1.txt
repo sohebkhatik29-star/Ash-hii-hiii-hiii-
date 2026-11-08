@@ -12,7 +12,7 @@ from pyrogram.errors import FloodWait
 
 from configs import Config
 from handlers.database import db
-from handlers.parser import extract_movie_metadata, format_size, sanitize_text
+from handlers.parser import disambiguate_title_by_language, extract_movie_metadata, format_size, sanitize_text
 from handlers.session_manager import session_mgr
 from handlers.movie_card import build_final_movie_card_text, build_final_movie_card_buttons
 from handlers.poster import extract_poster_from_message
@@ -234,6 +234,12 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
         movie_id = session.get("movie_id")
         active_title = session.get("title") or title
         active_year = session.get("year") or year
+        # Non-Hindi language → unique title so Boss Hindi != Boss Bengali
+        if not session.get("title_locked"):
+            try:
+                active_title = disambiguate_title_by_language(active_title, language)
+            except Exception:
+                pass
 
         if not movie_id:
             poster_file_id = session.get("poster_file_id")
