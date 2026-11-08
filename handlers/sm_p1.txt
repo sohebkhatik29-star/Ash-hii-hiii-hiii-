@@ -203,6 +203,7 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
         except Exception:
             pass
     year = meta.get("year") or session.get("year")
+    language = (meta.get("language") or session.get("language") or "").strip()
     final_quality = meta.get("quality") or meta.get("quality_label") or "HD"
     season = (meta.get("season") or "").strip()
     episode = (meta.get("episode") or "").strip()
@@ -247,7 +248,9 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
                     poster_file_id = None
             existing = None
             try:
-                existing = await db.find_movie_by_title(active_title, year=active_year)
+                existing = await db.find_movie_by_title(
+                    active_title, year=active_year, language=language or None
+                )
             except Exception:
                 existing = None
             if existing and existing.get("movie_id"):
@@ -266,6 +269,7 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
                     normalized_title=_safe(active_title.lower()),
                     year=active_year,
                     poster_file_id=poster_file_id,
+                    languages=[language] if language and language.lower() not in ("", "unknown") else ["Hindi"],
                 )
                 movie_id = doc.get("movie_id")
 

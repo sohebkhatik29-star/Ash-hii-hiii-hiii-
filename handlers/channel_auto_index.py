@@ -214,7 +214,13 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
     except Exception:
         year_val = None
 
+    lang_key = (language or "").strip().lower()
+    if lang_key in ("", "unknown", "unk"):
+        lang_key = ""
+
     core_quick = _core_title(title)
+    # include language in cache/lock key so Boss Hindi != Boss Bengali
+    core_cache_key = f"{core_quick}|{lang_key}" if lang_key else core_quick
     weak_core = (
         (not core_quick)
         or core_quick in ("unknown", "untitled", "untitled movie", "movie")
@@ -223,25 +229,25 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
 
     # Fast path without lock
     if not weak_core:
-        rec = _recent_cores.get(core_quick)
+        rec = _recent_cores.get(core_cache_key)
         if rec:
             mid_r, ts_r = rec
             if (__import__("time").monotonic() - ts_r) < 60 and mid_r:
-                logger.info("auto_index recent-core hit title=%s -> %s", title, mid_r)
+                logger.info("auto_index recent-core hit title=%s lang=%s -> %s", title, lang_key, mid_r)
                 return mid_r
 
     # Per-core lock: concurrent forwards of same movie share ONE create
     clock = None
     if not weak_core:
         async with _lock:
-            if core_quick not in _core_locks:
-                _core_locks[core_quick] = asyncio.Lock()
-            clock = _core_locks[core_quick]
+            if core_cache_key not in _core_locks:
+                _core_locks[core_cache_key] = asyncio.Lock()
+            clock = _core_locks[core_cache_key]
 
     async def _resolve() -> Optional[str]:
         # Re-check cache under lock
         if not weak_core:
-            rec = _recent_cores.get(core_quick)
+            rec = _recent_cores.get(core_cache_key)
             if rec:
                 mid_r, ts_r = rec
                 if (__import__("time").monotonic() - ts_r) < 60 and mid_r:
@@ -249,7 +255,7 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
 
         existing = None
 
-        # Soft-match by core title (ignore year)
+        # Soft-match by core title; different language = different movie
         if getattr(db, "movies_col", None) is not None:
             try:
                 core = core_quick
@@ -291,7 +297,16 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
                         continue
                     if not (core == dcore or (len(core) >= 6 and (core in dcore or dcore in core))):
                         continue
-                    # same core = same movie
+                    # language guard: Boss Hindi != Boss Bengali
+                    if lang_key:
+                        raw = doc.get("languages") or doc.get("language") or []
+                        if isinstance(raw, str):
+                            raw = [raw]
+                        dlangs = [str(x).strip().lower() for x in raw if str(x).strip()]
+                        specific = [x for x in dlangs if x and x not in ("unknown", "unk")]
+                        if specific and lang_key not in specific:
+                            continue
+                    # same core + compatible language = same movie
                     nfiles = 0
                     try:
                         files = doc.get("files") or doc.get("qualities") or {}
@@ -315,9 +330,9 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
         if not existing:
             try:
                 if hasattr(db, "find_movie_by_title_year"):
-                    existing = await db.find_movie_by_title_year(title, year=year_val)
+                    existing = await db.find_movie_by_title_year(title, year=year_val, language=language)
                 elif hasattr(db, "find_movie_by_title"):
-                    existing = await db.find_movie_by_title(title, year=year_val)
+                    existing = await db.find_movie_by_title(title, year=year_val, language=language)
             except Exception as e:
                 logger.debug("find movie: %s", e)
                 existing = None
@@ -345,7 +360,7 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
             except Exception:
                 pass
             if not weak_core:
-                _recent_cores[core_quick] = (mid, __import__("time").monotonic())
+                _recent_cores[core_cache_key] = (mid, __import__("time").monotonic())
             return mid
 
         if weak_core:
@@ -372,7 +387,7 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
             )
             mid = doc.get("movie_id") if doc else None
             if mid and not weak_core:
-                _recent_cores[core_quick] = (mid, __import__("time").monotonic())
+                _recent_cores[core_cache_key] = (mid, __import__("time").monotonic())
             return mid
         except Exception as e:
             logger.error("create_movie: %s", e)
@@ -578,10 +593,15 @@ async def _finalize_movie(bot: Client, movie_key: str, movie_id: str):
         chat = getattr(_post_or_update_group, "last_chat", "") or ""
 
         # Near-duplicate cleanup: same core title+year, different movie_id → delete extra
+        # Different language (Hindi vs Bengali) = NOT duplicate — keep both.
         if ok and getattr(db, "movies_col", None) is not None and hasattr(db, "delete_movie"):
             try:
                 core = _core_title(title)
                 y = (movie or {}).get("year")
+                my_langs_raw = (movie or {}).get("languages") or (movie or {}).get("language") or []
+                if isinstance(my_langs_raw, str):
+                    my_langs_raw = [my_langs_raw]
+                my_langs = [str(x).strip().lower() for x in my_langs_raw if str(x).strip() and str(x).strip().lower() not in ("unknown", "unk")]
                 async for doc in db.movies_col.find({}):
                     other = doc.get("movie_id")
                     if not other or other == movie_id:
@@ -593,12 +613,20 @@ async def _finalize_movie(bot: Client, movie_key: str, movie_id: str):
                         except Exception:
                             continue
                     ocore = _core_title(doc.get("title") or "")
-                    if core and ocore and (core == ocore or core in ocore or ocore in core):
-                        try:
-                            await db.delete_movie(other)
-                            logger.info("auto_index deleted duplicate movie_id=%s title=%s", other, doc.get("title"))
-                        except Exception as de:
-                            logger.debug("dup delete: %s", de)
+                    if not (core and ocore and (core == ocore or core in ocore or ocore in core)):
+                        continue
+                    # language guard
+                    o_raw = doc.get("languages") or doc.get("language") or []
+                    if isinstance(o_raw, str):
+                        o_raw = [o_raw]
+                    o_langs = [str(x).strip().lower() for x in o_raw if str(x).strip() and str(x).strip().lower() not in ("unknown", "unk")]
+                    if my_langs and o_langs and not set(my_langs).intersection(o_langs):
+                        continue  # different languages — keep both
+                    try:
+                        await db.delete_movie(other)
+                        logger.info("auto_index deleted duplicate movie_id=%s title=%s", other, doc.get("title"))
+                    except Exception as de:
+                        logger.debug("dup delete: %s", de)
             except Exception as ce:
                 logger.debug("dup cleanup: %s", ce)
 

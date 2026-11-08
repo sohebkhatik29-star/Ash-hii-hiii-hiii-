@@ -104,7 +104,8 @@ class Database:
         self._mem_movies[mid] = doc
         return doc
 
-    async def find_movie_by_title_year(self, title: str, year=None) -> Optional[dict]:
+    async def find_movie_by_title_year(self, title: str, year=None, language=None) -> Optional[dict]:
+        """Match by title+year. If language given and doc has a different known language, skip (Boss Hindi != Boss Bengali)."""
         norm = re.sub(r"[^\w\s]", " ", (title or "").lower())
         norm = re.sub(r"\s+", " ", norm).strip()
         if not norm:
@@ -112,6 +113,15 @@ class Database:
         year_val = None
         if year is not None and str(year).isdigit():
             year_val = int(year)
+        lang_in = (language or "").strip().lower()
+        if lang_in in ("", "unknown", "unk"):
+            lang_in = ""
+
+        def _doc_langs(doc):
+            raw = doc.get("languages") or doc.get("language") or []
+            if isinstance(raw, str):
+                raw = [raw]
+            return [str(x).strip().lower() for x in raw if str(x).strip()]
 
         def _match(doc):
             dnorm = (doc.get("normalized_title") or "")
@@ -123,12 +133,24 @@ class Database:
                 if t2 != norm:
                     return False
             dy = doc.get("year")
+            year_ok = False
             if year_val is None and (dy is None or dy == "" or dy == "N/A"):
-                return True
-            try:
-                return int(dy) == year_val if dy is not None and str(dy).isdigit() else (year_val is None)
-            except Exception:
-                return year_val is None
+                year_ok = True
+            else:
+                try:
+                    year_ok = int(dy) == year_val if dy is not None and str(dy).isdigit() else (year_val is None)
+                except Exception:
+                    year_ok = year_val is None
+            if not year_ok:
+                return False
+            # language guard: same title+year but different known language = different movie
+            # Boss (2013) Hindi != Boss (2013) Bengali
+            if lang_in:
+                dlangs = _doc_langs(doc)
+                specific = [x for x in dlangs if x and x not in ("unknown", "unk")]
+                if specific and lang_in not in specific:
+                    return False
+            return True
 
         if self.has_mongo and self.movies_col is not None:
             try:
@@ -157,6 +179,10 @@ class Database:
                 best = doc
                 best_ts = ts
         return best
+
+    async def find_movie_by_title(self, title: str, year=None, language=None):
+        """Alias used by addmovie — same as find_movie_by_title_year, language-aware."""
+        return await self.find_movie_by_title_year(title, year=year, language=language)
 
     async def add_quality_to_movie(self, movie_id: str, quality_key: str, quality_data: dict) -> bool:
         if self.has_mongo and self.movies_col is not None:
