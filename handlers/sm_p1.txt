@@ -262,7 +262,8 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
             if existing and existing.get("movie_id"):
                 movie_id = existing["movie_id"]
                 try:
-                    if poster_file_id and not existing.get("poster_file_id"):
+                    # Always refresh poster from current upload (fixes wrong-lang poster stuck)
+                    if poster_file_id:
                         await db.movies_col.update_one(
                             {"movie_id": movie_id},
                             {"$set": {"poster_file_id": poster_file_id}},
@@ -288,6 +289,10 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
             session["title"] = active_title
             session["year"] = active_year
 
+            if not session.get("poster_file_id"):
+                asyncio.create_task(_bg_extract_poster(bot, message, movie_id, admin_id))
+        else:
+            # movie already in session — still refresh poster from this file if we don't have one yet
             if not session.get("poster_file_id"):
                 asyncio.create_task(_bg_extract_poster(bot, message, movie_id, admin_id))
 

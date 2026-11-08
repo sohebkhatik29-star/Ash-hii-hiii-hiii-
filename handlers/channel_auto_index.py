@@ -433,11 +433,10 @@ async def _stabilize_poster(bot: Client, poster_file_id: str) -> Optional[str]:
 
 
 async def _set_poster_from_message(bot: Client, movie_id: str, message: Message, media) -> None:
-    """Poster: photo ya video/document thumb → stabilize → save."""
+    """Poster: photo ya video/document thumb → stabilize → save.
+    Always refresh so wrong-language poster can be corrected on re-upload.
+    """
     try:
-        movie = await db.get_movie(movie_id)
-        if movie and movie.get("poster_file_id"):
-            return
         fid = None
         if message.photo:
             fid = message.photo.file_id

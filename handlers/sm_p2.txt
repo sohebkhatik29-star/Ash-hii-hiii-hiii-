@@ -35,6 +35,22 @@ async def _handle_generate_links_inner(bot: Client, chat_id: int, admin_id: int)
         card_text = build_final_movie_card_text(movie)
         buttons = build_final_movie_card_buttons(movie, for_group=True)
         target_chat = Config.MOVIE_GROUP_ID or chat_id
+        # Session poster wins — wrong poster from earlier merge gets corrected
+        sess_poster = session.get("poster_file_id")
+        if sess_poster:
+            try:
+                if getattr(db, "movies_col", None) is not None:
+                    await db.movies_col.update_one(
+                        {"movie_id": movie_id},
+                        {"$set": {"poster_file_id": sess_poster}},
+                    )
+                if movie_id in getattr(db, "_mem_movies", {}):
+                    db._mem_movies[movie_id]["poster_file_id"] = sess_poster
+                movie = dict(movie or {})
+                movie["poster_file_id"] = sess_poster
+            except Exception as e:
+                logger.debug("force session poster: %s", type(e).__name__)
+
         poster_id = movie.get("poster_file_id") or session.get("poster_file_id")
         # Agar abhi tak poster miss (bg race) to 2s wait + re-fetch
         if not poster_id:
