@@ -6,7 +6,7 @@
 import logging
 import re
 import time
-from pyrogram import Client, filters
+from pyrogram import Client, filters, StopPropagation
 from pyrogram.enums import ChatType, ChatMemberStatus
 from pyrogram.types import Message
 
@@ -442,9 +442,9 @@ async def notify_admin_movie_request(
 
 def register_dn_command(bot: Client):
     @bot.on_message(
-        filters.command(["dn", "done_notify", "reqdone"])
+        filters.command(["dn", "done", "done_notify", "reqdone"])
         & (filters.private | filters.group),
-        group=-3,
+        group=-5,
     )
     async def dn_handler(client: Client, message: Message):
         try:
@@ -474,10 +474,14 @@ def register_dn_command(bot: Client):
                 client, reply, admin_id=uid, private_chat_id=priv_id
             )
 
+            # Group /done without request meta → leave for traditional done_cmd
+            cmd = (message.command or [""])[0].lower() if message.command else ""
             if not meta and message.chat and message.chat.type in (
                 ChatType.GROUP,
                 ChatType.SUPERGROUP,
             ):
+                if cmd == "done":
+                    return  # traditional /done in group (done_cmd)
                 meta = {
                     "chat_id": message.chat.id,
                     "user_msg_id": reply.id,
@@ -488,11 +492,14 @@ def register_dn_command(bot: Client):
                 }
 
             if not meta:
+                # /done in private without meta → leave for done_cmd local path
+                if cmd == "done" and message.chat and message.chat.type == ChatType.PRIVATE:
+                    return
                 await message.reply_text(
                     "Is message se request nahi samajh aayi.\n\n"
                     "Bot wale <b>📥 Movie Request (not found)</b> card pe "
                     "(jisme <code>chat=… msg=… nfmsg=…</code> likha ho) "
-                    "<b>reply</b> karke <code>/dn</code> bhejo.\n"
+                    "<b>reply</b> karke <code>/dn</code> ya <code>/done</code> bhejo.\n"
                     "Forward (sirf movie name) pe bhi try kar sakte ho — "
                     "bot recent request dhoondhega.",
                     quote=True,
@@ -504,7 +511,7 @@ def register_dn_command(bot: Client):
             except Exception:
                 pass
 
-            ok = await complete_request_in_group(client, meta)
+            ok = await complete_request_in_group(client, meta, prefer_done_text=True)
             if message.chat and message.chat.type == ChatType.PRIVATE:
                 try:
                     await client.send_message(
@@ -522,6 +529,9 @@ def register_dn_command(bot: Client):
                 meta.get("user_msg_id"),
                 uid,
             )
+            raise StopPropagation
+        except StopPropagation:
+            raise
         except Exception as e:
             logger.exception("dn_handler: %s", e)
 
