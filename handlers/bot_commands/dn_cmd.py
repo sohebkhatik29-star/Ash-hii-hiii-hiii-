@@ -16,9 +16,7 @@ logger = logging.getLogger("DnCmd")
 
 _PENDING: dict = {}
 _PENDING_TTL = 48 * 3600
-# (chat_id, user_msg_id) -> not_found bot msg id
 _NOT_FOUND_MSG: dict = {}
-# query_lower -> list of pending keys (admin notify msg ids) for soft match
 _QUERY_INDEX: dict = {}
 
 DN_GROUP_TEXT = (
@@ -148,23 +146,19 @@ def _meta_from_forward(reply: Message):
 
 
 def _meta_from_pending_by_query(reply: Message, admin_id: int = None):
-    """When reply is a short forward (only movie name), match recent pending by query."""
     if not reply:
         return None
     body = (reply.text or reply.caption or "").strip()
     if not body or len(body) > 120:
         return None
-    # skip if looks like command / long bot text
     if body.startswith("/") or "Movie Request" in body or "chat=" in body:
         return None
     q = body.lower().strip()
+    q2 = re.sub(r"[^\w\s]", "", q).strip()
     _purge_old()
     keys = list(_QUERY_INDEX.get(q, []))
-    # also try without punctuation
-    q2 = re.sub(r"[^\w\s]", "", q).strip()
     if q2 and q2 != q:
         keys.extend(_QUERY_INDEX.get(q2, []))
-    # newest first
     for k in reversed(keys):
         meta = _PENDING.get(k)
         if not meta:
@@ -177,8 +171,9 @@ def _meta_from_pending_by_query(reply: Message, admin_id: int = None):
                 (out["chat_id"], out["user_msg_id"])
             )
         return out
-    # soft: any pending whose query equals body
-    for k, meta in sorted(_PENDING.items(), key=lambda x: x[1].get("ts", 0), reverse=True):
+    for k, meta in sorted(
+        _PENDING.items(), key=lambda x: x[1].get("ts", 0), reverse=True
+    ):
         mq = (meta.get("query") or "").strip().lower()
         if mq == q or (q2 and mq == q2):
             if admin_id and meta.get("admin_id") and meta["admin_id"] != admin_id:
@@ -193,7 +188,7 @@ def _meta_from_pending_by_query(reply: Message, admin_id: int = None):
 
 
 def resolve_request_meta(reply: Message, admin_id: int = None):
-    """pending → text parse → forward → query soft-match."""
+    """Sync: pending → text → forward → query soft-match."""
     if not reply:
         return None
     _purge_old()
@@ -212,9 +207,65 @@ def resolve_request_meta(reply: Message, admin_id: int = None):
         key = (meta["chat_id"], meta["user_msg_id"])
         meta["not_found_msg_id"] = _NOT_FOUND_MSG.get(key)
         return meta
-    meta = _meta_from_pending_by_query(reply, admin_id=admin_id)
+    return _meta_from_pending_by_query(reply, admin_id=admin_id)
+
+
+async def resolve_request_meta_async(
+    client: Client,
+    reply: Message,
+    admin_id: int = None,
+    private_chat_id: int = None,
+):
+    """
+    Full resolve: sync paths + private chat history scan for Movie Request card.
+    Fixes: reply on forward (movie name only) after bot restart.
+    """
+    meta = resolve_request_meta(reply, admin_id=admin_id)
     if meta:
         return meta
+
+    if not private_chat_id or not reply:
+        return None
+
+    hint = (reply.text or reply.caption or "").strip().lower()
+    if hint.startswith("/"):
+        hint = ""
+    hint2 = re.sub(r"[^\w\s]", "", hint).strip() if hint else ""
+
+    try:
+        async for m in client.get_chat_history(private_chat_id, limit=40):
+            body = m.text or m.caption or ""
+            if not body:
+                continue
+            if "chat=" not in body and "msg=" not in body:
+                continue
+            if "Movie Request" not in body and "not found" not in body.lower():
+                # still allow pure meta lines
+                if "Query:" not in body:
+                    continue
+            parsed = _parse_meta_from_text(body)
+            if not parsed:
+                continue
+            # if we have a short query hint (from forward), prefer matching cards
+            if hint and len(hint) <= 80:
+                pq = (parsed.get("query") or "").strip().lower()
+                pq2 = re.sub(r"[^\w\s]", "", pq).strip()
+                if pq and pq != hint and pq2 != hint2 and hint not in pq and pq not in hint:
+                    continue
+            key = (parsed["chat_id"], parsed["user_msg_id"])
+            if not parsed.get("not_found_msg_id"):
+                parsed["not_found_msg_id"] = _NOT_FOUND_MSG.get(key)
+            logger.info(
+                "dn history-scan matched chat=%s msg=%s q=%r hint=%r",
+                parsed["chat_id"],
+                parsed["user_msg_id"],
+                parsed.get("query"),
+                hint,
+            )
+            return parsed
+    except Exception as e:
+        logger.warning("dn history-scan failed: %s", e)
+
     return None
 
 
@@ -234,24 +285,29 @@ async def complete_request_in_group(
         if prefer_done_text:
             text = DONE_GROUP_TEXT
         elif query:
-            text = f"✅ <b>{query}</b> ab available hai.\nGroup me dubara search karo."
+            text = (
+                f"✅ <b>{query}</b> ab available hai.\n"
+                "Group me dubara search karo."
+            )
         else:
             text = DN_GROUP_TEXT
 
+    # delete "nahi mila"
     if nf_id:
         try:
             await client.delete_messages(chat_id, int(nf_id))
             logger.info("dn: deleted not-found msg %s in %s", nf_id, chat_id)
         except Exception as e:
-            logger.debug("dn: delete not-found failed: %s", e)
+            logger.warning("dn: delete not-found %s failed: %s", nf_id, e)
     else:
         key = (chat_id, user_msg_id)
         cached = _NOT_FOUND_MSG.pop(key, None)
         if cached:
             try:
                 await client.delete_messages(chat_id, int(cached))
-            except Exception:
-                pass
+                logger.info("dn: deleted cached not-found %s", cached)
+            except Exception as e:
+                logger.warning("dn: delete cached nf failed: %s", e)
 
     sent = None
     try:
@@ -260,10 +316,12 @@ async def complete_request_in_group(
             text,
             reply_to_message_id=user_msg_id,
         )
+        logger.info("dn: group reply ok chat=%s to msg=%s", chat_id, user_msg_id)
     except Exception as e:
         logger.warning("dn group reply_to failed %s/%s: %s", chat_id, user_msg_id, e)
         try:
             sent = await client.send_message(chat_id, text)
+            logger.info("dn: group plain send ok chat=%s", chat_id)
         except Exception as e2:
             logger.error("dn group send failed: %s", e2)
             return False
@@ -320,10 +378,9 @@ async def notify_admin_movie_request(
     if not_found_msg_id:
         _NOT_FOUND_MSG[(chat.id, message.id)] = int(not_found_msg_id)
 
-    # Single message only (no separate forward — so reply always has chat=/msg=)
+    # Single card — no separate forward needed for resolve
     detail = (
         "📥 <b>Movie Request (not found)</b>\n\n"
-        f"📝 <b>Request:</b> <code>{query}</code>\n"
         f"👤 <b>User:</b> {name} ({uname})\n"
         f"🆔 <code>{user.id}</code>\n"
         f"👥 <b>Group:</b> {chat_title}\n"
@@ -334,35 +391,50 @@ async def notify_admin_movie_request(
         detail += f" nfmsg={int(not_found_msg_id)}"
     detail += "\n"
     if msg_link:
-        detail += f"🔗 <a href=\"{msg_link}\">Open message</a>\n"
+        detail += f'🔗 <a href="{msg_link}">Open message</a>\n'
     detail += (
-        "\n➕ Movie add karo, phir <b>ISI MESSAGE pe reply</b> karke\n"
-        "<code>/dn</code> ya <code>/done</code> bhejo.\n"
-        "(Forward pe mat — is card pe reply karo.)"
+        "\n➕ Movie add karo, phir <b>is message pe reply</b> karke "
+        "<code>/dn</code> ya <code>/done</code> bhejo — "
+        "bot group me user ke message pe reply karega + nahi-mila delete."
     )
 
     _purge_old()
     for admin_id in targets:
         try:
+            # optional forward of original user message
+            try:
+                await client.forward_messages(
+                    chat_id=admin_id,
+                    from_chat_id=chat.id,
+                    message_ids=message.id,
+                )
+            except Exception as fe:
+                logger.debug("dn forward %s: %s", admin_id, fe)
+
             sent = await client.send_message(
                 admin_id, detail, disable_web_page_preview=True
             )
             if sent:
-                meta = {
+                _PENDING[sent.id] = {
                     "ts": time.time(),
                     "chat_id": chat.id,
                     "user_msg_id": message.id,
                     "user_id": user.id,
                     "query": query,
                     "admin_id": admin_id,
-                    "not_found_msg_id": int(not_found_msg_id) if not_found_msg_id else None,
+                    "not_found_msg_id": int(not_found_msg_id)
+                    if not_found_msg_id
+                    else None,
                 }
-                _PENDING[sent.id] = meta
                 ql = query.lower()
                 _QUERY_INDEX.setdefault(ql, []).append(sent.id)
                 logger.info(
                     "dn notify admin=%s q=%r chat=%s msg=%s nf=%s",
-                    admin_id, query, chat.id, message.id, not_found_msg_id,
+                    admin_id,
+                    query,
+                    chat.id,
+                    message.id,
+                    not_found_msg_id,
                 )
         except Exception as e:
             logger.warning("dn notify admin %s: %s", admin_id, e)
@@ -387,16 +459,24 @@ def register_dn_command(bot: Client):
             reply = message.reply_to_message
             if not reply:
                 await message.reply_text(
-                    "Usage: <b>Movie Request</b> card pe reply karke "
-                    "<code>/dn</code> ya <code>/done</code> bhejo.",
+                    "Usage: <b>📥 Movie Request (not found)</b> card pe "
+                    "reply karke <code>/dn</code> ya <code>/done</code> bhejo.",
                     quote=True,
                 )
                 return
 
-            meta = resolve_request_meta(reply, admin_id=uid)
+            priv_id = (
+                message.chat.id
+                if message.chat and message.chat.type == ChatType.PRIVATE
+                else None
+            )
+            meta = await resolve_request_meta_async(
+                client, reply, admin_id=uid, private_chat_id=priv_id
+            )
 
             if not meta and message.chat and message.chat.type in (
-                ChatType.GROUP, ChatType.SUPERGROUP
+                ChatType.GROUP,
+                ChatType.SUPERGROUP,
             ):
                 meta = {
                     "chat_id": message.chat.id,
@@ -411,9 +491,10 @@ def register_dn_command(bot: Client):
                 await message.reply_text(
                     "Is message se request nahi samajh aayi.\n\n"
                     "Bot wale <b>📥 Movie Request (not found)</b> card pe "
-                    "(jo <code>chat=… msg=…</code> dikhata hai) "
+                    "(jisme <code>chat=… msg=… nfmsg=…</code> likha ho) "
                     "<b>reply</b> karke <code>/dn</code> bhejo.\n"
-                    "Sirf forward (movie name) pe mat try karo — ya naya request karo.",
+                    "Forward (sirf movie name) pe bhi try kar sakte ho — "
+                    "bot recent request dhoondhega.",
                     quote=True,
                 )
                 return
@@ -430,13 +511,18 @@ def register_dn_command(bot: Client):
                         message.chat.id,
                         "✅ Group me user ko reply + nahi-mila delete."
                         if ok
-                        else "⚠️ Group reply fail — bot group me admin hai?",
+                        else "⚠️ Group reply fail — bot group me admin + message permission check karo.",
                     )
                 except Exception:
                     pass
             logger.info(
                 "dn ok=%s chat=%s msg=%s by=%s",
-                ok, meta.get("chat_id"), meta.get("user_msg_id"), uid,
+                ok,
+                meta.get("chat_id"),
+                meta.get("user_msg_id"),
+                uid,
             )
         except Exception as e:
             logger.exception("dn_handler: %s", e)
+
+    logger.info("/dn registered")

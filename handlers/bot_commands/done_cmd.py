@@ -152,7 +152,7 @@ def register_done_command(bot: Client):
                 logger.info("done: no reply_to_message — ignore")
                 return
 
-            # Private chat: if reply is Movie Request card / forward → group notify
+            # Private chat: Movie Request card / forward / nearby card → group
             is_private = (
                 message.chat
                 and message.chat.type == ChatType.PRIVATE
@@ -160,11 +160,14 @@ def register_done_command(bot: Client):
             if is_private:
                 try:
                     from handlers.bot_commands.dn_cmd import (
-                        resolve_request_meta,
+                        resolve_request_meta_async,
                         complete_request_in_group,
                     )
-                    meta = resolve_request_meta(
-                        target, admin_id=message.from_user.id
+                    meta = await resolve_request_meta_async(
+                        client,
+                        target,
+                        admin_id=message.from_user.id,
+                        private_chat_id=message.chat.id,
                     )
                     if meta:
                         try:
@@ -179,13 +182,39 @@ def register_done_command(bot: Client):
                                 message.chat.id,
                                 "✅ Group me user ko reply + nahi-mila delete."
                                 if ok
-                                else "⚠️ Group reply fail — bot group admin hai?",
+                                else "⚠️ Group reply fail — bot group me admin + send permission check karo.",
                             )
                         except Exception:
                             pass
                         logger.info(
-                            "done(private→group) ok=%s chat=%s msg=%s",
-                            ok, meta.get("chat_id"), meta.get("user_msg_id"),
+                            "done(private→group) ok=%s chat=%s msg=%s nf=%s",
+                            ok,
+                            meta.get("chat_id"),
+                            meta.get("user_msg_id"),
+                            meta.get("not_found_msg_id"),
+                        )
+                        return
+                    # Looks like a request-related reply but unresolved → don't local-success
+                    body = (target.text or target.caption or "")
+                    looks_req = (
+                        "Movie Request" in body
+                        or "chat=" in body
+                        or "nfmsg=" in body
+                        or bool(getattr(target, "forward_date", None))
+                        or bool(getattr(target, "forward_origin", None))
+                        or bool(getattr(target, "forward_from_chat", None))
+                    )
+                    if looks_req:
+                        try:
+                            await message.delete()
+                        except Exception:
+                            pass
+                        await client.send_message(
+                            message.chat.id,
+                            "Is message se group request nahi mila.\n\n"
+                            "<b>📥 Movie Request (not found)</b> card pe "
+                            "(jisme <code>chat=… msg=…</code> ho) reply karke "
+                            "<code>/done</code> ya <code>/dn</code> bhejo.",
                         )
                         return
                 except Exception as e:
