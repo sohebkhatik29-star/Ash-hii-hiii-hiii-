@@ -152,10 +152,64 @@ def register_done_command(bot: Client):
                 logger.info("done: no reply_to_message — ignore")
                 return
 
+            # Private chat: if reply is Movie Request card / forward → group notify
+            is_private = (
+                message.chat
+                and message.chat.type == ChatType.PRIVATE
+            )
+            if is_private:
+                try:
+                    from handlers.bot_commands.dn_cmd import (
+                        resolve_request_meta,
+                        complete_request_in_group,
+                    )
+                    meta = resolve_request_meta(target)
+                    if meta:
+                        try:
+                            await message.delete()
+                        except Exception as e:
+                            logger.warning("done: delete cmd failed: %s", e)
+                        ok = await complete_request_in_group(
+                            client, meta, prefer_done_text=True
+                        )
+                        try:
+                            await client.send_message(
+                                message.chat.id,
+                                "✅ Group me user ko reply + nahi-mila delete."
+                                if ok
+                                else "⚠️ Group reply fail — bot group admin hai?",
+                            )
+                        except Exception:
+                            pass
+                        logger.info(
+                            "done(private→group) ok=%s chat=%s msg=%s",
+                            ok, meta.get("chat_id"), meta.get("user_msg_id"),
+                        )
+                        return
+                except Exception as e:
+                    logger.warning("done private-request path: %s", e)
+
             try:
                 await message.delete()
             except Exception as e:
                 logger.warning("done: delete cmd failed: %s", e)
+
+            # Group: also drop "nahi mila" under same user message if known
+            if message.chat and message.chat.type in (
+                ChatType.GROUP, ChatType.SUPERGROUP
+            ):
+                try:
+                    from handlers.bot_commands.dn_cmd import _NOT_FOUND_MSG
+                    nf = _NOT_FOUND_MSG.pop(
+                        (int(message.chat.id), int(target.id)), None
+                    )
+                    if nf:
+                        try:
+                            await client.delete_messages(message.chat.id, int(nf))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
             bot_msg = None
             try:
@@ -184,7 +238,6 @@ def register_done_command(bot: Client):
                         "done: mapped user_msg=%s → bot_reply=%s",
                         user_mid, bot_mid,
                     )
-                    # Reliable cleanup: poll until user msg is gone
                     asyncio.create_task(
                         _watch_user_msg(client, chat_id, user_mid, bot_mid)
                     )

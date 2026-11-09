@@ -171,10 +171,12 @@ def register_group_filter_handlers(bot: Client):
             m = await message.reply_text(f"❌ <b>{query}</b> nahi mila.", quote=True)
             # bot reply + user message → 2 min
             schedule_not_found_delete(client, message.chat.id, [m.id, message.id])
-            # Admin ko request forward + details (for /dn later)
+            # Admin ko request forward + details (for /dn or /done later)
             try:
                 from handlers.bot_commands.dn_cmd import notify_admin_movie_request
-                await notify_admin_movie_request(client, message, query)
+                await notify_admin_movie_request(
+                    client, message, query, not_found_msg_id=getattr(m, "id", None)
+                )
             except Exception as e:
                 logger = __import__("logging").getLogger("GroupFilter")
                 logger.debug("notify_admin_movie_request: %s", e)
