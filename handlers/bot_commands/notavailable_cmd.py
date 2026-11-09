@@ -1,16 +1,13 @@
 # ==============================================================================
 # handlers/bot_commands/notavailable_cmd.py
-# Command: /not_available  (aliases: /notavailable, /navailable)
-# Admin replies to a user message →
-#   1) deletes the admin's command message
-#   2) replies on the original user message in clear English
-#   3) if that user message is later deleted, bot reply is also deleted
-# Without reply-to: does nothing.
+# /not_available (aliases: /notavailable, /navailable)
+# - Group: reply to user msg → bot replies not-available text, deletes cmd
+# - Private on Movie Request card / forward → same text in GROUP + delete nahi-mila
 # ==============================================================================
 
 import asyncio
 import logging
-from pyrogram import Client, filters
+from pyrogram import Client, filters, StopPropagation
 from pyrogram.enums import ChatType, ChatMemberStatus
 from pyrogram.types import Message
 
@@ -25,9 +22,7 @@ NOT_AVAILABLE_TEXT = (
     "If it gets released or uploaded, it will be added here."
 )
 
-# (chat_id, user_message_id) -> [bot_reply_message_ids]
 _NA_REPLY_MAP: dict = {}
-
 _WATCH_INTERVAL = 3
 _WATCH_MAX_CHECKS = 200
 
@@ -36,19 +31,18 @@ async def _is_authorized(client: Client, message: Message) -> bool:
     if not message.from_user:
         return False
     user_id = message.from_user.id
-
     try:
         from handlers.admins_db import sync_admins_to_config
         await sync_admins_to_config()
     except Exception:
         pass
-
     try:
         if user_id in (Config.ADMINS or set()):
             return True
     except Exception:
         pass
-
+    if getattr(Config, "BOT_OWNER", None) and user_id == Config.BOT_OWNER:
+        return True
     try:
         if message.chat and message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
             member = await client.get_chat_member(message.chat.id, user_id)
@@ -60,7 +54,6 @@ async def _is_authorized(client: Client, message: Message) -> bool:
                 return True
     except Exception as e:
         logger.debug("notavailable admin check: %s", e)
-
     return False
 
 
@@ -69,88 +62,145 @@ async def _delete_bot_replies(client: Client, chat_id: int, bot_ids: list):
         return
     try:
         await client.delete_messages(chat_id, bot_ids)
-        logger.info("notavailable: deleted bot replies %s in chat %s", bot_ids, chat_id)
     except Exception:
         for mid in bot_ids:
             try:
                 await client.delete_messages(chat_id, mid)
-            except Exception as e2:
-                logger.warning("notavailable: delete bot reply %s failed: %s", mid, e2)
-
-
-def _user_msg_gone(msg) -> bool:
-    if msg is None:
-        return True
-    if isinstance(msg, list):
-        if not msg:
-            return True
-        msg = msg[0]
-    if getattr(msg, "empty", False):
-        return True
-    if not getattr(msg, "id", None):
-        return True
-    return False
-
-
-async def _watch_user_msg(
-    client: Client,
-    chat_id: int,
-    user_msg_id: int,
-    bot_msg_id: int,
-):
-    key = (int(chat_id), int(user_msg_id))
-    try:
-        for _ in range(_WATCH_MAX_CHECKS):
-            await asyncio.sleep(_WATCH_INTERVAL)
-            try:
-                msg = await client.get_messages(chat_id, user_msg_id)
             except Exception:
-                msg = None
+                pass
 
-            if _user_msg_gone(msg):
-                bot_ids = _NA_REPLY_MAP.pop(key, None)
-                if not bot_ids:
-                    bot_ids = [int(bot_msg_id)]
-                await _delete_bot_replies(client, chat_id, list(bot_ids))
+
+async def _watch_user_msg(client: Client, chat_id: int, user_mid: int, bot_mid: int):
+    key = (chat_id, user_mid)
+    for _ in range(_WATCH_MAX_CHECKS):
+        await asyncio.sleep(_WATCH_INTERVAL)
+        try:
+            msg = await client.get_messages(chat_id, user_mid)
+            if msg is None or getattr(msg, "empty", False):
+                ids = _NA_REPLY_MAP.pop(key, [bot_mid])
+                await _delete_bot_replies(client, chat_id, list(ids))
                 return
-        logger.debug("notavailable: watch timeout chat=%s user_msg=%s", chat_id, user_msg_id)
-    except Exception as e:
-        logger.debug("notavailable watch: %s", e)
+        except Exception:
+            ids = _NA_REPLY_MAP.pop(key, [bot_mid])
+            await _delete_bot_replies(client, chat_id, list(ids))
+            return
+
+
+async def _complete_not_available_in_group(client: Client, meta: dict) -> bool:
+    """Send NOT_AVAILABLE in group on user msg + delete nahi-mila."""
+    from handlers.bot_commands.dn_cmd import complete_request_in_group
+
+    return await complete_request_in_group(
+        client,
+        meta,
+        text=NOT_AVAILABLE_TEXT,
+        prefer_done_text=False,
+    )
 
 
 def register_notavailable_command(bot: Client):
-    """Register /not_available + auto-cleanup when original user message is deleted."""
-
     @bot.on_message(
         filters.command(["not_available", "notavailable", "navailable"])
         & (filters.group | filters.private),
-        group=-3,
+        group=-4,
     )
     async def notavailable_handler(client: Client, message: Message):
         try:
-            logger.info(
-                "notavailable cmd chat=%s user=%s reply=%s",
-                getattr(message.chat, "id", None),
-                getattr(message.from_user, "id", None),
-                bool(message.reply_to_message),
-            )
-
             if not message.from_user:
                 return
-
             if not await _is_authorized(client, message):
-                logger.info("notavailable: not authorized user=%s", message.from_user.id)
                 return
 
             target = message.reply_to_message
             if not target:
-                logger.info("notavailable: no reply_to_message — ignore")
                 return
 
+            is_private = (
+                message.chat and message.chat.type == ChatType.PRIVATE
+            )
+
+            # ---- Private: Movie Request card / forward → group ----
+            if is_private:
+                try:
+                    from handlers.bot_commands.dn_cmd import (
+                        resolve_request_meta_async,
+                    )
+                    meta = await resolve_request_meta_async(
+                        client,
+                        target,
+                        admin_id=message.from_user.id,
+                        private_chat_id=message.chat.id,
+                    )
+                    if meta:
+                        try:
+                            await message.delete()
+                        except Exception:
+                            pass
+                        ok = await _complete_not_available_in_group(client, meta)
+                        try:
+                            await client.send_message(
+                                message.chat.id,
+                                "✅ Group me user ko 'not available' reply + nahi-mila delete."
+                                if ok
+                                else "⚠️ Group reply fail — bot group me admin + send permission check karo.",
+                            )
+                        except Exception:
+                            pass
+                        logger.info(
+                            "not_available(private→group) ok=%s chat=%s msg=%s",
+                            ok,
+                            meta.get("chat_id"),
+                            meta.get("user_msg_id"),
+                        )
+                        raise StopPropagation
+                    body = target.text or target.caption or ""
+                    looks_req = (
+                        "Movie Request" in body
+                        or "chat=" in body
+                        or "nfmsg=" in body
+                        or bool(getattr(target, "forward_date", None))
+                        or bool(getattr(target, "forward_origin", None))
+                        or bool(getattr(target, "forward_from_chat", None))
+                    )
+                    if looks_req:
+                        try:
+                            await message.delete()
+                        except Exception:
+                            pass
+                        await client.send_message(
+                            message.chat.id,
+                            "Is message se group request nahi mila.\n\n"
+                            "<b>📥 Movie Request (not found)</b> card pe "
+                            "(jisme <code>chat=… msg=…</code> ho) reply karke "
+                            "<code>/not_available</code> bhejo.",
+                        )
+                        raise StopPropagation
+                except StopPropagation:
+                    raise
+                except Exception as e:
+                    logger.warning("not_available private path: %s", e)
+                # fall through only if not a request card (shouldn't reply local on random PM)
+                return
+
+            # ---- Group: classic reply on user message ----
             try:
                 await message.delete()
             except Exception as e:
                 logger.warning("notavailable: delete cmd failed: %s", e)
+
+            # also delete nahi-mila if known
+            try:
+                from handlers.bot_commands.dn_cmd import _NOT_FOUND_MSG
+                nf = _NOT_FOUND_MSG.pop(
+                    (int(message.chat.id), int(target.id)), None
+                )
+                if nf:
+                    try:
+                        await client.delete_messages(message.chat.id, int(nf))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             bot_msg = None
             try:
@@ -179,13 +229,15 @@ def register_notavailable_command(bot: Client):
                         _watch_user_msg(client, chat_id, user_mid, bot_mid)
                     )
                 except Exception as e:
-                    logger.debug("notavailable: map/watch setup failed: %s", e)
+                    logger.debug("notavailable map/watch: %s", e)
 
+        except StopPropagation:
+            raise
         except Exception as e:
             logger.exception("notavailable_handler: %s", e)
 
     @bot.on_deleted_messages()
-    async def notavailable_on_user_msg_deleted(client: Client, messages):
+    async def na_on_user_msg_deleted(client: Client, messages):
         try:
             if not messages:
                 return
@@ -201,9 +253,9 @@ def register_notavailable_command(bot: Client):
                     if not bot_ids:
                         continue
                     await _delete_bot_replies(client, int(chat_id), list(bot_ids))
-                except Exception as e:
-                    logger.debug("notavailable deleted_messages item: %s", e)
-        except Exception as e:
-            logger.debug("notavailable_on_user_msg_deleted: %s", e)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-    logger.info("/not_available registered (watch + deleted_messages cleanup)")
+    logger.info("/not_available registered (private→group + group + cleanup)")
