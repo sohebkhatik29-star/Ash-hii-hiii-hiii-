@@ -125,6 +125,13 @@ except Exception as e:
     logger.error(f"done_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
 try:
+    from handlers.bot_commands.dn_cmd import register_dn_command
+    register_dn_command(Bot)
+    logger.info("/dn + movie-request notify registered")
+except Exception as e:
+    logger.error(f"dn_cmd register failed (bot still runs): {type(e).__name__}: {e}")
+
+try:
     from handlers.bot_commands.chakspelling_cmd import register_chakspelling_command
     register_chakspelling_command(Bot)
 except Exception as e:
@@ -201,6 +208,7 @@ async def setup_bot_commands(bot: Client):
         BotCommand("ban", "User ban (reply / user_id)"),
         BotCommand("unban", "User unban (reply / user_id)"),
         BotCommand("done", "Not-found session close"),
+        BotCommand("dn", "Reply request notify → user in group"),
         BotCommand("chakspelling", "Check spelling (reply to user)"),
         BotCommand("deletefilter", "Reply to poster remove filter"),
         BotCommand("deletemovie", "Delete all filters by movie name"),
