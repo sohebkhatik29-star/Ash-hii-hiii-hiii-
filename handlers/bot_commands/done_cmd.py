@@ -163,7 +163,9 @@ def register_done_command(bot: Client):
                         resolve_request_meta,
                         complete_request_in_group,
                     )
-                    meta = resolve_request_meta(target)
+                    meta = resolve_request_meta(
+                        target, admin_id=message.from_user.id
+                    )
                     if meta:
                         try:
                             await message.delete()
