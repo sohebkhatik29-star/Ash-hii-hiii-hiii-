@@ -7,14 +7,35 @@
 import logging
 import re
 from pyrogram import Client, filters
-from pyrogram.types import Message, CallbackQuery
+from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from configs import Config
 from handlers.database import db
 from handlers.force_sub_handler import enforce_force_sub_in_group
 from handlers.search_query import clean_search_query, filter_strict_matches
 from handlers.auto_delete import schedule_result_delete, schedule_not_found_delete
+import time
+import secrets
 
 logger = logging.getLogger("GroupFilter")
+
+# Pagination: 10 results per page, Next/Prev buttons
+PAGE_SIZE = 10
+_SEARCH_CACHE: dict = {}  # cache_id -> {query, results, ts}
+_SEARCH_CACHE_TTL = 600  # 10 min
+
+
+def _purge_search_cache():
+    now = time.time()
+    for k, v in list(_SEARCH_CACHE.items()):
+        if now - v.get("ts", 0) > _SEARCH_CACHE_TTL:
+            _SEARCH_CACHE.pop(k, None)
+
+
+def _store_search(query: str, results: list) -> str:
+    _purge_search_cache()
+    cid = secrets.token_hex(4)
+    _SEARCH_CACHE[cid] = {"query": query, "results": results, "ts": time.time()}
+    return cid
 
 
 def _norm_title(t) -> str:
@@ -86,20 +107,49 @@ def _get_post_link(m: dict) -> str:
     return ""
 
 
-def build_link_results_text(query: str, results: list) -> str:
-    lines = [f"🔎 <b>Results for:</b> <code>{query}</code>", f"📄 Total: {len(results)}", ""]
-    for i, m in enumerate(results, start=1):
+def build_link_results_page(query: str, results: list, page: int = 0) -> tuple:
+    """Return (text, reply_markup) for one page of results. 10 per page."""
+    total = len(results or [])
+    if total <= 0:
+        return f"❌ <b>{query}</b> nahi mila.", None
+
+    page = max(0, int(page or 0))
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    if page >= total_pages:
+        page = total_pages - 1
+
+    start = page * PAGE_SIZE
+    chunk = results[start : start + PAGE_SIZE]
+
+    lines = [
+        f"🔎 <b>Results for:</b> <code>{query}</code>",
+        f"📄 Page {page + 1}/{total_pages} — Total: {total}",
+        "",
+    ]
+    for i, m in enumerate(chunk, start=start + 1):
         title = _display_title(m.get("title") or "Unknown")
         year = m.get("year")
         name = f"{title}" + (f" ({year})" if year else "")
         link = _get_post_link(m)
-        lines.append(f"{i}. <b>{name}</b>")
+        # one compact block per result
         if link:
-            lines.append(f"Link 🔗 {link}")
+            lines.append(f"{i}. <b>{name}</b>\nLink 🔗 {link}")
         else:
-            lines.append("Link 🔗 (post abhi available nahi)")
+            lines.append(f"{i}. <b>{name}</b>\nLink 🔗 (post abhi available nahi)")
         lines.append("")
-    return "\n".join(lines).strip()
+    text = "\n".join(lines).strip()
+    return text, page, total_pages
+
+
+def build_page_keyboard(cache_id: str, page: int, total_pages: int):
+    if total_pages <= 1:
+        return None
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"sp|{cache_id}|{page - 1}"))
+    if page < total_pages - 1:
+        row.append(InlineKeyboardButton("Next ▶️", callback_data=f"sp|{cache_id}|{page + 1}"))
+    return InlineKeyboardMarkup([row]) if row else None
 
 
 def register_group_filter_handlers(bot: Client):
@@ -187,11 +237,14 @@ def register_group_filter_handlers(bot: Client):
                 logger.debug("notify_admin_movie_request: %s", e)
             return
 
-        text = build_link_results_text(query, results[:20])
+        cache_id = _store_search(query, results)
+        text, page, total_pages = build_link_results_page(query, results, page=0)
+        kb = build_page_keyboard(cache_id, page, total_pages)
         sent = await message.reply_text(
             text,
             quote=True,
             disable_web_page_preview=True,
+            reply_markup=kb,
         )
         if sent:
             # bot result + user message → 2 min
@@ -199,6 +252,45 @@ def register_group_filter_handlers(bot: Client):
             try:
                 from handlers.bot_commands.dn_cmd import track_bot_reply
                 track_bot_reply(message.chat.id, message.id, sent.id, client=client)
+            except Exception:
+                pass
+
+    @bot.on_callback_query(filters.regex(r"^sp\|"))
+    async def search_page_callback(client: Client, query: CallbackQuery):
+        """Next / Prev page for search results."""
+        try:
+            data = (query.data or "").split("|")
+            # sp|{cache_id}|{page}
+            if len(data) < 3:
+                await query.answer("Expired", show_alert=False)
+                return
+            cache_id = data[1]
+            try:
+                page = int(data[2])
+            except Exception:
+                page = 0
+            entry = _SEARCH_CACHE.get(cache_id)
+            if not entry:
+                await query.answer("Results expire ho gaye — dubara search karo.", show_alert=True)
+                return
+            results = entry.get("results") or []
+            qtext = entry.get("query") or ""
+            text, page, total_pages = build_link_results_page(qtext, results, page=page)
+            kb = build_page_keyboard(cache_id, page, total_pages)
+            try:
+                await query.message.edit_text(
+                    text,
+                    disable_web_page_preview=True,
+                    reply_markup=kb,
+                )
+            except Exception as e:
+                # same content / message not modified
+                logger.debug("page edit: %s", e)
+            await query.answer(f"Page {page + 1}/{total_pages}")
+        except Exception as e:
+            logger.warning("search_page_callback: %s", e)
+            try:
+                await query.answer("Error", show_alert=False)
             except Exception:
                 pass
 
