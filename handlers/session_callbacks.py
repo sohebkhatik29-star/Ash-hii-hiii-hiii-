@@ -36,6 +36,71 @@ def register_callback_handlers(bot: Client):
                     pass
             return
 
+        # Search pagination Next/Prev (group_filter) — handle early
+        if data.startswith("sp|"):
+            try:
+                from handlers.group_filter import (
+                    _SEARCH_CACHE,
+                    build_link_results_page,
+                    build_page_keyboard,
+                    filter_strict_matches,
+                    dedupe_by_title_year,
+                )
+                import re as _re
+                import time as _time
+                parts = data.split("|")
+                if len(parts) < 3:
+                    await query.answer("Expired", show_alert=False)
+                    return
+                cache_id = parts[1]
+                try:
+                    page = int(parts[2])
+                except Exception:
+                    page = 0
+                entry = _SEARCH_CACHE.get(cache_id) or {}
+                results = entry.get("results") or []
+                qtext = entry.get("query") or ""
+                if not results or not qtext:
+                    body = (query.message.text or query.message.caption or "") if query.message else ""
+                    m = _re.search(r"Results for:\s*(?:<code>)?([^<\n]+)", body, _re.I)
+                    if m:
+                        qtext = m.group(1).strip().strip("`")
+                    if qtext:
+                        results = await db.search_movies(qtext)
+                        if not isinstance(results, list):
+                            results = list(results or [])
+                        try:
+                            results = filter_strict_matches(qtext, results)
+                            results = dedupe_by_title_year(results)
+                        except Exception:
+                            pass
+                        _SEARCH_CACHE[cache_id] = {
+                            "query": qtext,
+                            "results": results,
+                            "ts": _time.time(),
+                        }
+                if not results:
+                    await query.answer("Results expire — dubara search karo.", show_alert=True)
+                    return
+                text, page, total_pages = build_link_results_page(qtext, results, page=page)
+                kb = build_page_keyboard(cache_id, page, total_pages)
+                try:
+                    await query.message.edit_text(
+                        text,
+                        disable_web_page_preview=True,
+                        reply_markup=kb,
+                    )
+                except Exception:
+                    pass
+                await query.answer(f"Page {page + 1}/{total_pages}")
+            except Exception as e:
+                logger.error("sp page callback: %s", e)
+                try:
+                    await query.answer("Error", show_alert=False)
+                except Exception:
+                    pass
+            return
+
         # Force-sub buttons - handle BEFORE anything else
         if data.startswith("fs_mode:") or data.startswith("fs_refresh") or data == "fs_noop":
             try:

@@ -255,26 +255,65 @@ def register_group_filter_handlers(bot: Client):
             except Exception:
                 pass
 
-    @bot.on_callback_query(filters.regex(r"^sp\|"))
+    @bot.on_callback_query(filters.regex(r"^sp\|"), group=-3)
     async def search_page_callback(client: Client, query: CallbackQuery):
         """Next / Prev page for search results."""
         try:
             data = (query.data or "").split("|")
             # sp|{cache_id}|{page}
             if len(data) < 3:
-                await query.answer("Expired", show_alert=False)
+                try:
+                    await query.answer("Expired", show_alert=False)
+                except Exception:
+                    pass
                 return
             cache_id = data[1]
             try:
                 page = int(data[2])
             except Exception:
                 page = 0
+
             entry = _SEARCH_CACHE.get(cache_id)
-            if not entry:
-                await query.answer("Results expire ho gaye — dubara search karo.", show_alert=True)
+            results = (entry or {}).get("results") or []
+            qtext = (entry or {}).get("query") or ""
+
+            # Cache miss (Render restart) → recover query from message text + re-search
+            if not results or not qtext:
+                body = query.message.text or query.message.caption or ""
+                m = re.search(
+                    r"Results for:\s*(?:<code>)?([^<\n]+)",
+                    body,
+                    re.I,
+                )
+                if m:
+                    qtext = m.group(1).strip().strip("`")
+                if qtext:
+                    try:
+                        results = await db.search_movies(qtext)
+                        if not isinstance(results, list):
+                            results = list(results or [])
+                        results = filter_strict_matches(qtext, results)
+                        results = dedupe_by_title_year(results)
+                        # refresh cache under same id
+                        _SEARCH_CACHE[cache_id] = {
+                            "query": qtext,
+                            "results": results,
+                            "ts": time.time(),
+                        }
+                    except Exception as e:
+                        logger.warning("page re-search: %s", e)
+                        results = []
+
+            if not results:
+                try:
+                    await query.answer(
+                        "Results expire — dubara movie name search karo.",
+                        show_alert=True,
+                    )
+                except Exception:
+                    pass
                 return
-            results = entry.get("results") or []
-            qtext = entry.get("query") or ""
+
             text, page, total_pages = build_link_results_page(qtext, results, page=page)
             kb = build_page_keyboard(cache_id, page, total_pages)
             try:
@@ -284,9 +323,13 @@ def register_group_filter_handlers(bot: Client):
                     reply_markup=kb,
                 )
             except Exception as e:
-                # same content / message not modified
-                logger.debug("page edit: %s", e)
-            await query.answer(f"Page {page + 1}/{total_pages}")
+                err = str(e).lower()
+                if "not modified" not in err and "message is not modified" not in err:
+                    logger.warning("page edit: %s", e)
+            try:
+                await query.answer(f"Page {page + 1}/{total_pages}")
+            except Exception:
+                pass
         except Exception as e:
             logger.warning("search_page_callback: %s", e)
             try:
