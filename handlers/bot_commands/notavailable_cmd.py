@@ -224,7 +224,7 @@ def register_notavailable_command(bot: Client):
                     user_mid = int(target.id)
                     bot_mid = int(bot_msg.id)
                     from handlers.bot_commands.dn_cmd import track_bot_reply
-                    track_bot_reply(chat_id, user_mid, bot_mid)
+                    track_bot_reply(chat_id, user_mid, bot_mid, client=client)
                     # backup poll in case deleted_messages misses
                     asyncio.create_task(
                         _watch_user_msg(client, chat_id, user_mid, bot_mid)

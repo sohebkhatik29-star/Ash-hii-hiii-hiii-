@@ -173,7 +173,7 @@ def register_group_filter_handlers(bot: Client):
             schedule_not_found_delete(client, message.chat.id, [m.id, message.id])
             try:
                 from handlers.bot_commands.dn_cmd import track_bot_reply
-                track_bot_reply(message.chat.id, message.id, m.id)
+                track_bot_reply(message.chat.id, message.id, m.id, client=client)
             except Exception:
                 pass
             # Admin ko request forward + details (for /dn or /done later)
@@ -198,7 +198,7 @@ def register_group_filter_handlers(bot: Client):
             schedule_result_delete(client, message.chat.id, [sent.id, message.id])
             try:
                 from handlers.bot_commands.dn_cmd import track_bot_reply
-                track_bot_reply(message.chat.id, message.id, sent.id)
+                track_bot_reply(message.chat.id, message.id, sent.id, client=client)
             except Exception:
                 pass
 
