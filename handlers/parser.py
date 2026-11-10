@@ -122,6 +122,10 @@ def extract_episode_or_part(text: str) -> str:
 def extract_season(text: str) -> str:
     if not text:
         return ""
+    # S02E01 / S02 E01 form (no word-boundary after season digits)
+    m = re.search(r"(?i)\bS\s*0*(\d{1,2})\s*E\s*\d", text)
+    if m:
+        return f"S{int(m.group(1)):02d}"
     s_match = re.search(r"(?i)\b(?:s|season)\s*0*(\d{1,2})\b", text)
     if s_match:
         return f"S{int(s_match.group(1)):02d}"
