@@ -274,7 +274,7 @@ async def resolve_request_meta_async(
 
 
 
-_WATCH_INTERVAL = 3  # seconds between polls
+_WATCH_INTERVAL = 2  # seconds between polls
 _WATCH_MAX = 200     # ~10 min coverage
 _WATCHING: set = set()  # keys already being polled
 
@@ -308,18 +308,29 @@ async def _poll_user_msg(client: Client, chat_id: int, user_msg_id: int):
     key = (int(chat_id), int(user_msg_id))
     try:
         import asyncio
-        for _ in range(_WATCH_MAX):
+        for i in range(_WATCH_MAX):
             await asyncio.sleep(_WATCH_INTERVAL)
-            # already cleaned?
             if key not in _BOT_REPLIES and key not in _NOT_FOUND_MSG:
                 return
+            gone = False
             try:
                 msg = await client.get_messages(int(chat_id), int(user_msg_id))
-                if msg is None or getattr(msg, "empty", False):
-                    await cascade_delete_for_user_msg(client, chat_id, user_msg_id)
-                    return
-            except Exception:
-                # get_messages failed → treat as deleted
+                # Pyrogram: deleted → empty Message or None
+                if msg is None:
+                    gone = True
+                elif getattr(msg, "empty", False):
+                    gone = True
+                elif getattr(msg, "id", None) is None:
+                    gone = True
+            except Exception as e:
+                # MESSAGE_ID_INVALID / not found → gone
+                err = str(e).lower()
+                if "invalid" in err or "not found" in err or "empty" in err or "id" in err:
+                    gone = True
+                else:
+                    logger.debug("poll get_messages %s/%s: %s", chat_id, user_msg_id, e)
+            if gone:
+                logger.info("poll: user msg %s gone in %s → cascade bot replies", user_msg_id, chat_id)
                 await cascade_delete_for_user_msg(client, chat_id, user_msg_id)
                 return
     finally:
@@ -331,41 +342,59 @@ async def cascade_delete_for_user_msg(client: Client, chat_id: int, user_msg_id:
     key = (int(chat_id), int(user_msg_id))
     bot_ids = list(_BOT_REPLIES.pop(key, None) or [])
     nf = _NOT_FOUND_MSG.pop(key, None)
-    if nf and int(nf) not in bot_ids:
+    if nf and int(nf) not in [int(x) for x in bot_ids]:
         bot_ids.append(int(nf))
     if not bot_ids:
+        logger.debug("cascade user→bot: no bot replies for %s/%s", chat_id, user_msg_id)
         return
     for bid in bot_ids:
         _BOT_REPLY_TO_USER.pop(int(bid), None)
-        try:
-            await client.delete_messages(int(chat_id), int(bid))
-            logger.info("cascade: deleted bot reply %s in %s (user %s gone)", bid, chat_id, user_msg_id)
-        except Exception as e:
-            logger.debug("cascade delete bot %s: %s", bid, e)
+    # batch delete all bot replies at once
+    try:
+        await client.delete_messages(int(chat_id), [int(b) for b in bot_ids])
+        logger.info("cascade: deleted bot replies %s in %s (user %s gone)", bot_ids, chat_id, user_msg_id)
+    except Exception as e:
+        logger.warning("cascade batch delete failed %s: %s — trying one by one", bot_ids, e)
+        for bid in bot_ids:
+            try:
+                await client.delete_messages(int(chat_id), int(bid))
+                logger.info("cascade: deleted bot reply %s in %s (user %s gone)", bid, chat_id, user_msg_id)
+            except Exception as e2:
+                logger.warning("cascade delete bot %s failed: %s", bid, e2)
 
 
 async def cascade_delete_for_bot_reply(client: Client, chat_id: int, bot_msg_id: int):
     """Bot reply deleted → delete original user message + sibling bot replies."""
     info = _BOT_REPLY_TO_USER.pop(int(bot_msg_id), None)
     if not info:
+        logger.debug("cascade bot→user: no mapping for bot_msg %s", bot_msg_id)
         return
     c_id, user_msg_id = info
     chat_id = int(c_id)
-    key = (chat_id, int(user_msg_id))
+    user_msg_id = int(user_msg_id)
+    key = (chat_id, user_msg_id)
     siblings = list(_BOT_REPLIES.pop(key, []) or [])
+    to_del = []
     for bid in siblings:
         _BOT_REPLY_TO_USER.pop(int(bid), None)
-        if int(bid) == int(bot_msg_id):
-            continue
-        try:
-            await client.delete_messages(chat_id, int(bid))
-        except Exception:
-            pass
+        if int(bid) != int(bot_msg_id):
+            to_del.append(int(bid))
+    # delete sibling bot replies + user message together
+    to_del.append(user_msg_id)
     try:
-        await client.delete_messages(chat_id, int(user_msg_id))
-        logger.info("cascade: deleted user msg %s in %s (bot reply %s gone)", user_msg_id, chat_id, bot_msg_id)
+        await client.delete_messages(chat_id, to_del)
+        logger.info(
+            "cascade: deleted user %s + siblings %s in %s (bot reply %s gone)",
+            user_msg_id, [x for x in to_del if x != user_msg_id], chat_id, bot_msg_id,
+        )
     except Exception as e:
-        logger.debug("cascade delete user %s: %s", user_msg_id, e)
+        logger.warning("cascade bot→user batch failed: %s — one by one", e)
+        for mid in to_del:
+            try:
+                await client.delete_messages(chat_id, int(mid))
+                logger.info("cascade: deleted %s in %s (bot reply %s gone)", mid, chat_id, bot_msg_id)
+            except Exception as e2:
+                logger.warning("cascade delete %s failed: %s", mid, e2)
 
 
 
