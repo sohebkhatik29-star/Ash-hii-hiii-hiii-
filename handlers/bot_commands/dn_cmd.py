@@ -534,13 +534,31 @@ async def notify_admin_movie_request(
     _purge_old()
     for admin_id in targets:
         try:
-            # optional forward of original user message
+            meta_base = {
+                "ts": time.time(),
+                "chat_id": chat.id,
+                "user_msg_id": message.id,
+                "user_id": user.id,
+                "query": query,
+                "admin_id": admin_id,
+                "not_found_msg_id": int(not_found_msg_id)
+                if not_found_msg_id
+                else None,
+            }
+            # optional forward of original user message — track its PM id too
             try:
-                await client.forward_messages(
+                fwd = await client.forward_messages(
                     chat_id=admin_id,
                     from_chat_id=chat.id,
                     message_ids=message.id,
                 )
+                # Pyrogram may return Message or list
+                fwd_list = fwd if isinstance(fwd, (list, tuple)) else ([fwd] if fwd else [])
+                for fm in fwd_list:
+                    fid = getattr(fm, "id", None)
+                    if fid:
+                        _PENDING[int(fid)] = dict(meta_base)
+                        logger.debug("dn tracked forward pm_msg=%s admin=%s", fid, admin_id)
             except Exception as fe:
                 logger.debug("dn forward %s: %s", admin_id, fe)
 
@@ -548,26 +566,17 @@ async def notify_admin_movie_request(
                 admin_id, detail, disable_web_page_preview=True
             )
             if sent:
-                _PENDING[sent.id] = {
-                    "ts": time.time(),
-                    "chat_id": chat.id,
-                    "user_msg_id": message.id,
-                    "user_id": user.id,
-                    "query": query,
-                    "admin_id": admin_id,
-                    "not_found_msg_id": int(not_found_msg_id)
-                    if not_found_msg_id
-                    else None,
-                }
+                _PENDING[sent.id] = dict(meta_base)
                 ql = query.lower()
                 _QUERY_INDEX.setdefault(ql, []).append(sent.id)
                 logger.info(
-                    "dn notify admin=%s q=%r chat=%s msg=%s nf=%s",
+                    "dn notify admin=%s q=%r chat=%s msg=%s nf=%s pm_card=%s",
                     admin_id,
                     query,
                     chat.id,
                     message.id,
                     not_found_msg_id,
+                    sent.id,
                 )
         except Exception as e:
             logger.warning("dn notify admin %s: %s", admin_id, e)
@@ -671,27 +680,41 @@ def register_dn_command(bot: Client):
     
     @bot.on_deleted_messages(group=-1)
     async def dn_on_deleted(client: Client, messages):
-        """User msg deleted → bot replies; bot reply deleted → user msg."""
+        """Group cascade + Bot-PM card/forward delete → group cascade."""
         try:
             if not messages:
                 return
-            # messages can be list of Message or a single DeletedMessages-like object
             items = list(messages) if not isinstance(messages, (list, tuple)) else messages
+            # parent-level chat / message_ids (common for channel/private deletes)
+            parent_chat = getattr(messages, "chat", None)
+            parent_chat_id = getattr(parent_chat, "id", None) if parent_chat else None
+            parent_ids = getattr(messages, "message_ids", None)
+            if parent_ids and parent_chat_id is not None:
+                for mid in parent_ids:
+                    try:
+                        await _handle_deleted_id(client, int(parent_chat_id), int(mid))
+                    except Exception as e:
+                        logger.debug("dn_on_deleted parent id: %s", e)
             for m in items:
                 try:
                     chat = getattr(m, "chat", None)
                     chat_id = getattr(chat, "id", None) if chat else getattr(m, "chat_id", None)
+                    if chat_id is None:
+                        chat_id = parent_chat_id
                     msg_id = getattr(m, "id", None) or getattr(m, "message_id", None)
-                    # some updates only give message_ids on the parent
-                    if chat_id is None and hasattr(messages, "chat"):
-                        chat_id = getattr(messages.chat, "id", None)
                     if msg_id is None and hasattr(m, "message_ids"):
                         for mid in m.message_ids:
-                            await _handle_deleted_id(client, chat_id, int(mid))
+                            # even without chat_id, try PM pending lookup
+                            await _handle_deleted_id(client, chat_id if chat_id is not None else 0, int(mid))
                         continue
-                    if chat_id is None or msg_id is None:
+                    if msg_id is None:
                         continue
-                    await _handle_deleted_id(client, int(chat_id), int(msg_id))
+                    # allow chat_id=0 so PM pending path still runs via msg_id in _PENDING
+                    await _handle_deleted_id(
+                        client,
+                        int(chat_id) if chat_id is not None else 0,
+                        int(msg_id),
+                    )
                 except Exception as e:
                     logger.debug("dn_on_deleted item: %s", e)
         except Exception as e:
@@ -702,11 +725,49 @@ def register_dn_command(bot: Client):
             return
         chat_id = int(chat_id)
         msg_id = int(msg_id)
+
+        # ---- A) Group: user msg deleted → bot replies ----
         if (chat_id, msg_id) in _BOT_REPLIES or (chat_id, msg_id) in _NOT_FOUND_MSG:
             await cascade_delete_for_user_msg(client, chat_id, msg_id)
             return
+
+        # ---- B) Group: bot reply deleted → user msg ----
         if msg_id in _BOT_REPLY_TO_USER:
             await cascade_delete_for_bot_reply(client, chat_id, msg_id)
+            return
+
+        # ---- C) Bot PM: admin deleted Movie Request card / forward ----
+        #     → delete user message + all bot replies in the GROUP
+        meta = _PENDING.pop(msg_id, None)
+        if meta:
+            # clean query index
+            q = (meta.get("query") or "").strip().lower()
+            if q and q in _QUERY_INDEX:
+                _QUERY_INDEX[q] = [x for x in _QUERY_INDEX[q] if x != msg_id]
+                if not _QUERY_INDEX[q]:
+                    _QUERY_INDEX.pop(q, None)
+            # also drop any other PM keys pointing to same group request
+            g_chat = int(meta["chat_id"])
+            u_msg = int(meta["user_msg_id"])
+            for k, v in list(_PENDING.items()):
+                try:
+                    if int(v.get("chat_id", 0)) == g_chat and int(v.get("user_msg_id", 0)) == u_msg:
+                        _PENDING.pop(k, None)
+                except Exception:
+                    pass
+            logger.info(
+                "pm-delete cascade: admin deleted card/fwd %s → group %s user_msg %s",
+                msg_id, g_chat, u_msg,
+            )
+            # delete bot replies (nahi-mila / done / results)
+            await cascade_delete_for_user_msg(client, g_chat, u_msg)
+            # delete original user message in group
+            try:
+                await client.delete_messages(g_chat, u_msg)
+                logger.info("pm-delete: deleted user msg %s in group %s", u_msg, g_chat)
+            except Exception as e:
+                logger.warning("pm-delete user msg %s failed: %s", u_msg, e)
+            return
 
 
     logger.info("/dn registered")
