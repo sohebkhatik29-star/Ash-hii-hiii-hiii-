@@ -273,9 +273,12 @@ def extract_movie_metadata(filename: str, caption: str = "") -> Dict[str, Any]:
 
     # Series: keep season in title so S01 / S02 of same year stay separate movies
     # (e.g. Vikings S01 vs Vikings S02). Same-season qualities still merge under one post.
-    # If user intentionally puts multiple seasons in ONE upload session, session grouping still wins.
     if season and season.upper() not in title.upper():
         title = f"{title} {season}".strip()
+    # Episode: same name + year + season + different EP → separate movie + separate filter
+    # (e.g. Vikings S02 E01 vs Vikings S02 E02). Same-EP qualities still merge under one post.
+    if episode and episode.upper() not in title.upper():
+        title = f"{title} {episode}".strip()
 
     return {
         "title": title,

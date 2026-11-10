@@ -146,15 +146,9 @@ def _detect_quality(file_name: str, caption: str, meta_q: str = "") -> str:
 
 
 def _quality_key(q: str, meta: dict) -> str:
-    season = (meta.get("season") or "").strip()
-    episode = (meta.get("episode") or "").strip()
-    if episode:
-        parts = [q]
-        if season:
-            parts.append(season)
-        parts.append(episode)
-        return " ".join(parts)
-    return q or "HD"
+    # Episode/season already live in movie TITLE (separate filters).
+    # Quality key stays pure so same-EP 480/720/1080 merge under one post.
+    return (q or "HD").strip() or "HD"
 
 
 async def _notify(bot: Client, text: str):
@@ -297,6 +291,20 @@ async def _get_or_create_movie(title: str, year: Any, language: str = None) -> O
                         continue
                     if not (core == dcore or (len(core) >= 6 and (core in dcore or dcore in core))):
                         continue
+                    # season / episode must match when either side has them
+                    # (prevents Vikings S02 E01 merging into Vikings S02 or S01)
+                    import re as _re
+                    def _tok(s, pat):
+                        m = _re.search(pat, s or "")
+                        return m.group(0) if m else None
+                    sa, sb = _tok(core, r"\bs\d{1,2}\b"), _tok(dcore, r"\bs\d{1,2}\b")
+                    if sa or sb:
+                        if sa != sb:
+                            continue
+                    ea, eb = _tok(core, r"\be\d{1,3}(?:-\d{1,3})?\b"), _tok(dcore, r"\be\d{1,3}(?:-\d{1,3})?\b")
+                    if ea or eb:
+                        if ea != eb:
+                            continue
                     # language guard: non-Hindi must match explicitly
                     if lang_key:
                         raw = doc.get("languages") or doc.get("language") or []
