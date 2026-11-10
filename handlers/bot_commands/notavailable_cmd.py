@@ -71,18 +71,20 @@ async def _delete_bot_replies(client: Client, chat_id: int, bot_ids: list):
 
 
 async def _watch_user_msg(client: Client, chat_id: int, user_mid: int, bot_mid: int):
-    key = (chat_id, user_mid)
     for _ in range(_WATCH_MAX_CHECKS):
         await asyncio.sleep(_WATCH_INTERVAL)
         try:
             msg = await client.get_messages(chat_id, user_mid)
             if msg is None or getattr(msg, "empty", False):
-                ids = _NA_REPLY_MAP.pop(key, [bot_mid])
-                await _delete_bot_replies(client, chat_id, list(ids))
+                from handlers.bot_commands.dn_cmd import cascade_delete_for_user_msg
+                await cascade_delete_for_user_msg(client, chat_id, user_mid)
                 return
         except Exception:
-            ids = _NA_REPLY_MAP.pop(key, [bot_mid])
-            await _delete_bot_replies(client, chat_id, list(ids))
+            try:
+                from handlers.bot_commands.dn_cmd import cascade_delete_for_user_msg
+                await cascade_delete_for_user_msg(client, chat_id, user_mid)
+            except Exception:
+                pass
             return
 
 
@@ -221,10 +223,9 @@ def register_notavailable_command(bot: Client):
                     chat_id = int(message.chat.id)
                     user_mid = int(target.id)
                     bot_mid = int(bot_msg.id)
-                    key = (chat_id, user_mid)
-                    _NA_REPLY_MAP.setdefault(key, [])
-                    if bot_mid not in _NA_REPLY_MAP[key]:
-                        _NA_REPLY_MAP[key].append(bot_mid)
+                    from handlers.bot_commands.dn_cmd import track_bot_reply
+                    track_bot_reply(chat_id, user_mid, bot_mid)
+                    # backup poll in case deleted_messages misses
                     asyncio.create_task(
                         _watch_user_msg(client, chat_id, user_mid, bot_mid)
                     )
@@ -236,26 +237,5 @@ def register_notavailable_command(bot: Client):
         except Exception as e:
             logger.exception("notavailable_handler: %s", e)
 
-    @bot.on_deleted_messages()
-    async def na_on_user_msg_deleted(client: Client, messages):
-        try:
-            if not messages:
-                return
-            for m in messages:
-                try:
-                    chat = getattr(m, "chat", None)
-                    chat_id = getattr(chat, "id", None) if chat else None
-                    msg_id = getattr(m, "id", None)
-                    if chat_id is None or msg_id is None:
-                        continue
-                    key = (int(chat_id), int(msg_id))
-                    bot_ids = _NA_REPLY_MAP.pop(key, None)
-                    if not bot_ids:
-                        continue
-                    await _delete_bot_replies(client, int(chat_id), list(bot_ids))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
+    # deleted_messages cascade is handled centrally in dn_cmd.dn_on_deleted
     logger.info("/not_available registered (private→group + group + cleanup)")

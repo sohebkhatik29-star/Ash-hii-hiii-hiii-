@@ -171,6 +171,11 @@ def register_group_filter_handlers(bot: Client):
             m = await message.reply_text(f"❌ <b>{query}</b> nahi mila.", quote=True)
             # bot reply + user message → 2 min
             schedule_not_found_delete(client, message.chat.id, [m.id, message.id])
+            try:
+                from handlers.bot_commands.dn_cmd import track_bot_reply
+                track_bot_reply(message.chat.id, message.id, m.id)
+            except Exception:
+                pass
             # Admin ko request forward + details (for /dn or /done later)
             try:
                 from handlers.bot_commands.dn_cmd import notify_admin_movie_request
@@ -191,6 +196,11 @@ def register_group_filter_handlers(bot: Client):
         if sent:
             # bot result + user message → 2 min
             schedule_result_delete(client, message.chat.id, [sent.id, message.id])
+            try:
+                from handlers.bot_commands.dn_cmd import track_bot_reply
+                track_bot_reply(message.chat.id, message.id, sent.id)
+            except Exception:
+                pass
 
     @bot.on_callback_query(filters.regex(r"^close_card$"))
     async def close_card_callback(client: Client, query: CallbackQuery):

@@ -17,6 +17,10 @@ logger = logging.getLogger("DnCmd")
 _PENDING: dict = {}
 _PENDING_TTL = 48 * 3600
 _NOT_FOUND_MSG: dict = {}
+# (chat_id, user_msg_id) -> [bot_reply_msg_ids]  — user msg delete → bot replies delete
+_BOT_REPLIES: dict = {}
+# bot_msg_id -> (chat_id, user_msg_id) for reverse cleanup
+_BOT_REPLY_TO_USER: dict = {}
 _QUERY_INDEX: dict = {}
 
 DN_GROUP_TEXT = (
@@ -269,6 +273,65 @@ async def resolve_request_meta_async(
     return None
 
 
+
+def track_bot_reply(chat_id: int, user_msg_id: int, bot_msg_id: int):
+    """Link bot reply to user message so delete cascades both ways."""
+    try:
+        chat_id = int(chat_id)
+        user_msg_id = int(user_msg_id)
+        bot_msg_id = int(bot_msg_id)
+        key = (chat_id, user_msg_id)
+        lst = _BOT_REPLIES.setdefault(key, [])
+        if bot_msg_id not in lst:
+            lst.append(bot_msg_id)
+        _BOT_REPLY_TO_USER[bot_msg_id] = (chat_id, user_msg_id)
+    except Exception as e:
+        logger.debug("track_bot_reply: %s", e)
+
+
+async def cascade_delete_for_user_msg(client: Client, chat_id: int, user_msg_id: int):
+    """User message deleted → delete all tracked bot replies."""
+    key = (int(chat_id), int(user_msg_id))
+    bot_ids = _BOT_REPLIES.pop(key, None) or []
+    # also clear not-found if still around
+    nf = _NOT_FOUND_MSG.pop(key, None)
+    if nf and int(nf) not in bot_ids:
+        bot_ids.append(int(nf))
+    for bid in list(bot_ids):
+        _BOT_REPLY_TO_USER.pop(int(bid), None)
+        try:
+            await client.delete_messages(int(chat_id), int(bid))
+            logger.info("cascade: deleted bot reply %s in %s (user %s gone)", bid, chat_id, user_msg_id)
+        except Exception as e:
+            logger.debug("cascade delete bot %s: %s", bid, e)
+
+
+async def cascade_delete_for_bot_reply(client: Client, chat_id: int, bot_msg_id: int):
+    """Bot reply deleted → delete original user message + sibling bot replies."""
+    info = _BOT_REPLY_TO_USER.pop(int(bot_msg_id), None)
+    if not info:
+        return
+    c_id, user_msg_id = info
+    if int(c_id) != int(chat_id):
+        chat_id = c_id
+    key = (int(chat_id), int(user_msg_id))
+    siblings = _BOT_REPLIES.pop(key, []) or []
+    for bid in siblings:
+        _BOT_REPLY_TO_USER.pop(int(bid), None)
+        if int(bid) == int(bot_msg_id):
+            continue
+        try:
+            await client.delete_messages(int(chat_id), int(bid))
+        except Exception:
+            pass
+    try:
+        await client.delete_messages(int(chat_id), int(user_msg_id))
+        logger.info("cascade: deleted user msg %s in %s (bot reply %s gone)", user_msg_id, chat_id, bot_msg_id)
+    except Exception as e:
+        logger.debug("cascade delete user %s: %s", user_msg_id, e)
+
+
+
 async def complete_request_in_group(
     client: Client,
     meta: dict,
@@ -326,6 +389,9 @@ async def complete_request_in_group(
             logger.error("dn group send failed: %s", e2)
             return False
 
+    if sent and getattr(sent, "id", None):
+        track_bot_reply(chat_id, user_msg_id, sent.id)
+
     for k, v in list(_PENDING.items()):
         if v.get("chat_id") == chat_id and v.get("user_msg_id") == user_msg_id:
             _PENDING.pop(k, None)
@@ -377,6 +443,7 @@ async def notify_admin_movie_request(
 
     if not_found_msg_id:
         _NOT_FOUND_MSG[(chat.id, message.id)] = int(not_found_msg_id)
+        track_bot_reply(chat.id, message.id, int(not_found_msg_id))
 
     # Single card — no separate forward needed for resolve
     detail = (
@@ -534,5 +601,34 @@ def register_dn_command(bot: Client):
             raise
         except Exception as e:
             logger.exception("dn_handler: %s", e)
+
+    
+    @bot.on_deleted_messages()
+    async def dn_on_deleted(client: Client, messages):
+        """User msg deleted → bot replies; bot reply deleted → user msg."""
+        try:
+            if not messages:
+                return
+            for m in messages:
+                try:
+                    chat = getattr(m, "chat", None)
+                    chat_id = getattr(chat, "id", None) if chat else None
+                    msg_id = getattr(m, "id", None)
+                    if chat_id is None or msg_id is None:
+                        continue
+                    chat_id = int(chat_id)
+                    msg_id = int(msg_id)
+                    # Was this a tracked user message?
+                    if (chat_id, msg_id) in _BOT_REPLIES or (chat_id, msg_id) in _NOT_FOUND_MSG:
+                        await cascade_delete_for_user_msg(client, chat_id, msg_id)
+                        continue
+                    # Was this a tracked bot reply?
+                    if msg_id in _BOT_REPLY_TO_USER:
+                        await cascade_delete_for_bot_reply(client, chat_id, msg_id)
+                except Exception as e:
+                    logger.debug("dn_on_deleted item: %s", e)
+        except Exception as e:
+            logger.debug("dn_on_deleted: %s", e)
+
 
     logger.info("/dn registered")
