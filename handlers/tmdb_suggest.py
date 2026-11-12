@@ -76,6 +76,28 @@ def get_suggest_meta(cache_id: str) -> Dict[str, Any]:
     return entry.get("meta") or {}
 
 
+def _norm_title(s: str) -> str:
+    """Lowercase, strip year + punctuation for exact spelling compare."""
+    s = (s or "").lower()
+    s = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", s)
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def has_exact_tmdb_match(query: str, suggestions: List[Dict[str, Any]]) -> bool:
+    """True when user typed the real title (spelling already correct)."""
+    nq = _norm_title(query)
+    if not nq or len(nq) < 2:
+        return False
+    for it in suggestions or []:
+        nt = _norm_title(it.get("title") or "")
+        if nt and nt == nq:
+            return True
+    return False
+
+
+
 def _http_get_json(url: str, timeout: float = 8.0) -> dict:
     req = urllib.request.Request(
         url,

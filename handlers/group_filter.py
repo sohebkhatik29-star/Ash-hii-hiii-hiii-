@@ -234,7 +234,18 @@ def register_group_filter_handlers(bot: Client):
                 logger.warning("tmdb suggest: %s", e)
                 suggestions = []
 
+            # Spelling already correct (exact TMDB title) → no suggestion buttons
+            exact_ok = False
             if suggestions:
+                try:
+                    from handlers.tmdb_suggest import has_exact_tmdb_match
+                    exact_ok = has_exact_tmdb_match(query, suggestions) or has_exact_tmdb_match(
+                        search_q, suggestions
+                    )
+                except Exception:
+                    exact_ok = False
+
+            if suggestions and not exact_ok:
                 cid = store_suggestions(
                     suggestions,
                     meta={
@@ -261,7 +272,12 @@ def register_group_filter_handlers(bot: Client):
                         pass
                 return
 
-            m = await message.reply_text(f"❌ <b>{query}</b> nahi mila.", quote=True)
+            m = await message.reply_text(
+                f"❌ <b>{query}</b> abhi mere paas available nahi hai.\n\n"
+                f"Request admin ke paas bhej di gayi hai — admin ke daalne ka wait karo, "
+                f"ya khud admin se request kar sakte ho.",
+                quote=True,
+            )
             # bot reply + user message → auto delete
             schedule_not_found_delete(client, message.chat.id, [m.id, message.id])
             try:
