@@ -227,12 +227,23 @@ def register_group_filter_handlers(bot: Client):
                     build_suggest_keyboard,
                 )
                 suggestions = await tmdb_search(search_q, limit=5)
+                # cleaned query fail → original typed name se bhi try
+                if not suggestions and query and query.strip() != search_q:
+                    suggestions = await tmdb_search(query.strip(), limit=5)
             except Exception as e:
                 logger.warning("tmdb suggest: %s", e)
                 suggestions = []
 
             if suggestions:
-                cid = store_suggestions(suggestions)
+                cid = store_suggestions(
+                    suggestions,
+                    meta={
+                        "user_id": user.id,
+                        "chat_id": message.chat.id,
+                        "user_msg_id": message.id,
+                        "query": query,
+                    },
+                )
                 text = build_suggest_text(query)
                 kb = build_suggest_keyboard(cid, suggestions)
                 m = await message.reply_text(

@@ -303,6 +303,22 @@ async def tmdb_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
 
     items = list(merged.values())
     items.sort(key=lambda it: _score_against_query(it, q, year_in_q), reverse=True)
+
+    # Keep only titles that relate to what user typed (avoid random TMDB noise)
+    filtered = []
+    for it in items:
+        ymatch, contain, overlap, pop = _score_against_query(it, q, year_in_q)
+        title_l = (it.get("title") or "").lower()
+        q_plain = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", q.lower())
+        q_plain = re.sub(r"\s+", " ", q_plain).strip()
+        q_c = _collapse_repeats(q_plain)
+        q_toks = [w for w in q_c.split() if len(w) >= 3]
+        title_c = _collapse_repeats(title_l)
+        tok_hit = any(w in title_c for w in q_toks)
+        if ymatch or contain or overlap or tok_hit:
+            filtered.append(it)
+    if filtered:
+        items = filtered
     return items[:limit]
 
 
