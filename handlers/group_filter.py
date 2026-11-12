@@ -236,14 +236,45 @@ def register_group_filter_handlers(bot: Client):
 
             # Spelling already correct (exact TMDB title) → no suggestion buttons
             exact_ok = False
+            exact_item = None
             if suggestions:
                 try:
-                    from handlers.tmdb_suggest import has_exact_tmdb_match
-                    exact_ok = has_exact_tmdb_match(query, suggestions) or has_exact_tmdb_match(
+                    from handlers.tmdb_suggest import (
+                        has_exact_tmdb_match,
+                        get_exact_match_item,
+                        is_unreleased,
+                        build_unreleased_text,
+                        build_unreleased_keyboard,
+                    )
+                    exact_item = get_exact_match_item(query, suggestions) or get_exact_match_item(
                         search_q, suggestions
                     )
-                except Exception:
+                    exact_ok = exact_item is not None or has_exact_tmdb_match(
+                        query, suggestions
+                    ) or has_exact_tmdb_match(search_q, suggestions)
+                except Exception as e:
+                    logger.warning("exact/unreleased check: %s", e)
                     exact_ok = False
+                    exact_item = None
+
+            # Exact title + future release date → not released yet
+            if exact_item and is_unreleased(exact_item):
+                text = build_unreleased_text(query, exact_item)
+                kb = build_unreleased_keyboard(exact_item)
+                m = await message.reply_text(
+                    text,
+                    quote=True,
+                    reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
+                if m:
+                    schedule_not_found_delete(client, message.chat.id, [m.id, message.id])
+                    try:
+                        from handlers.bot_commands.dn_cmd import track_bot_reply
+                        track_bot_reply(message.chat.id, message.id, m.id, client=client)
+                    except Exception:
+                        pass
+                return
 
             if suggestions and not exact_ok:
                 cid = store_suggestions(

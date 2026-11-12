@@ -97,6 +97,76 @@ def has_exact_tmdb_match(query: str, suggestions: List[Dict[str, Any]]) -> bool:
     return False
 
 
+def get_exact_match_item(query: str, suggestions: List[Dict[str, Any]]):
+    """Return first suggestion whose title exactly matches query (ignore year)."""
+    nq = _norm_title(query)
+    if not nq or len(nq) < 2:
+        return None
+    for it in suggestions or []:
+        nt = _norm_title(it.get("title") or "")
+        if nt and nt == nq:
+            return it
+    return None
+
+
+def is_unreleased(item: Dict[str, Any]) -> bool:
+    """True if TMDB release_date is strictly after today."""
+    from datetime import date
+    rd = (item or {}).get("release_date") or ""
+    if len(rd) < 10:
+        return False
+    try:
+        y, m, d = int(rd[0:4]), int(rd[5:7]), int(rd[8:10])
+        rel = date(y, m, d)
+    except Exception:
+        return False
+    return rel > date.today()
+
+
+def format_release_date(rd: str) -> str:
+    """2026-12-18 -> 18 December 2026"""
+    months = [
+        "", "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    ]
+    if not rd or len(rd) < 10:
+        return rd or ""
+    try:
+        y, m, d = int(rd[0:4]), int(rd[5:7]), int(rd[8:10])
+        if 1 <= m <= 12:
+            return f"{d} {months[m]} {y}"
+    except Exception:
+        pass
+    return rd
+
+
+def build_unreleased_text(query: str, item: Dict[str, Any]) -> str:
+    rd = item.get("release_date") or ""
+    nice = format_release_date(rd)
+    title = item.get("title") or query
+    year = item.get("year") or ""
+    label = f"{title}" + (f" ({year})" if year else "")
+    return (
+        f"⏳ <b>{label}</b>\n\n"
+        f"Sorry, ye movie <b>abhi release nahi hui</b>.\n"
+        f"Expected release: <b>{nice or 'TBA'}</b>\n\n"
+        f"Release hone ke baad hi yahan milegi."
+    )
+
+
+def build_unreleased_keyboard(item: Dict[str, Any]):
+    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    import urllib.parse
+    title = item.get("title") or "movie"
+    year = item.get("year") or ""
+    q = f"{title} {year} release date".strip()
+    url = "https://www.google.com/search?q=" + urllib.parse.quote(q)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Check release date", url=url)],
+    ])
+
+
+
 
 def _http_get_json(url: str, timeout: float = 8.0) -> dict:
     req = urllib.request.Request(
@@ -294,6 +364,7 @@ async def _tmdb_raw(query: str, limit: int = 10) -> List[Dict[str, Any]]:
         out.append({
             "title": title,
             "year": year,
+            "release_date": date,  # YYYY-MM-DD or empty
             "tmdb_id": r.get("id"),
             "media_type": media,
             "label": label,
