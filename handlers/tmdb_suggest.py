@@ -36,6 +36,12 @@ _COMMON_FIX = {
     "jaaat": "jaat",
     "jaata": "jaat",
     "jaatt": "jaat",
+    "jailear": "jailer",
+    "jailaer": "jailer",
+    "jailaaer": "jailer",
+    "jaailaer": "jailer",
+    "jailerr": "jailer",
+    "jiler": "jailer",
     "rrr": "rrr",
 }
 
@@ -101,6 +107,16 @@ def _adj_swaps(word: str) -> List[str]:
         c = chars[:]
         c[i], c[i + 1] = c[i + 1], c[i]
         out.append("".join(c))
+    return out
+
+
+def _single_deletes(word: str) -> List[str]:
+    """One-char deletions: Jailear -> Jailer."""
+    if len(word) < 4:
+        return []
+    out = []
+    for i in range(len(word)):
+        out.append(word[:i] + word[i + 1 :])
     return out
 
 
@@ -174,6 +190,31 @@ def _query_variants(query: str) -> List[str]:
                         rebuilt.append(_collapse_repeats(w))
                 add(" ".join(rebuilt))
 
+        # single-char deletions on longest word (Jailear -> Jailer)
+        if len(longest) >= 4:
+            for dl in _single_deletes(longest.lower())[:8]:
+                if len(dl) < 3:
+                    continue
+                rebuilt = []
+                for w in words:
+                    if w == longest:
+                        rebuilt.append(dl)
+                    else:
+                        rebuilt.append(_collapse_repeats(w))
+                add(" ".join(rebuilt))
+            # deletions on collapsed longest
+            long_c = _collapse_repeats(longest.lower())
+            if long_c != longest.lower():
+                for dl in _single_deletes(long_c)[:6]:
+                    if len(dl) >= 3:
+                        add(dl)
+
+        # prefix of longest word (Jail from Jailear) — TMDB handles partial
+        lw = _collapse_repeats(longest.lower())
+        if len(lw) >= 5:
+            add(lw[:5])
+            add(lw[:4])
+
     # also try first significant word alone (franchise / single-title)
     sig = [w for w in _collapse_repeats(base).split() if len(w) >= 3]
     if len(sig) >= 1:
@@ -182,7 +223,7 @@ def _query_variants(query: str) -> List[str]:
             add(" ".join(sig[:2]))
 
     # attach year variants for ranking later (search without year is broader)
-    return ordered[:8]
+    return ordered[:12]
 
 
 async def _tmdb_raw(query: str, limit: int = 10) -> List[Dict[str, Any]]:
@@ -314,7 +355,10 @@ async def tmdb_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
         q_c = _collapse_repeats(q_plain)
         q_toks = [w for w in q_c.split() if len(w) >= 3]
         title_c = _collapse_repeats(title_l)
-        tok_hit = any(w in title_c for w in q_toks)
+        hits = sum(1 for w in q_toks if w in title_c)
+        # multi-word query: need roughly half the significant tokens in title
+        need = max(1, (len(q_toks) + 1) // 2) if q_toks else 1
+        tok_hit = hits >= need
         if ymatch or contain or overlap or tok_hit:
             filtered.append(it)
     if filtered:
