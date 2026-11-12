@@ -218,8 +218,40 @@ def register_group_filter_handlers(bot: Client):
         results = dedupe_by_title_year(results)
 
         if not results:
+            # TMDB spelling / year suggestions
+            try:
+                from handlers.tmdb_suggest import (
+                    tmdb_search,
+                    store_suggestions,
+                    build_suggest_text,
+                    build_suggest_keyboard,
+                )
+                suggestions = await tmdb_search(search_q, limit=5)
+            except Exception as e:
+                logger.warning("tmdb suggest: %s", e)
+                suggestions = []
+
+            if suggestions:
+                cid = store_suggestions(suggestions)
+                text = build_suggest_text(query)
+                kb = build_suggest_keyboard(cid, suggestions)
+                m = await message.reply_text(
+                    text,
+                    quote=True,
+                    reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
+                if m:
+                    schedule_not_found_delete(client, message.chat.id, [m.id, message.id])
+                    try:
+                        from handlers.bot_commands.dn_cmd import track_bot_reply
+                        track_bot_reply(message.chat.id, message.id, m.id, client=client)
+                    except Exception:
+                        pass
+                return
+
             m = await message.reply_text(f"❌ <b>{query}</b> nahi mila.", quote=True)
-            # bot reply + user message → 2 min
+            # bot reply + user message → auto delete
             schedule_not_found_delete(client, message.chat.id, [m.id, message.id])
             try:
                 from handlers.bot_commands.dn_cmd import track_bot_reply
@@ -332,6 +364,127 @@ def register_group_filter_handlers(bot: Client):
                 pass
         except Exception as e:
             logger.warning("search_page_callback: %s", e)
+            try:
+                await query.answer("Error", show_alert=False)
+            except Exception:
+                pass
+
+    @bot.on_callback_query(filters.regex(r"^ts_close$"), group=-3)
+    async def tmdb_suggest_close(client: Client, query: CallbackQuery):
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+    @bot.on_callback_query(filters.regex(r"^ts\|"), group=-3)
+    async def tmdb_suggest_callback(client: Client, query: CallbackQuery):
+        """User picked a TMDB suggestion → search DB; else not-available + admin notify."""
+        try:
+            parts = (query.data or "").split("|")
+            # ts|{cache_id}|{index}
+            if len(parts) < 3:
+                await query.answer("Expired", show_alert=False)
+                return
+            cache_id = parts[1]
+            try:
+                idx = int(parts[2])
+            except Exception:
+                idx = 0
+            from handlers.tmdb_suggest import get_suggestion
+            item = get_suggestion(cache_id, idx)
+            if not item:
+                await query.answer(
+                    "Options expire ho gaye — dubara search karo.",
+                    show_alert=True,
+                )
+                return
+
+            title = (item.get("title") or "").strip()
+            year = (item.get("year") or "").strip()
+            search_q = f"{title} {year}".strip() if year else title
+            label = item.get("label") or search_q
+
+            await query.answer(f"Searching: {label[:40]}...")
+
+            results = await db.search_movies(search_q)
+            if not isinstance(results, list):
+                results = list(results or [])
+            results = filter_strict_matches(search_q, results)
+            # year-flexible: if empty, try title only
+            if not results and year:
+                results = await db.search_movies(title)
+                if not isinstance(results, list):
+                    results = list(results or [])
+                results = filter_strict_matches(title, results)
+            results = dedupe_by_title_year(results)
+
+            if results:
+                from handlers.tmdb_suggest import store_suggestions  # noqa: F401
+                # reuse pagination path
+                cache_id2 = _store_search(label, results)
+                text, page, total_pages = build_link_results_page(label, results, page=0)
+                kb = build_page_keyboard(cache_id2, page, total_pages)
+                try:
+                    await query.message.edit_text(
+                        text,
+                        disable_web_page_preview=True,
+                        reply_markup=kb,
+                    )
+                except Exception as e:
+                    logger.warning("suggest result edit: %s", e)
+                    await query.message.reply_text(
+                        text,
+                        disable_web_page_preview=True,
+                        reply_markup=kb,
+                        quote=True,
+                    )
+                return
+
+            # Not in our DB
+            msg = (
+                "😊 <b>" + str(label) + "</b>\n\n"
+                "THIS MOVIE IS NOT AVAILABLE IN MY DATABASE.\n\n"
+                "😊 Yeh movie mujhe mere database me nahi mili.\n\n"
+                "Request admin ke paas bhej di gayi hai — "
+                "admin ke daalne ka wait karo, ya khud admin se request kar sakte ho."
+            )
+            try:
+                await query.message.edit_text(msg, disable_web_page_preview=True)
+            except Exception:
+                try:
+                    await query.message.reply_text(msg, quote=True)
+                except Exception:
+                    pass
+            try:
+                from handlers.tmdb_suggest import get_suggest_meta
+                from configs import Config
+                meta = get_suggest_meta(cache_id)
+                uid = meta.get("user_id") or (query.from_user.id if query.from_user else 0)
+                uname = ""
+                if query.from_user:
+                    uname = ("@" + query.from_user.username) if query.from_user.username else (query.from_user.first_name or "")
+                admin_text = (
+                    "📩 <b>Movie Request (not found)</b>\n"
+                    "Movie: <code>" + str(label) + "</code>\n"
+                    "User: " + str(uname) + " (<code>" + str(uid) + "</code>)\n"
+                    "chat=" + str(meta.get("chat_id") or query.message.chat.id)
+                    + " msg=" + str(meta.get("user_msg_id") or 0)
+                    + " nfmsg=" + str(query.message.id)
+                )
+                for aid in (Config.ADMINS or set()):
+                    try:
+                        await client.send_message(int(aid), admin_text)
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.debug("notify after suggest: %s", e)
+
+        except Exception as e:
+            logger.warning("tmdb_suggest_callback: %s", e)
             try:
                 await query.answer("Error", show_alert=False)
             except Exception:

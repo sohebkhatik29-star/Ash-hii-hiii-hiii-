@@ -57,6 +57,9 @@ class Config(object):
     AUTO_EXTRACT_POSTER = bool(os.environ.get("AUTO_EXTRACT_POSTER", True))
     DEFAULT_POSTER_URL = os.environ.get("DEFAULT_POSTER_URL", "")
 
+    # TMDB (spelling / year suggestions)
+    TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "f021b4695e5082f54ccfa746c6fe02f1")
+
     # Text Templates
     HOME_TEXT = """🎬 **Welcome to {brand}** 🎬
 
