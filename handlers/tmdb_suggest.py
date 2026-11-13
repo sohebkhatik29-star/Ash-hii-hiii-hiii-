@@ -408,6 +408,156 @@ def _score_against_query(item: Dict[str, Any], query: str, year_in_q) -> tuple:
     return (ymatch, contain, overlap, item.get("popularity", 0))
 
 
+
+_MONTH_MAP = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _omdb_released_to_iso(released: str) -> str:
+    """OMDb '18 Dec 2026' / 'N/A' -> '2026-12-18' or ''."""
+    s = (released or "").strip()
+    if not s or s.upper() == "N/A":
+        return ""
+    parts = s.replace(",", " ").split()
+    if len(parts) == 3 and parts[0].isdigit() and parts[2].isdigit():
+        try:
+            d = int(parts[0])
+            m = _MONTH_MAP.get(parts[1][:3].lower(), 0)
+            y = int(parts[2])
+            if m and 1 <= d <= 31:
+                return f"{y:04d}-{m:02d}-{d:02d}"
+        except Exception:
+            return ""
+    if len(s) >= 4 and s[:4].isdigit():
+        return s[:4] + "-01-01"
+    return ""
+
+
+async def _omdb_by_title(query: str) -> Dict[str, Any] | None:
+    """Exact-ish title lookup on OMDb (IMDb data)."""
+    key = (getattr(Config, "OMDB_API_KEY", None) or "").strip()
+    q = (query or "").strip()
+    if not key or not q or len(q) < 2:
+        return None
+    # strip trailing year for ?t= then re-check
+    q_no_year = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", q)
+    q_no_year = re.sub(r"\s+", " ", q_no_year).strip() or q
+    year_m = re.search(r"\b(19\d{2}|20\d{2})\b", q)
+    year = year_m.group(1) if year_m else ""
+
+    params = {"apikey": key, "t": q_no_year, "type": "movie"}
+    if year:
+        params["y"] = year
+    url = "https://www.omdbapi.com/?" + urllib.parse.urlencode(params)
+    try:
+        data = await asyncio.to_thread(_http_get_json, url)
+    except Exception as e:
+        logger.warning("omdb_by_title(%s) failed: %s", q, e)
+        return None
+    if not data or str(data.get("Response", "")).lower() != "true":
+        # retry without year
+        if year:
+            params.pop("y", None)
+            url = "https://www.omdbapi.com/?" + urllib.parse.urlencode(params)
+            try:
+                data = await asyncio.to_thread(_http_get_json, url)
+            except Exception:
+                return None
+            if not data or str(data.get("Response", "")).lower() != "true":
+                return None
+        else:
+            return None
+    title = (data.get("Title") or "").strip()
+    if not title:
+        return None
+    y = (data.get("Year") or "")[:4]
+    if y and not y.isdigit():
+        y = ""
+    rd = _omdb_released_to_iso(data.get("Released") or "")
+    if not rd and y:
+        rd = f"{y}-01-01"
+    label = f"{title}" + (f" ({y})" if y else "")
+    return {
+        "title": title,
+        "year": y,
+        "release_date": rd,
+        "tmdb_id": None,
+        "imdb_id": data.get("imdbID") or "",
+        "media_type": "movie",
+        "label": label,
+        "popularity": 0.0,
+        "source": "omdb",
+    }
+
+
+async def _omdb_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """OMDb search list + enrich top hits with full Released date."""
+    key = (getattr(Config, "OMDB_API_KEY", None) or "").strip()
+    q = (query or "").strip()
+    if not key or not q or len(q) < 2:
+        return []
+    q_no_year = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", q)
+    q_no_year = re.sub(r"\s+", " ", q_no_year).strip() or q
+    params = {"apikey": key, "s": q_no_year, "type": "movie"}
+    url = "https://www.omdbapi.com/?" + urllib.parse.urlencode(params)
+    try:
+        data = await asyncio.to_thread(_http_get_json, url)
+    except Exception as e:
+        logger.warning("omdb_search(%s) failed: %s", q, e)
+        return []
+    if not data or str(data.get("Response", "")).lower() != "true":
+        return []
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for r in (data.get("Search") or [])[: limit + 2]:
+        title = (r.get("Title") or "").strip()
+        y = (r.get("Year") or "")[:4]
+        if y and not y.isdigit():
+            y = ""
+        if not title:
+            continue
+        key_s = (title.lower(), y)
+        if key_s in seen:
+            continue
+        seen.add(key_s)
+        # enrich with full plot endpoint for Released
+        imdb = r.get("imdbID") or ""
+        rd = f"{y}-01-01" if y else ""
+        if imdb:
+            try:
+                u2 = "https://www.omdbapi.com/?" + urllib.parse.urlencode(
+                    {"apikey": key, "i": imdb}
+                )
+                det = await asyncio.to_thread(_http_get_json, u2)
+                if det and str(det.get("Response", "")).lower() == "true":
+                    rd2 = _omdb_released_to_iso(det.get("Released") or "")
+                    if rd2:
+                        rd = rd2
+                    if not y:
+                        y2 = (det.get("Year") or "")[:4]
+                        if y2.isdigit():
+                            y = y2
+            except Exception:
+                pass
+        label = f"{title}" + (f" ({y})" if y else "")
+        out.append({
+            "title": title,
+            "year": y,
+            "release_date": rd,
+            "tmdb_id": None,
+            "imdb_id": imdb,
+            "media_type": "movie",
+            "label": label,
+            "popularity": 0.0,
+            "source": "omdb",
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
 async def tmdb_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
     Search TMDB with spelling-tolerant variants.
@@ -489,6 +639,66 @@ async def tmdb_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
         items = filtered
     else:
         items = []
+
+    # OMDb (IMDb) fallback — when TMDB has no solid hits or no exact title match
+    has_exact = any(_norm_title(it.get("title") or "") == _norm_title(q) for it in items)
+    if not items or not has_exact:
+        try:
+            omdb_exact = await _omdb_by_title(q)
+        except Exception as e:
+            logger.warning("omdb exact fallback: %s", e)
+            omdb_exact = None
+        omdb_rows: List[Dict[str, Any]] = []
+        if omdb_exact:
+            omdb_rows.append(omdb_exact)
+        if len(omdb_rows) < limit:
+            try:
+                more = await _omdb_search(q, limit=limit)
+            except Exception as e:
+                logger.warning("omdb search fallback: %s", e)
+                more = []
+            for row in more:
+                key = (row["title"].lower(), row.get("year") or "")
+                if not any(
+                    (x["title"].lower(), x.get("year") or "") == key for x in omdb_rows + items
+                ):
+                    omdb_rows.append(row)
+        # apply same relevance filter spirit on OMDb rows (reuse score)
+        omdb_kept = []
+        for it in omdb_rows:
+            ymatch, contain, overlap, pop = _score_against_query(it, q, year_in_q)
+            title_l = (it.get("title") or "").lower()
+            title_c = _collapse_repeats(title_l)
+            title_norm = _norm_title(it.get("title") or "")
+            ok = False
+            for qf in q_forms:
+                qf = re.sub(r"\s+", " ", qf).strip()
+                if not qf:
+                    continue
+                if qf in title_c or title_norm == _norm_title(qf):
+                    ok = True
+                    break
+                q_toks = [w for w in qf.split() if len(w) >= 2 and w not in stop]
+                hits = sum(1 for w in q_toks if w in title_c)
+                if len(q_toks) >= 2 and hits >= len(q_toks):
+                    ok = True
+                    break
+                if len(q_toks) == 1 and hits >= 1 and len(title_c.split()) <= 4:
+                    ok = True
+                    break
+            if ok or ymatch:
+                omdb_kept.append(it)
+        # merge: exact OMDb first, then existing TMDB, then other OMDb
+        merged_out: List[Dict[str, Any]] = []
+        seen_k = set()
+        for it in omdb_kept + items:
+            k = (it["title"].lower(), it.get("year") or "")
+            if k in seen_k:
+                continue
+            seen_k.add(k)
+            merged_out.append(it)
+        items = merged_out
+
     return items[:limit]
 
 

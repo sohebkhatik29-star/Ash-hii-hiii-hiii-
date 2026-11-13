@@ -59,6 +59,8 @@ class Config(object):
 
     # TMDB (spelling / year suggestions)
     TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "f021b4695e5082f54ccfa746c6fe02f1")
+    # OMDb (IMDb data) — fallback when TMDB has no match
+    OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "b860caad")
 
     # Text Templates
     HOME_TEXT = """🎬 **Welcome to {brand}** 🎬
