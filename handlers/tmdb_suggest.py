@@ -895,27 +895,103 @@ async def tmdb_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
             merged_out.append(it)
         items = merged_out
 
-    # Gemini last resort — only if still no solid exact title
-    has_exact = any(_norm_title(it.get("title") or "") == _norm_title(q) for it in items)
-    if not items or not has_exact:
-        try:
-            g = await _gemini_movie_guess(q)
-        except Exception as e:
-            logger.warning("gemini fallback: %s", e)
-            g = None
-        if g:
-            gk = (g["title"].lower(), g.get("year") or "")
-            # put Gemini hit first if not already present
-            if not any((it["title"].lower(), it.get("year") or "") == gk for it in items):
-                items = [g] + list(items)
-            else:
-                # upgrade release_date if missing on existing
-                for it in items:
-                    if (it["title"].lower(), it.get("year") or "") == gk:
-                        if not it.get("release_date") and g.get("release_date"):
-                            it["release_date"] = g["release_date"]
-                        break
+    return items[:limit]
 
+
+
+async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    TMDB + OMDb + Gemini — teeno se lo, merge karo.
+    Ek se na mile to dusra/teesra bhar de; dates/titles best se enrich.
+    """
+    q = (query or "").strip()
+    if not q or len(q) < 2:
+        return []
+
+    tmdb_items: List[Dict[str, Any]] = []
+    omdb_items: List[Dict[str, Any]] = []
+    gemini_items: List[Dict[str, Any]] = []
+
+    # 1) TMDB (+ internal OMDb inside tmdb_search)
+    try:
+        tmdb_items = await tmdb_search(q, limit=limit)
+    except Exception as e:
+        logger.warning("multi tmdb: %s", e)
+
+    # 2) Direct OMDb (extra net if tmdb path thin)
+    try:
+        exact = await _omdb_by_title(q)
+        search = await _omdb_search(q, limit=limit)
+        for row in ([exact] if exact else []) + (search or []):
+            if not row:
+                continue
+            k = (row["title"].lower(), row.get("year") or "")
+            if not any((x["title"].lower(), x.get("year") or "") == k for x in omdb_items):
+                omdb_items.append(row)
+    except Exception as e:
+        logger.warning("multi omdb: %s", e)
+
+    # 3) Gemini (spelling + release)
+    try:
+        gemini_items = await gemini_search(q, limit=limit)
+    except Exception as e:
+        logger.warning("multi gemini: %s", e)
+
+    # Merge: prefer exact title match, then longer release_date, keep unique
+    bucket: Dict[tuple, Dict[str, Any]] = {}
+
+    def _absorb(it: Dict[str, Any], priority: int):
+        if not it or not it.get("title"):
+            return
+        # key by normalized title only so year variants can enrich same film
+        nk = _norm_title(it.get("title") or "")
+        if not nk:
+            return
+        y = it.get("year") or ""
+        key = (nk, y)
+        # also try match same title different year → keep separate
+        prev = bucket.get(key)
+        if not prev:
+            it = dict(it)
+            it["_prio"] = priority
+            bucket[key] = it
+            return
+        # enrich release_date / ids from better source
+        if (not prev.get("release_date") or len(prev.get("release_date") or "") < 10) and it.get("release_date"):
+            prev["release_date"] = it["release_date"]
+        if not prev.get("tmdb_id") and it.get("tmdb_id"):
+            prev["tmdb_id"] = it["tmdb_id"]
+        if not prev.get("imdb_id") and it.get("imdb_id"):
+            prev["imdb_id"] = it["imdb_id"]
+        if it.get("released_flag") is False:
+            prev["released_flag"] = False
+        # higher priority source wins label if closer
+        if priority < prev.get("_prio", 99):
+            prev["source"] = it.get("source") or prev.get("source")
+            prev["_prio"] = priority
+
+    # priority: gemini spelling fixes first for options, then tmdb accuracy, then omdb
+    for it in gemini_items:
+        _absorb(it, 1)
+    for it in tmdb_items:
+        _absorb(it, 2)
+    for it in omdb_items:
+        _absorb(it, 3)
+
+    items = list(bucket.values())
+
+    # Rank: exact norm match first, then unreleased upcoming, then popularity/confidence
+    nq = _norm_title(q)
+    def _rank(it):
+        nt = _norm_title(it.get("title") or "")
+        exact = 0 if nt == nq else 1
+        unrel = 0 if is_unreleased(it) else 1
+        conf = -float(it.get("confidence") or it.get("popularity") or 0)
+        return (exact, unrel, conf)
+
+    items.sort(key=_rank)
+    for it in items:
+        it.pop("_prio", None)
     return items[:limit]
 
 

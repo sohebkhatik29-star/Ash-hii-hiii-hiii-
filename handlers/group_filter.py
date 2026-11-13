@@ -218,28 +218,17 @@ def register_group_filter_handlers(bot: Client):
         results = dedupe_by_title_year(results)
 
         if not results:
-            # Google Gemini first (spelling options + release check), then TMDB/OMDb
+            # TMDB + OMDb + Gemini — teeno se search, merge
             try:
                 from handlers.tmdb_suggest import (
-                    gemini_search,
-                    tmdb_search,
+                    multi_source_search,
                     store_suggestions,
                     build_suggest_text,
                     build_suggest_keyboard,
                 )
-                suggestions = []
-                try:
-                    suggestions = await gemini_search(search_q, limit=5)
-                    if not suggestions and query and query.strip() != search_q:
-                        suggestions = await gemini_search(query.strip(), limit=5)
-                except Exception as ge:
-                    logger.warning("gemini suggest: %s", ge)
-                    suggestions = []
-                # Fallback TMDB/OMDb only if Gemini empty / no key
-                if not suggestions:
-                    suggestions = await tmdb_search(search_q, limit=5)
-                    if not suggestions and query and query.strip() != search_q:
-                        suggestions = await tmdb_search(query.strip(), limit=5)
+                suggestions = await multi_source_search(search_q, limit=5)
+                if not suggestions and query and query.strip() != search_q:
+                    suggestions = await multi_source_search(query.strip(), limit=5)
             except Exception as e:
                 logger.warning("suggest pipeline: %s", e)
                 suggestions = []
