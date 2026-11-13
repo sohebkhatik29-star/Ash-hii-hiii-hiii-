@@ -558,6 +558,119 @@ async def _omdb_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     return out
 
 
+
+async def _gemini_movie_guess(query: str) -> Dict[str, Any] | None:
+    """Last-resort: Gemini fixes spelling / release status when TMDB+OMDb miss."""
+    key = (getattr(Config, "GEMINI_API_KEY", None) or "").strip()
+    q = (query or "").strip()
+    if not key or not q or len(q) < 2:
+        return None
+    from datetime import date
+    today = date.today().isoformat()
+    prompt = (
+        "Telegram movie-search bot helper. Today: " + today + ".\n"
+        "User typed (possibly misspelled) movie/TV title. Fix spelling using common "
+        "Indian/Hollywood film names.\n"
+        "Reply ONLY JSON object, no markdown:\n"
+        '{"correct_title":"...","year":"YYYY or","released":true,'
+        '"release_date":"YYYY-MM-DD or","confidence":0.0,"is_real_movie":true}\n'
+        "Examples of fixes:\n"
+        "Jailear -> Jailer (2023)\n"
+        "Jaata -> Jaat (2025)\n"
+        "Fack wife -> My Fake Wife\n"
+        "Puspa -> Pushpa\n"
+        "If clearly an upcoming film, set released=false and best known release_date.\n"
+        "If unknown, is_real_movie=false confidence<=0.3\n"
+        "User: " + q
+    )
+    model = "gemini-3.5-flash-lite"
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        + model
+        + ":generateContent?key="
+        + urllib.parse.quote(key)
+    )
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 200},
+    }).encode()
+
+    def _post():
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    try:
+        data = await asyncio.to_thread(_post)
+    except Exception as e:
+        logger.warning("gemini_movie_guess(%s) failed: %s", q, e)
+        return None
+    try:
+        text = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text")
+            or ""
+        )
+    except Exception:
+        return None
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        obj = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.S)
+        if not m:
+            return None
+        try:
+            obj = json.loads(m.group(0))
+        except Exception:
+            return None
+    if not isinstance(obj, dict):
+        return None
+    conf = float(obj.get("confidence") or 0)
+    is_real = bool(obj.get("is_real_movie"))
+    title = (obj.get("correct_title") or "").strip()
+    if not title or conf < 0.45 or not is_real:
+        return None
+    year = str(obj.get("year") or "").strip()
+    if year and not re.match(r"^(19|20)\d{2}$", year):
+        year = ""
+    rd = str(obj.get("release_date") or "").strip()
+    if rd.lower() in ("null", "none", "n/a", ""):
+        rd = ""
+    if rd and not re.match(r"^\d{4}-\d{2}-\d{2}$", rd):
+        # try year only
+        if year:
+            rd = f"{year}-01-01"
+        else:
+            rd = ""
+    if not rd and year:
+        rd = f"{year}-01-01"
+    # if model says not released, ensure release_date is in future when possible
+    released = obj.get("released")
+    if released is False and rd:
+        pass  # keep date for is_unreleased()
+    label = f"{title}" + (f" ({year})" if year else "")
+    return {
+        "title": title,
+        "year": year,
+        "release_date": rd,
+        "tmdb_id": None,
+        "imdb_id": "",
+        "media_type": "movie",
+        "label": label,
+        "popularity": conf * 10,
+        "source": "gemini",
+        "confidence": conf,
+    }
+
+
 async def tmdb_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
     Search TMDB with spelling-tolerant variants.
@@ -698,6 +811,27 @@ async def tmdb_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
             seen_k.add(k)
             merged_out.append(it)
         items = merged_out
+
+    # Gemini last resort — only if still no solid exact title
+    has_exact = any(_norm_title(it.get("title") or "") == _norm_title(q) for it in items)
+    if not items or not has_exact:
+        try:
+            g = await _gemini_movie_guess(q)
+        except Exception as e:
+            logger.warning("gemini fallback: %s", e)
+            g = None
+        if g:
+            gk = (g["title"].lower(), g.get("year") or "")
+            # put Gemini hit first if not already present
+            if not any((it["title"].lower(), it.get("year") or "") == gk for it in items):
+                items = [g] + list(items)
+            else:
+                # upgrade release_date if missing on existing
+                for it in items:
+                    if (it["title"].lower(), it.get("year") or "") == gk:
+                        if not it.get("release_date") and g.get("release_date"):
+                            it["release_date"] = g["release_date"]
+                        break
 
     return items[:limit]
 
