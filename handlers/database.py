@@ -281,15 +281,40 @@ class Database:
             if not m_tokens:
                 continue
             if query_title_tokens:
-                hits = sum(1 for t in query_title_tokens if t in m_tokens or any(t in mt for mt in m_tokens))
-                if hits < max(1, (len(query_title_tokens) + 1) // 2):
+                hits = sum(
+                    1
+                    for t in query_title_tokens
+                    if t in m_tokens or any(t in mt for mt in m_tokens if len(t) >= 3)
+                )
+                n_q = len(query_title_tokens)
+                # short query ("spider man") → loose match, all franchise hits
+                # long/specific query ("spider man beyond the spider verse") → almost all tokens must match
+                if n_q >= 4:
+                    need = max(3, n_q - 1)
+                elif n_q == 3:
+                    need = 3
+                else:
+                    need = max(1, (n_q + 1) // 2)
+                if hits < need:
+                    continue
+                # reject when movie title is much shorter than a long query
+                # (stops "Spider Man" matching "Spider Man Beyond the Spider Verse")
+                if n_q >= 4 and len(m_tokens) < max(2, n_q - 1):
                     continue
             myear = m.get("year")
             if year_tokens and myear is not None:
                 if str(myear) not in year_tokens:
                     continue
             results.append(m)
-        results.sort(key=lambda x: str(x.get("added_at") or ""), reverse=False)  # pehle upload upar
+        # better first: more token overlap with query, then older uploads first
+        def _rank(m):
+            mtitle = (m.get("normalized_title") or m.get("title") or "").lower()
+            mtitle = re.sub(r"[^\w\s]", " ", mtitle)
+            mtitle = re.sub(r"\s+", " ", mtitle).strip()
+            m_toks = set(mtitle.split())
+            hits = sum(1 for t in query_title_tokens if t in m_toks) if query_title_tokens else 0
+            return (-hits, str(m.get("added_at") or ""))
+        results.sort(key=_rank)
         return results
 
     async def delete_movie(self, movie_id: str) -> bool:
