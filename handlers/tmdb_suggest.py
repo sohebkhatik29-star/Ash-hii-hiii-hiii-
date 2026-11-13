@@ -438,24 +438,57 @@ async def tmdb_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     items = list(merged.values())
     items.sort(key=lambda it: _score_against_query(it, q, year_in_q), reverse=True)
 
-    # Keep only titles that relate to what user typed (avoid random TMDB noise)
+    # Keep only titles that really relate to what user typed (kill random "red/cut" noise)
     filtered = []
+    q_plain = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", q.lower())
+    q_plain = re.sub(r"\s+", " ", q_plain).strip()
+    q_forms = list(dict.fromkeys([
+        q_plain,
+        _collapse_repeats(q_plain),
+        _collapse_soft(q_plain),
+    ]))
+    # also single-char deletions of last form (jaata -> jaat)
+    base = q_forms[-1] if q_forms else q_plain
+    if 4 <= len(base) <= 12 and " " not in base:
+        for i in range(len(base)):
+            q_forms.append(base[:i] + base[i+1:])
+    q_forms = list(dict.fromkeys(q_forms))
+    stop = {"to", "of", "the", "a", "an", "in", "on", "and", "for", "with"}
+
     for it in items:
         ymatch, contain, overlap, pop = _score_against_query(it, q, year_in_q)
         title_l = (it.get("title") or "").lower()
-        q_plain = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", q.lower())
-        q_plain = re.sub(r"\s+", " ", q_plain).strip()
-        q_c = _collapse_repeats(q_plain)
-        q_toks = [w for w in q_c.split() if len(w) >= 3]
         title_c = _collapse_repeats(title_l)
-        hits = sum(1 for w in q_toks if w in title_c)
-        # multi-word query: need roughly half the significant tokens in title
-        need = max(1, (len(q_toks) + 1) // 2) if q_toks else 1
-        tok_hit = hits >= need
-        if ymatch or contain or overlap or tok_hit:
+        title_toks = [w for w in title_c.split() if len(w) >= 2 and w not in stop]
+        title_norm = _norm_title(it.get("title") or "")
+
+        real_contain = False
+        tok_hit = False
+        for qf in q_forms:
+            qf = re.sub(r"\s+", " ", qf).strip()
+            if not qf:
+                continue
+            if qf in title_c or title_norm == _norm_title(qf):
+                real_contain = True
+            q_toks = [w for w in qf.split() if len(w) >= 2 and w not in stop]
+            hits = sum(1 for w in q_toks if w in title_c)
+            if len(q_toks) >= 2:
+                ok = hits >= len(q_toks)
+                if ok and len(title_toks) > len(q_toks) + 1 and qf not in title_c:
+                    ok = False
+                if ok:
+                    tok_hit = True
+            elif q_toks and hits >= 1:
+                # single token: title should be close (not a long unrelated phrase)
+                if len(title_toks) <= 3 or title_norm == _norm_title(qf) or qf in title_c:
+                    tok_hit = True
+
+        if ymatch or real_contain or tok_hit:
             filtered.append(it)
     if filtered:
         items = filtered
+    else:
+        items = []
     return items[:limit]
 
 
