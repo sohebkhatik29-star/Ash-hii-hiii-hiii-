@@ -63,6 +63,8 @@ class Config(object):
     OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "b860caad")
     # Google Gemini (AI Studio) — last-resort spelling / release guess
     GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+    # OpenAI / ChatGPT — extra fallback for spelling + release
+    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
     # Text Templates
     HOME_TEXT = """🎬 **Welcome to {brand}** 🎬

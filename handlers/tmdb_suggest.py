@@ -899,9 +899,99 @@ async def tmdb_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
 
 
 
+
+async def openai_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    OpenAI/ChatGPT fallback — spelling fix + release status when others miss.
+    """
+    key = (getattr(Config, "OPENAI_API_KEY", None) or "").strip()
+    q = (query or "").strip()
+    if not key or not q or len(q) < 2:
+        return []
+    from datetime import date
+    today = date.today().isoformat()
+    prompt = (
+        "You help a Telegram movie bot. Today is " + today + ".\n"
+        "User typed a movie/TV name (may be misspelled or wrong year).\n"
+        "Return ONLY a JSON array (max " + str(max(1, min(limit, 5))) + " items), no markdown.\n"
+        "Each item:\n"
+        '{"title":"Correct official name","year":"YYYY or empty",'
+        '"release_date":"YYYY-MM-DD or empty","released":true,'
+        '"confidence":0.0,"is_real_movie":true}\n'
+        "Rules:\n"
+        "- Fix spelling (Jailear->Jailer, Jaata->Jaat, Fack wife->My Fake Wife, Puspa->Pushpa).\n"
+        "- Prefer real theatrical/OTT films.\n"
+        "- If not released yet vs today, released=false and best release_date.\n"
+        "- First item = best match. Do not invent fake movies.\n"
+        "- If nothing real matches, return [].\n"
+        "User query: " + q
+    )
+    body = json.dumps({
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "Reply with valid JSON only. No markdown."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.15,
+        "max_tokens": 500,
+    }).encode()
+
+    def _post():
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + key,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    try:
+        data = await asyncio.to_thread(_post)
+    except Exception as e:
+        logger.warning("openai_search(%s) failed: %s", q, e)
+        return []
+    try:
+        text = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content")
+            or ""
+        )
+    except Exception:
+        return []
+    obj = _parse_gemini_json(text)
+    rows = []
+    if isinstance(obj, list):
+        rows = obj
+    elif isinstance(obj, dict):
+        if isinstance(obj.get("results"), list):
+            rows = obj["results"]
+        else:
+            rows = [obj]
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for raw in rows:
+        it = _gemini_item_from_obj(raw if isinstance(raw, dict) else {})
+        if not it:
+            continue
+        it["source"] = "openai"
+        k = (it["title"].lower(), it.get("year") or "")
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(it)
+        if len(out) >= limit:
+            break
+    return out
+
+
 async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
-    TMDB + OMDb + Gemini — teeno se lo, merge karo.
+    TMDB + OMDb + Gemini + OpenAI — saari sources se lo, merge karo.
     Ek se na mile to dusra/teesra bhar de; dates/titles best se enrich.
     """
     q = (query or "").strip()
@@ -911,6 +1001,7 @@ async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]
     tmdb_items: List[Dict[str, Any]] = []
     omdb_items: List[Dict[str, Any]] = []
     gemini_items: List[Dict[str, Any]] = []
+    openai_items: List[Dict[str, Any]] = []
 
     # 1) TMDB (+ internal OMDb inside tmdb_search)
     try:
@@ -936,6 +1027,12 @@ async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]
         gemini_items = await gemini_search(q, limit=limit)
     except Exception as e:
         logger.warning("multi gemini: %s", e)
+
+    # 4) OpenAI / ChatGPT — last net for hard misses
+    try:
+        openai_items = await openai_search(q, limit=limit)
+    except Exception as e:
+        logger.warning("multi openai: %s", e)
 
     # Merge: prefer exact title match, then longer release_date, keep unique
     bucket: Dict[tuple, Dict[str, Any]] = {}
@@ -972,6 +1069,8 @@ async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]
 
     # priority: gemini spelling fixes first for options, then tmdb accuracy, then omdb
     for it in gemini_items:
+        _absorb(it, 1)
+    for it in openai_items:
         _absorb(it, 1)
     for it in tmdb_items:
         _absorb(it, 2)
