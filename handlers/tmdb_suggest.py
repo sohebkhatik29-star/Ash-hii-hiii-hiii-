@@ -110,17 +110,32 @@ def get_exact_match_item(query: str, suggestions: List[Dict[str, Any]]):
 
 
 def is_unreleased(item: Dict[str, Any]) -> bool:
-    """True if TMDB release_date is strictly after today."""
+    """True when film is not out yet (date after today, or Gemini says so for current/future year)."""
     from datetime import date
-    rd = (item or {}).get("release_date") or ""
-    if len(rd) < 10:
-        return False
-    try:
-        y, m, d = int(rd[0:4]), int(rd[5:7]), int(rd[8:10])
-        rel = date(y, m, d)
-    except Exception:
-        return False
-    return rel > date.today()
+    item = item or {}
+    today = date.today()
+    rd = item.get("release_date") or ""
+    # Prefer solid calendar date when present
+    if len(rd) >= 10:
+        try:
+            y, m, d = int(rd[0:4]), int(rd[5:7]), int(rd[8:10])
+            rel = date(y, m, d)
+            # If source is gemini and released_flag is False, trust flag when year is current/future
+            # even if guessed day-month already passed (common AI date errors)
+            if item.get("source") == "gemini" and item.get("released_flag") is False:
+                if y >= today.year:
+                    return True
+            return rel > today
+        except Exception:
+            pass
+    if item.get("released_flag") is False:
+        y = (item.get("year") or "")[:4]
+        try:
+            if not y or int(y) >= today.year:
+                return True
+        except Exception:
+            return True
+    return False
 
 
 def format_release_date(rd: str) -> str:
@@ -559,30 +574,28 @@ async def _omdb_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
 
 
 
-async def _gemini_movie_guess(query: str) -> Dict[str, Any] | None:
-    """Last-resort: Gemini fixes spelling / release status when TMDB+OMDb miss."""
+
+def _parse_gemini_json(text: str):
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"[\[\{].*[\]\}]", text, re.S)
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+
+
+async def _gemini_post(prompt: str, max_tokens: int = 400) -> str:
     key = (getattr(Config, "GEMINI_API_KEY", None) or "").strip()
-    q = (query or "").strip()
-    if not key or not q or len(q) < 2:
-        return None
-    from datetime import date
-    today = date.today().isoformat()
-    prompt = (
-        "Telegram movie-search bot helper. Today: " + today + ".\n"
-        "User typed (possibly misspelled) movie/TV title. Fix spelling using common "
-        "Indian/Hollywood film names.\n"
-        "Reply ONLY JSON object, no markdown:\n"
-        '{"correct_title":"...","year":"YYYY or","released":true,'
-        '"release_date":"YYYY-MM-DD or","confidence":0.0,"is_real_movie":true}\n'
-        "Examples of fixes:\n"
-        "Jailear -> Jailer (2023)\n"
-        "Jaata -> Jaat (2025)\n"
-        "Fack wife -> My Fake Wife\n"
-        "Puspa -> Pushpa\n"
-        "If clearly an upcoming film, set released=false and best known release_date.\n"
-        "If unknown, is_real_movie=false confidence<=0.3\n"
-        "User: " + q
-    )
+    if not key:
+        return ""
     model = "gemini-3.5-flash-lite"
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -592,70 +605,59 @@ async def _gemini_movie_guess(query: str) -> Dict[str, Any] | None:
     )
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 200},
+        "generationConfig": {"temperature": 0.15, "maxOutputTokens": max_tokens},
     }).encode()
 
     def _post():
         req = urllib.request.Request(
             url, data=body, headers={"Content-Type": "application/json"}, method="POST"
         )
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=22) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
 
     try:
         data = await asyncio.to_thread(_post)
-    except Exception as e:
-        logger.warning("gemini_movie_guess(%s) failed: %s", q, e)
-        return None
-    try:
-        text = (
+        return (
             data.get("candidates", [{}])[0]
             .get("content", {})
             .get("parts", [{}])[0]
             .get("text")
             or ""
         )
-    except Exception:
-        return None
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    try:
-        obj = json.loads(text)
-    except Exception:
-        m = re.search(r"\{.*\}", text, re.S)
-        if not m:
-            return None
-        try:
-            obj = json.loads(m.group(0))
-        except Exception:
-            return None
+    except Exception as e:
+        logger.warning("gemini_post failed: %s", e)
+        return ""
+
+
+def _gemini_item_from_obj(obj: dict) -> Dict[str, Any] | None:
     if not isinstance(obj, dict):
         return None
-    conf = float(obj.get("confidence") or 0)
-    is_real = bool(obj.get("is_real_movie"))
-    title = (obj.get("correct_title") or "").strip()
-    if not title or conf < 0.45 or not is_real:
+    conf = float(obj.get("confidence") or 0.7)
+    is_real = obj.get("is_real_movie")
+    if is_real is False and conf < 0.5:
+        return None
+    title = (obj.get("correct_title") or obj.get("title") or "").strip()
+    if not title or len(title) < 2:
         return None
     year = str(obj.get("year") or "").strip()
     if year and not re.match(r"^(19|20)\d{2}$", year):
-        year = ""
+        year = year[:4] if re.match(r"^(19|20)\d{2}", year) else ""
     rd = str(obj.get("release_date") or "").strip()
     if rd.lower() in ("null", "none", "n/a", ""):
         rd = ""
     if rd and not re.match(r"^\d{4}-\d{2}-\d{2}$", rd):
-        # try year only
-        if year:
-            rd = f"{year}-01-01"
-        else:
-            rd = ""
+        rd = f"{year}-01-01" if year else ""
     if not rd and year:
         rd = f"{year}-01-01"
-    # if model says not released, ensure release_date is in future when possible
-    released = obj.get("released")
-    if released is False and rd:
-        pass  # keep date for is_unreleased()
+    # model can force unreleased
+    if obj.get("released") is False and not rd and year:
+        # put mid-year future-ish placeholder only if year > current
+        from datetime import date
+        try:
+            if int(year) >= date.today().year:
+                rd = f"{year}-12-31"
+        except Exception:
+            pass
     label = f"{title}" + (f" ({year})" if year else "")
     return {
         "title": title,
@@ -668,7 +670,88 @@ async def _gemini_movie_guess(query: str) -> Dict[str, Any] | None:
         "popularity": conf * 10,
         "source": "gemini",
         "confidence": conf,
+        "released_flag": obj.get("released"),
     }
+
+
+async def gemini_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    Primary Google/Gemini suggestions for wrong spelling + release status.
+    Returns list of {title, year, release_date, label, ...}.
+    """
+    key = (getattr(Config, "GEMINI_API_KEY", None) or "").strip()
+    q = (query or "").strip()
+    if not key or not q or len(q) < 2:
+        return []
+    from datetime import date
+    today = date.today().isoformat()
+    prompt = (
+        "You help a Telegram movie bot. Today is " + today + ".\n"
+        "User typed a movie/TV name (may be misspelled or wrong year).\n"
+        "Return ONLY a JSON array (max " + str(limit) + " items), no markdown.\n"
+        "Each item:\n"
+        '{"title":"Correct official name","year":"YYYY or empty",'
+        '"release_date":"YYYY-MM-DD or empty","released":true,'
+        '"confidence":0.0,"is_real_movie":true}\n'
+        "Rules:\n"
+        "- Fix spelling (Jailear->Jailer, Jaata->Jaat, Fack wife->My Fake Wife, Puspa->Pushpa).\n"
+        "- Prefer real theatrical/OTT films known on Google/IMDb.\n"
+        "- If upcoming / not released yet vs today, released=false and best release_date.\n"
+        "- If user year is wrong, put correct year.\n"
+        "- First item = best match. Do not invent fake movies.\n"
+        "- If nothing real matches, return [].\n"
+        "User query: " + q
+    )
+    text = await _gemini_post(prompt, max_tokens=500)
+    obj = _parse_gemini_json(text)
+    rows = []
+    if isinstance(obj, list):
+        rows = obj
+    elif isinstance(obj, dict):
+        # single object or {results:[...]}
+        if isinstance(obj.get("results"), list):
+            rows = obj["results"]
+        else:
+            rows = [obj]
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for raw in rows:
+        it = _gemini_item_from_obj(raw if isinstance(raw, dict) else {})
+        if not it:
+            continue
+        k = (it["title"].lower(), it.get("year") or "")
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(it)
+        if len(out) >= limit:
+            break
+    # Enrich release_date from TMDB when possible (more accurate dates)
+    for it in out:
+        try:
+            tmdb_rows = await _tmdb_raw(it["title"], limit=5)
+        except Exception:
+            tmdb_rows = []
+        for tr in tmdb_rows:
+            if _norm_title(tr.get("title") or "") != _norm_title(it["title"]):
+                continue
+            # same year or gemini year empty
+            if it.get("year") and tr.get("year") and it["year"] != tr["year"]:
+                continue
+            if tr.get("release_date") and len(tr.get("release_date") or "") >= 10:
+                it["release_date"] = tr["release_date"]
+                if tr.get("year"):
+                    it["year"] = tr["year"]
+                    it["label"] = f"{it['title']} ({tr['year']})"
+                it["tmdb_id"] = tr.get("tmdb_id")
+                break
+    return out
+
+
+async def _gemini_movie_guess(query: str) -> Dict[str, Any] | None:
+    """Single best Gemini guess (compat)."""
+    rows = await gemini_search(query, limit=1)
+    return rows[0] if rows else None
 
 
 async def tmdb_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
