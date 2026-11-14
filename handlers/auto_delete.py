@@ -211,3 +211,12 @@ def schedule_not_found_delete(client, chat_id, message_ids):
         await schedule_delete(client, chat_id, message_ids, delay)
 
     asyncio.create_task(_run())
+
+
+def schedule_suggest_delete(client, chat_id, message_ids, delay_seconds: int = 60):
+    """Spelling/year options panel → 1 min me delete agar user ne option nahi select kiya."""
+
+    async def _run():
+        await schedule_delete(client, chat_id, message_ids, int(delay_seconds or 60))
+
+    asyncio.create_task(_run())

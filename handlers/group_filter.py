@@ -12,7 +12,7 @@ from configs import Config
 from handlers.database import db
 from handlers.force_sub_handler import enforce_force_sub_in_group
 from handlers.search_query import clean_search_query, filter_strict_matches
-from handlers.auto_delete import schedule_result_delete, schedule_not_found_delete
+from handlers.auto_delete import schedule_result_delete, schedule_not_found_delete, schedule_suggest_delete
 import time
 import secrets
 
@@ -294,7 +294,8 @@ def register_group_filter_handlers(bot: Client):
                     disable_web_page_preview=True,
                 )
                 if m:
-                    schedule_not_found_delete(client, message.chat.id, [m.id, message.id])
+                    # Options panel: 1 minute me auto-delete (agar select nahi kiya)
+                    schedule_suggest_delete(client, message.chat.id, [m.id, message.id], 60)
                     try:
                         from handlers.bot_commands.dn_cmd import track_bot_reply
                         track_bot_reply(message.chat.id, message.id, m.id, client=client)
