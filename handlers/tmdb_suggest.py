@@ -1235,14 +1235,53 @@ async def openai_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     return out
 
 
+def _query_token_set(query: str) -> set:
+    q = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", (query or "").lower())
+    q = re.sub(r"[^\w\s]", " ", q)
+    q = re.sub(r"\s+", " ", q).strip()
+    stop = {"the", "a", "an", "of", "to", "and", "in", "on", "for"}
+    return {t for t in q.split() if t and t not in stop and len(t) > 1}
+
+
+def _is_strong_source_hit(query: str, items: List[Dict[str, Any]]) -> bool:
+    """
+    True only when at least one result reasonably matches the full query.
+    Weak partials like Doomsday(1998) for 'Avengers Doomsday' → False (try next source).
+    """
+    if not items:
+        return False
+    q_toks = _query_token_set(query)
+    if not q_toks:
+        return True
+    nq = _norm_title(query)
+    for it in items:
+        nt = _norm_title(it.get("title") or "")
+        if nt and nt == nq:
+            return True
+        t_toks = _query_token_set(it.get("title") or "")
+        if not t_toks:
+            continue
+        # all query tokens covered by title, or high overlap
+        if q_toks <= t_toks:
+            return True
+        overlap = len(q_toks & t_toks)
+        if overlap >= max(2, (len(q_toks) + 1) // 2) and overlap >= len(t_toks) - 1:
+            return True
+        # single distinctive long token shared (exact franchise word) + year match optional
+        if len(q_toks) == 1 and list(q_toks)[0] in t_toks and len(list(q_toks)[0]) >= 5:
+            return True
+    return False
+
+
 async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
-    Strict waterfall (pehli source se mile to aage mat jao):
+    Strict waterfall (pehli STRONG source se mile to aage mat jao):
       1) TMDB
       2) OMDb
       3) AI (Gemini → OpenAI if key)
       4) Wikidata
       5) Wikipedia
+    Weak partial hits (galat purani movie) se aage cascade hota hai.
     """
     q = (query or "").strip()
     if not q or len(q) < 2:
@@ -1262,17 +1301,18 @@ async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]
         out.sort(key=key)
         return out[:limit]
 
+    weak_pool: List[Dict[str, Any]] = []
+
     # 1) TMDB only
     try:
         tmdb_items = await tmdb_search(q, limit=limit)
-        # tmdb_search sometimes appends omdb — keep only pure tmdb rows for step 1
         pure = [x for x in (tmdb_items or []) if (x.get("source") or "tmdb") == "tmdb" or x.get("tmdb_id")]
-        if pure:
-            logger.info("waterfall: hit TMDB (%s)", len(pure))
+        if pure and _is_strong_source_hit(q, pure):
+            logger.info("waterfall: strong TMDB (%s)", len(pure))
             return _rank(pure)
-        # if all were omdb-tagged from internal fallback, fall through
-        if tmdb_items:
-            logger.info("waterfall: TMDB empty pure, trying next")
+        if pure:
+            weak_pool.extend(pure)
+            logger.info("waterfall: weak TMDB, next source")
     except Exception as e:
         logger.warning("waterfall tmdb: %s", e)
 
@@ -1287,45 +1327,61 @@ async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]
             k = (row["title"].lower(), row.get("year") or "")
             if not any((x["title"].lower(), x.get("year") or "") == k for x in omdb_items):
                 omdb_items.append(row)
-        if omdb_items:
-            logger.info("waterfall: hit OMDb (%s)", len(omdb_items))
+        if omdb_items and _is_strong_source_hit(q, omdb_items):
+            logger.info("waterfall: strong OMDb (%s)", len(omdb_items))
             return _rank(omdb_items)
+        if omdb_items:
+            weak_pool.extend(omdb_items)
+            logger.info("waterfall: weak OMDb, next source")
     except Exception as e:
         logger.warning("waterfall omdb: %s", e)
 
     # 3) AI — Gemini first, then OpenAI
     try:
         gemini_items = await gemini_search(q, limit=limit)
-        if gemini_items:
-            logger.info("waterfall: hit Gemini (%s)", len(gemini_items))
+        if gemini_items and _is_strong_source_hit(q, gemini_items):
+            logger.info("waterfall: strong Gemini (%s)", len(gemini_items))
             return _rank(gemini_items)
+        if gemini_items:
+            weak_pool.extend(gemini_items)
     except Exception as e:
         logger.warning("waterfall gemini: %s", e)
     try:
         openai_items = await openai_search(q, limit=limit)
-        if openai_items:
-            logger.info("waterfall: hit OpenAI (%s)", len(openai_items))
+        if openai_items and _is_strong_source_hit(q, openai_items):
+            logger.info("waterfall: strong OpenAI (%s)", len(openai_items))
             return _rank(openai_items)
+        if openai_items:
+            weak_pool.extend(openai_items)
     except Exception as e:
         logger.warning("waterfall openai: %s", e)
 
     # 4) Wikidata
     try:
         wiki_items = await wiki_search(q, limit=limit)
-        if wiki_items:
-            logger.info("waterfall: hit Wikidata (%s)", len(wiki_items))
+        if wiki_items and _is_strong_source_hit(q, wiki_items):
+            logger.info("waterfall: strong Wikidata (%s)", len(wiki_items))
             return _rank(wiki_items)
+        if wiki_items:
+            weak_pool.extend(wiki_items)
     except Exception as e:
         logger.warning("waterfall wikidata: %s", e)
 
     # 5) Wikipedia (last)
     try:
         wp_items = await wikipedia_search(q, limit=limit)
-        if wp_items:
-            logger.info("waterfall: hit Wikipedia (%s)", len(wp_items))
+        if wp_items and _is_strong_source_hit(q, wp_items):
+            logger.info("waterfall: strong Wikipedia (%s)", len(wp_items))
             return _rank(wp_items)
+        if wp_items:
+            weak_pool.extend(wp_items)
     except Exception as e:
         logger.warning("waterfall wikipedia: %s", e)
+
+    # Koi strong hit nahi → best weak pool (still useful for suggestions)
+    if weak_pool:
+        logger.info("waterfall: only weak hits (%s) for %r", len(weak_pool), q)
+        return _rank(weak_pool)
 
     logger.info("waterfall: no hits for %r", q)
     return []

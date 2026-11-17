@@ -114,8 +114,12 @@ def is_strict_title_match(query: str, movie_title: str, movie_year=None) -> bool
         return True
 
     # Path B: every significant title word is in the query (query covers full title)
+    # BUT: if user typed EXTRA distinctive words not in this title → reject
+    # "Avengers Doomsday" must NOT match "The Avengers" (extra: doomsday)
     if all(tw in q_set for tw in title_words):
-        return True
+        extras = [w for w in q_words if w not in title_set]
+        if not extras or all(len(w) <= 3 for w in extras):
+            return True
 
     # Path C: single-word franchise query — first title word only, len >= 5
     # "PUSHPA" → Pushpa The Rise  |  "FURY" (len 4) → blocked

@@ -233,9 +233,10 @@ def register_group_filter_handlers(bot: Client):
                 logger.warning("suggest pipeline: %s", e)
                 suggestions = []
 
-            # Spelling already correct (exact TMDB title) → no suggestion buttons
+            # Spelling already correct (exact title) → no suggestion buttons
             exact_ok = False
             exact_item = None
+            unreleased_item = None
             if suggestions:
                 try:
                     from handlers.tmdb_suggest import (
@@ -244,6 +245,8 @@ def register_group_filter_handlers(bot: Client):
                         is_unreleased,
                         build_unreleased_text,
                         build_unreleased_keyboard,
+                        _norm_title,
+                        _query_token_set,
                     )
                     exact_item = get_exact_match_item(query, suggestions) or get_exact_match_item(
                         search_q, suggestions
@@ -251,15 +254,42 @@ def register_group_filter_handlers(bot: Client):
                     exact_ok = exact_item is not None or has_exact_tmdb_match(
                         query, suggestions
                     ) or has_exact_tmdb_match(search_q, suggestions)
+
+                    # Unreleased: exact match OR strong token overlap with future film
+                    if exact_item and is_unreleased(exact_item):
+                        unreleased_item = exact_item
+                    else:
+                        q_toks = _query_token_set(search_q or query)
+                        best = None
+                        best_score = 0
+                        for it in suggestions:
+                            if not is_unreleased(it):
+                                continue
+                            t_toks = _query_token_set(it.get("title") or "")
+                            if not t_toks or not q_toks:
+                                continue
+                            overlap = len(q_toks & t_toks)
+                            # need most query words in the unreleased title
+                            if overlap >= max(2, (len(q_toks) + 1) // 2) or (
+                                q_toks <= t_toks
+                            ) or _norm_title(it.get("title") or "") == _norm_title(
+                                search_q or query
+                            ):
+                                score = overlap * 10 + (1 if is_unreleased(it) else 0)
+                                if score > best_score:
+                                    best_score = score
+                                    best = it
+                        unreleased_item = best
                 except Exception as e:
                     logger.warning("exact/unreleased check: %s", e)
                     exact_ok = False
                     exact_item = None
+                    unreleased_item = None
 
-            # Exact title + future release date → not released yet
-            if exact_item and is_unreleased(exact_item):
-                text = build_unreleased_text(query, exact_item)
-                kb = build_unreleased_keyboard(exact_item)
+            # Future release → not released yet message
+            if unreleased_item:
+                text = build_unreleased_text(query, unreleased_item)
+                kb = build_unreleased_keyboard(unreleased_item)
                 m = await message.reply_text(
                     text,
                     quote=True,
