@@ -145,6 +145,13 @@ except Exception as e:
     logger.error(f"spl_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
 try:
+    from handlers.bot_commands.nrls_cmd import register_nrls_command
+    register_nrls_command(Bot)
+    logger.info("/nrls command registered")
+except Exception as e:
+    logger.error(f"nrls_cmd register failed (bot still runs): {type(e).__name__}: {e}")
+
+try:
     from handlers.bot_commands.delete_filter_cmd import register_delete_filter_command
     register_delete_filter_command(Bot)
 except Exception as e:
