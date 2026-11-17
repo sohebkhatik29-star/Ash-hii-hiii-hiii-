@@ -935,16 +935,76 @@ def _wiki_parse_time(time_val: str) -> tuple:
     return y, iso
 
 
+async def wikipedia_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Wikipedia OpenSearch only — last fallback, no API key."""
+    q = (query or "").strip()
+    if not q or len(q) < 2:
+        return []
+    try:
+        wp_url = (
+            "https://en.wikipedia.org/w/api.php?"
+            + urllib.parse.urlencode(
+                {
+                    "action": "opensearch",
+                    "search": q,
+                    "limit": max(limit * 2, 8),
+                    "namespace": 0,
+                    "format": "json",
+                }
+            )
+        )
+        wp = await asyncio.to_thread(_http_get_json, wp_url, 8.0)
+        titles = wp[1] if isinstance(wp, list) and len(wp) > 1 else []
+        descs = wp[2] if isinstance(wp, list) and len(wp) > 2 else []
+        out_wp: List[Dict[str, Any]] = []
+        seen = set()
+        for i, title in enumerate(titles or []):
+            desc = (descs[i] if i < len(descs) else "") or ""
+            low = (title + " " + desc).lower()
+            if not any(
+                k in low
+                for k in ("film", "movie", "television", "tv series", "series")
+            ):
+                continue
+            year_m = re.search(r"\b(19\d{2}|20\d{2})\b", desc) or re.search(
+                r"\b(19\d{2}|20\d{2})\b", title
+            )
+            year = year_m.group(1) if year_m else ""
+            k = (title.lower(), year)
+            if k in seen:
+                continue
+            seen.add(k)
+            label = f"{title} ({year})" if year else title
+            out_wp.append(
+                {
+                    "title": title,
+                    "year": year,
+                    "release_date": "",
+                    "released_flag": None,
+                    "label": label,
+                    "confidence": 0.35,
+                    "source": "wikipedia",
+                    "tmdb_id": None,
+                    "imdb_id": None,
+                }
+            )
+            if len(out_wp) >= limit:
+                break
+        return out_wp
+    except Exception as e:
+        logger.warning("wikipedia_search(%s) failed: %s", q, e)
+        return []
+
+
 async def wiki_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
-    Wikidata + Wikipedia (no API key) — title spelling + release year backup.
-    Filters to film / TV series only.
+    Wikidata only (no API key) — title + release year. Filters film / TV.
     """
     q = (query or "").strip()
     if not q or len(q) < 2:
         return []
 
-    # 1) Wikidata entity search
+    # Wikidata entity search
     search_url = (
         "https://www.wikidata.org/w/api.php?"
         + urllib.parse.urlencode(
@@ -968,57 +1028,7 @@ async def wiki_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     hits = data.get("search") or []
     ids = [h.get("id") for h in hits if h.get("id")]
     if not ids:
-        # 2) Wikipedia OpenSearch fallback (titles only)
-        try:
-            wp_url = (
-                "https://en.wikipedia.org/w/api.php?"
-                + urllib.parse.urlencode(
-                    {
-                        "action": "opensearch",
-                        "search": q,
-                        "limit": limit,
-                        "namespace": 0,
-                        "format": "json",
-                    }
-                )
-            )
-            wp = await asyncio.to_thread(_http_get_json, wp_url, 8.0)
-            # opensearch returns [query, [titles], [descs], [urls]]
-            titles = wp[1] if isinstance(wp, list) and len(wp) > 1 else []
-            descs = wp[2] if isinstance(wp, list) and len(wp) > 2 else []
-            out_wp: List[Dict[str, Any]] = []
-            for i, title in enumerate(titles or []):
-                desc = (descs[i] if i < len(descs) else "") or ""
-                low = (title + " " + desc).lower()
-                if not any(
-                    k in low
-                    for k in ("film", "movie", "television", "tv series", "series")
-                ):
-                    continue
-                year_m = re.search(r"\b(19\d{2}|20\d{2})\b", desc) or re.search(
-                    r"\b(19\d{2}|20\d{2})\b", title
-                )
-                year = year_m.group(1) if year_m else ""
-                label = f"{title} ({year})" if year else title
-                out_wp.append(
-                    {
-                        "title": title,
-                        "year": year,
-                        "release_date": "",
-                        "released_flag": None,
-                        "label": label,
-                        "confidence": 0.4,
-                        "source": "wiki",
-                        "tmdb_id": None,
-                        "imdb_id": None,
-                    }
-                )
-                if len(out_wp) >= limit:
-                    break
-            return out_wp
-        except Exception as e:
-            logger.warning("wiki opensearch(%s) failed: %s", q, e)
-            return []
+        return []
 
     # 3) Batch get entities for P31 + P577
     ids_str = "|".join(ids[:15])
@@ -1125,7 +1135,7 @@ async def wiki_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
                 "released_flag": released_flag,
                 "label": lab,
                 "confidence": 0.55,
-                "source": "wiki",
+                "source": "wikidata",
                 "tmdb_id": None,
                 "imdb_id": None,
                 "wikidata_id": qid,
@@ -1227,27 +1237,48 @@ async def openai_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
 
 async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
-    TMDB + OMDb + Wiki + Gemini + OpenAI — saari sources se lo, merge karo.
-    Ek se na mile to dusra/teesra bhar de; dates/titles best se enrich.
+    Strict waterfall (pehli source se mile to aage mat jao):
+      1) TMDB
+      2) OMDb
+      3) AI (Gemini → OpenAI if key)
+      4) Wikidata
+      5) Wikipedia
     """
     q = (query or "").strip()
     if not q or len(q) < 2:
         return []
 
-    tmdb_items: List[Dict[str, Any]] = []
-    omdb_items: List[Dict[str, Any]] = []
-    wiki_items: List[Dict[str, Any]] = []
-    gemini_items: List[Dict[str, Any]] = []
-    openai_items: List[Dict[str, Any]] = []
+    def _rank(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        nq = _norm_title(q)
 
-    # 1) TMDB (+ internal OMDb inside tmdb_search)
+        def key(it):
+            nt = _norm_title(it.get("title") or "")
+            exact = 0 if nt == nq else 1
+            unrel = 0 if is_unreleased(it) else 1
+            conf = -float(it.get("confidence") or it.get("popularity") or 0)
+            return (exact, unrel, conf)
+
+        out = list(items or [])
+        out.sort(key=key)
+        return out[:limit]
+
+    # 1) TMDB only
     try:
         tmdb_items = await tmdb_search(q, limit=limit)
+        # tmdb_search sometimes appends omdb — keep only pure tmdb rows for step 1
+        pure = [x for x in (tmdb_items or []) if (x.get("source") or "tmdb") == "tmdb" or x.get("tmdb_id")]
+        if pure:
+            logger.info("waterfall: hit TMDB (%s)", len(pure))
+            return _rank(pure)
+        # if all were omdb-tagged from internal fallback, fall through
+        if tmdb_items:
+            logger.info("waterfall: TMDB empty pure, trying next")
     except Exception as e:
-        logger.warning("multi tmdb: %s", e)
+        logger.warning("waterfall tmdb: %s", e)
 
-    # 2) Direct OMDb (extra net if tmdb path thin)
+    # 2) OMDb
     try:
+        omdb_items: List[Dict[str, Any]] = []
         exact = await _omdb_by_title(q)
         search = await _omdb_search(q, limit=limit)
         for row in ([exact] if exact else []) + (search or []):
@@ -1256,87 +1287,48 @@ async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]
             k = (row["title"].lower(), row.get("year") or "")
             if not any((x["title"].lower(), x.get("year") or "") == k for x in omdb_items):
                 omdb_items.append(row)
+        if omdb_items:
+            logger.info("waterfall: hit OMDb (%s)", len(omdb_items))
+            return _rank(omdb_items)
     except Exception as e:
-        logger.warning("multi omdb: %s", e)
+        logger.warning("waterfall omdb: %s", e)
 
-    # 3) Wikidata + Wikipedia (free, no key)
-    try:
-        wiki_items = await wiki_search(q, limit=limit)
-    except Exception as e:
-        logger.warning("multi wiki: %s", e)
-
-    # 4) Gemini (spelling + release)
+    # 3) AI — Gemini first, then OpenAI
     try:
         gemini_items = await gemini_search(q, limit=limit)
+        if gemini_items:
+            logger.info("waterfall: hit Gemini (%s)", len(gemini_items))
+            return _rank(gemini_items)
     except Exception as e:
-        logger.warning("multi gemini: %s", e)
-
-    # 5) OpenAI / ChatGPT — last net (optional, needs billing)
+        logger.warning("waterfall gemini: %s", e)
     try:
         openai_items = await openai_search(q, limit=limit)
+        if openai_items:
+            logger.info("waterfall: hit OpenAI (%s)", len(openai_items))
+            return _rank(openai_items)
     except Exception as e:
-        logger.warning("multi openai: %s", e)
+        logger.warning("waterfall openai: %s", e)
 
-    # Merge: prefer exact title match, then longer release_date, keep unique
-    bucket: Dict[tuple, Dict[str, Any]] = {}
+    # 4) Wikidata
+    try:
+        wiki_items = await wiki_search(q, limit=limit)
+        if wiki_items:
+            logger.info("waterfall: hit Wikidata (%s)", len(wiki_items))
+            return _rank(wiki_items)
+    except Exception as e:
+        logger.warning("waterfall wikidata: %s", e)
 
-    def _absorb(it: Dict[str, Any], priority: int):
-        if not it or not it.get("title"):
-            return
-        # key by normalized title only so year variants can enrich same film
-        nk = _norm_title(it.get("title") or "")
-        if not nk:
-            return
-        y = it.get("year") or ""
-        key = (nk, y)
-        # also try match same title different year → keep separate
-        prev = bucket.get(key)
-        if not prev:
-            it = dict(it)
-            it["_prio"] = priority
-            bucket[key] = it
-            return
-        # enrich release_date / ids from better source
-        if (not prev.get("release_date") or len(prev.get("release_date") or "") < 10) and it.get("release_date"):
-            prev["release_date"] = it["release_date"]
-        if not prev.get("tmdb_id") and it.get("tmdb_id"):
-            prev["tmdb_id"] = it["tmdb_id"]
-        if not prev.get("imdb_id") and it.get("imdb_id"):
-            prev["imdb_id"] = it["imdb_id"]
-        if it.get("released_flag") is False:
-            prev["released_flag"] = False
-        # higher priority source wins label if closer
-        if priority < prev.get("_prio", 99):
-            prev["source"] = it.get("source") or prev.get("source")
-            prev["_prio"] = priority
+    # 5) Wikipedia (last)
+    try:
+        wp_items = await wikipedia_search(q, limit=limit)
+        if wp_items:
+            logger.info("waterfall: hit Wikipedia (%s)", len(wp_items))
+            return _rank(wp_items)
+    except Exception as e:
+        logger.warning("waterfall wikipedia: %s", e)
 
-    # priority: gemini/openai spelling, tmdb accuracy, omdb, wiki backup
-    for it in gemini_items:
-        _absorb(it, 1)
-    for it in openai_items:
-        _absorb(it, 1)
-    for it in tmdb_items:
-        _absorb(it, 2)
-    for it in omdb_items:
-        _absorb(it, 3)
-    for it in wiki_items:
-        _absorb(it, 4)
-
-    items = list(bucket.values())
-
-    # Rank: exact norm match first, then unreleased upcoming, then popularity/confidence
-    nq = _norm_title(q)
-    def _rank(it):
-        nt = _norm_title(it.get("title") or "")
-        exact = 0 if nt == nq else 1
-        unrel = 0 if is_unreleased(it) else 1
-        conf = -float(it.get("confidence") or it.get("popularity") or 0)
-        return (exact, unrel, conf)
-
-    items.sort(key=_rank)
-    for it in items:
-        it.pop("_prio", None)
-    return items[:limit]
+    logger.info("waterfall: no hits for %r", q)
+    return []
 
 
 def build_suggest_text(query: str) -> str:
