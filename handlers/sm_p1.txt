@@ -60,6 +60,9 @@ _SESSION_MARKUP = InlineKeyboardMarkup([
     ],
     [
         InlineKeyboardButton("✏️ Edit Name", callback_data="session_edit"),
+        InlineKeyboardButton("🖼 Set Thumb", callback_data="session_set_thumb"),
+    ],
+    [
         InlineKeyboardButton("Cancel Session", callback_data="session_cancel"),
     ],
 ])

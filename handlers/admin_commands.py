@@ -122,29 +122,63 @@ def register_admin_handlers(bot: Client):
 
     @bot.on_message(filters.photo & filters.private)
     async def handle_photo_upload(client: Client, message: Message):
-        """Manual poster attach/change."""
+        """Set Thumb button ke baad custom poster, ya active session pe manual poster."""
         admin_id = message.from_user.id
         if admin_id not in Config.ADMINS:
             return
 
         session = await session_mgr.get_session(admin_id)
-        photo_id = message.photo.file_id
+        if not session:
+            await message.reply_text(
+                "🖼 Photo received. Pehle <b>/addmovie</b> se session shuru karein, "
+                "phir <b>Set Thumb</b> dabao.",
+                quote=True,
+            )
+            return
 
-        if session and session.get("movie_id"):
-            movie_id = session.get("movie_id")
-            await db.update_movie_poster(movie_id, photo_id, source="manual")
-            session["poster_file_id"] = photo_id
+        photo_id = message.photo.file_id
+        # Prefer largest size if available
+        try:
+            if message.photo and getattr(message.photo, "file_id", None):
+                photo_id = message.photo.file_id
+        except Exception:
+            pass
+
+        session["poster_file_id"] = photo_id
+        session["awaiting_thumb"] = False
+        session_mgr.active_sessions[admin_id] = session
+        try:
             await db.set_active_session(admin_id, session)
-            await message.reply_text(
-                f"🖼 <b>Poster Updated!</b>\n\n"
-                f"Yeh poster active movie <b>'{session.get('title')}'</b> ke liye set kar diya gaya hai.",
-                quote=True
-            )
-        else:
-            await message.reply_text(
-                "🖼 Photo received. Poster set karne ke liye pehle <b>/addmovie</b> se session shuru karein.",
-                quote=True
-            )
+        except Exception:
+            pass
+
+        movie_id = session.get("movie_id")
+        if movie_id:
+            try:
+                await db.update_movie_poster(movie_id, photo_id, source="manual")
+            except Exception as e:
+                logger.warning("update_movie_poster: %s", e)
+            try:
+                if getattr(db, "movies_col", None) is not None:
+                    await db.movies_col.update_one(
+                        {"movie_id": movie_id},
+                        {"$set": {"poster_file_id": photo_id}},
+                    )
+                if movie_id in getattr(db, "_mem_movies", {}):
+                    db._mem_movies[movie_id]["poster_file_id"] = photo_id
+            except Exception:
+                pass
+
+        title = session.get("title") or "Movie"
+        year_str = f" ({session.get('year')})" if session.get("year") else ""
+        await message.reply_text(
+            f"🖼 <b>Thumb set!</b>\n\n"
+            f"Yeh photo <b>{title}{year_str}</b> pe lag jayegi.\n"
+            f"Group post + user download pe yahi poster dikhega.\n\n"
+            f"Ab aur quality bhejo ya <b>Generate Links</b> dabaao.\n"
+            f"(Agar thumb nahi chahiye to ignore — regular video thumb use hogi.)",
+            quote=True,
+        )
 
 
     @bot.on_message(filters.private & filters.text & ~filters.command([
@@ -223,6 +257,9 @@ def register_admin_handlers(bot: Client):
             ],
             [
                 InlineKeyboardButton("✏️ Edit Name", callback_data="session_edit"),
+                InlineKeyboardButton("🖼 Set Thumb", callback_data="session_set_thumb"),
+            ],
+            [
                 InlineKeyboardButton("Cancel Session", callback_data="session_cancel"),
             ],
         ])

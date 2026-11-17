@@ -67,6 +67,10 @@ async def addmovie_command(bot: Client, cmd: Message):
                 InlineKeyboardButton("Continue Upload", callback_data="session_continue"),
                 InlineKeyboardButton("Generate Links", callback_data="session_generate"),
             ],
+            [
+                InlineKeyboardButton("✏️ Edit Name", callback_data="session_edit"),
+                InlineKeyboardButton("🖼 Set Thumb", callback_data="session_set_thumb"),
+            ],
             [InlineKeyboardButton("Cancel Session", callback_data="session_cancel")],
         ])
         status_msg = await cmd.reply_text(

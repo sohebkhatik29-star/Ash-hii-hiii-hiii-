@@ -163,8 +163,9 @@ def register_callback_handlers(bot: Client):
                 [InlineKeyboardButton("🔗 Generate Links", callback_data="session_generate")],
                 [
                     InlineKeyboardButton("✏️ Edit Name", callback_data="session_edit"),
-                    InlineKeyboardButton("❌ Cancel Session", callback_data="session_cancel"),
+                    InlineKeyboardButton("🖼 Set Thumb", callback_data="session_set_thumb"),
                 ],
+                [InlineKeyboardButton("❌ Cancel Session", callback_data="session_cancel")],
             ])
             try:
                 await query.message.edit_text(text, reply_markup=markup)
@@ -191,6 +192,7 @@ def register_callback_handlers(bot: Client):
                 await query.answer("Koi active session nahi hai", show_alert=True)
                 return
             session["awaiting_edit"] = True
+            session["awaiting_thumb"] = False
             session_mgr.active_sessions[user_id] = session
             try:
                 await db.set_active_session(user_id, session)
@@ -211,6 +213,34 @@ def register_callback_handlers(bot: Client):
             except Exception:
                 pass
             await query.answer("Name type karke bhejo")
+            return
+
+        elif data == "session_set_thumb":
+            if user_id not in Config.ADMINS:
+                await query.answer("Admin only", show_alert=True)
+                return
+            session = await session_mgr.get_session(user_id)
+            if not session:
+                await query.answer("Koi active session nahi hai", show_alert=True)
+                return
+            session["awaiting_thumb"] = True
+            session["awaiting_edit"] = False
+            session_mgr.active_sessions[user_id] = session
+            try:
+                await db.set_active_session(user_id, session)
+            except Exception:
+                pass
+            try:
+                await query.message.reply_text(
+                    "🖼 <b>Custom thumb set karo</b>\n\n"
+                    "Ab <b>koi bhi photo</b> bhejo — yahi poster is movie pe lagega.\n"
+                    "Group post + user ko movie milne pe yahi photo dikhegi.\n\n"
+                    "Agar thumb nahi lagani to ignore karo — regular video thumb use hogi.",
+                    quote=True,
+                )
+            except Exception:
+                pass
+            await query.answer("Photo bhejo")
             return
 
         elif data == "session_cancel":
