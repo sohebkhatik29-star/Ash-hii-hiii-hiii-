@@ -138,6 +138,13 @@ except Exception as e:
     logger.error(f"chakspelling_cmd register failed (bot still runs): {type(e).__name__}: {e}")
 
 try:
+    from handlers.bot_commands.spl_cmd import register_spl_command
+    register_spl_command(Bot)
+    logger.info("/spl command registered")
+except Exception as e:
+    logger.error(f"spl_cmd register failed (bot still runs): {type(e).__name__}: {e}")
+
+try:
     from handlers.bot_commands.delete_filter_cmd import register_delete_filter_command
     register_delete_filter_command(Bot)
 except Exception as e:
