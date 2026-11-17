@@ -80,6 +80,72 @@ async def _apply_custom_caption(bot: Client, sent_file: Message, source_msg: Mes
     except Exception as e:
         logger.debug("custom caption: %s", e)
 
+
+async def _send_with_custom_thumb(
+    bot: Client,
+    user_id: int,
+    source_msg: Message,
+    poster_id: str,
+    caption: str = None,
+):
+    """
+    Custom poster ko video/document thumb banake bhejo.
+    copy_message original thumb rakhta hai — isliye re-send with thumb=.
+    Fail ho to None return (caller copy pe fallback kare).
+    """
+    if not source_msg or not poster_id:
+        return None
+    try:
+        video = getattr(source_msg, "video", None)
+        document = getattr(source_msg, "document", None)
+        animation = getattr(source_msg, "animation", None)
+
+        if video:
+            kw = dict(
+                chat_id=user_id,
+                video=video.file_id,
+                thumb=poster_id,
+                supports_streaming=True,
+            )
+            if caption is not None:
+                kw["caption"] = caption
+            elif source_msg.caption:
+                kw["caption"] = source_msg.caption
+            if getattr(video, "duration", None):
+                kw["duration"] = video.duration
+            if getattr(video, "width", None):
+                kw["width"] = video.width
+            if getattr(video, "height", None):
+                kw["height"] = video.height
+            if getattr(video, "file_name", None):
+                kw["file_name"] = video.file_name
+            return await bot.send_video(**kw)
+
+        if animation:
+            kw = dict(chat_id=user_id, animation=animation.file_id, thumb=poster_id)
+            if caption is not None:
+                kw["caption"] = caption
+            elif source_msg.caption:
+                kw["caption"] = source_msg.caption
+            return await bot.send_animation(**kw)
+
+        if document:
+            kw = dict(
+                chat_id=user_id,
+                document=document.file_id,
+                thumb=poster_id,
+            )
+            if caption is not None:
+                kw["caption"] = caption
+            elif source_msg.caption:
+                kw["caption"] = source_msg.caption
+            if getattr(document, "file_name", None):
+                kw["file_name"] = document.file_name
+            return await bot.send_document(**kw)
+    except Exception as e:
+        logger.warning("send with custom thumb failed: %s", e)
+    return None
+
 async def send_movie_card(bot: Client, user_id: int, movie_id: str, is_admin: bool = False):
     movie = await db.get_movie(movie_id)
     if not movie:
@@ -162,6 +228,7 @@ async def deliver_movie_quality(bot: Client, query: CallbackQuery, movie_id: str
     try:
         sent_file = None
         source_msg = None
+        poster_id = movie.get("poster_file_id")
         if channel_msg_id and Config.DB_CHANNEL:
             try:
                 try:
@@ -172,31 +239,56 @@ async def deliver_movie_quality(bot: Client, query: CallbackQuery, movie_id: str
                 if build_delivery_caption and source_msg and media_meta_from_message:
                     fname, fsize, orig = media_meta_from_message(source_msg)
                     custom_cap = await build_delivery_caption(fname, fsize, orig)
-                if Config.FORWARD_AS_COPY:
-                    kw = dict(
-                        chat_id=user_id,
-                        from_chat_id=Config.DB_CHANNEL,
-                        message_id=channel_msg_id,
+                # Custom thumb pehle try (group poster wahi file pe)
+                if poster_id and source_msg:
+                    sent_file = await _send_with_custom_thumb(
+                        bot, user_id, source_msg, poster_id, caption=custom_cap
                     )
-                    if custom_cap is not None:
-                        kw["caption"] = custom_cap
-                    sent_file = await bot.copy_message(**kw)
-                else:
-                    sent_file = await bot.forward_messages(
-                        chat_id=user_id,
-                        from_chat_id=Config.DB_CHANNEL,
-                        message_ids=channel_msg_id
-                    )
-                    if custom_cap is not None:
-                        await _apply_custom_caption(bot, sent_file, source_msg)
+                if not sent_file:
+                    if Config.FORWARD_AS_COPY:
+                        kw = dict(
+                            chat_id=user_id,
+                            from_chat_id=Config.DB_CHANNEL,
+                            message_id=channel_msg_id,
+                        )
+                        if custom_cap is not None:
+                            kw["caption"] = custom_cap
+                        sent_file = await bot.copy_message(**kw)
+                    else:
+                        sent_file = await bot.forward_messages(
+                            chat_id=user_id,
+                            from_chat_id=Config.DB_CHANNEL,
+                            message_ids=channel_msg_id
+                        )
+                        if custom_cap is not None:
+                            await _apply_custom_caption(bot, sent_file, source_msg)
             except Exception as e:
                 logger.warning(f"Channel copy failed: {e}")
 
         if not sent_file and q_data.get("file_id"):
-            sent_file = await bot.send_cached_media(
-                chat_id=user_id,
-                file_id=q_data["file_id"]
-            )
+            # file_id path: try video/doc with custom thumb
+            if poster_id:
+                try:
+                    sent_file = await bot.send_video(
+                        chat_id=user_id,
+                        video=q_data["file_id"],
+                        thumb=poster_id,
+                        supports_streaming=True,
+                    )
+                except Exception:
+                    try:
+                        sent_file = await bot.send_document(
+                            chat_id=user_id,
+                            document=q_data["file_id"],
+                            thumb=poster_id,
+                        )
+                    except Exception:
+                        sent_file = None
+            if not sent_file:
+                sent_file = await bot.send_cached_media(
+                    chat_id=user_id,
+                    file_id=q_data["file_id"]
+                )
             await _apply_custom_caption(bot, sent_file, source_msg)
 
         if not sent_file:
@@ -234,6 +326,7 @@ async def deliver_movie_quality_direct(bot: Client, user_id: int, movie_id: str,
         return
 
     channel_msg_id = q_data.get("channel_msg_id")
+    poster_id = movie.get("poster_file_id")
 
     try:
         sent_file = None
@@ -248,31 +341,54 @@ async def deliver_movie_quality_direct(bot: Client, user_id: int, movie_id: str,
                 if build_delivery_caption and source_msg and media_meta_from_message:
                     fname, fsize, orig = media_meta_from_message(source_msg)
                     custom_cap = await build_delivery_caption(fname, fsize, orig)
-                if Config.FORWARD_AS_COPY:
-                    kw = dict(
-                        chat_id=user_id,
-                        from_chat_id=Config.DB_CHANNEL,
-                        message_id=channel_msg_id,
+                if poster_id and source_msg:
+                    sent_file = await _send_with_custom_thumb(
+                        bot, user_id, source_msg, poster_id, caption=custom_cap
                     )
-                    if custom_cap is not None:
-                        kw["caption"] = custom_cap
-                    sent_file = await bot.copy_message(**kw)
-                else:
-                    sent_file = await bot.forward_messages(
-                        chat_id=user_id,
-                        from_chat_id=Config.DB_CHANNEL,
-                        message_ids=channel_msg_id
-                    )
-                    if custom_cap is not None:
-                        await _apply_custom_caption(bot, sent_file, source_msg)
+                if not sent_file:
+                    if Config.FORWARD_AS_COPY:
+                        kw = dict(
+                            chat_id=user_id,
+                            from_chat_id=Config.DB_CHANNEL,
+                            message_id=channel_msg_id,
+                        )
+                        if custom_cap is not None:
+                            kw["caption"] = custom_cap
+                        sent_file = await bot.copy_message(**kw)
+                    else:
+                        sent_file = await bot.forward_messages(
+                            chat_id=user_id,
+                            from_chat_id=Config.DB_CHANNEL,
+                            message_ids=channel_msg_id
+                        )
+                        if custom_cap is not None:
+                            await _apply_custom_caption(bot, sent_file, source_msg)
             except Exception as e:
                 logger.warning(f"Direct channel copy failed: {e}")
 
         if not sent_file and q_data.get("file_id"):
-            sent_file = await bot.send_cached_media(
-                chat_id=user_id,
-                file_id=q_data["file_id"]
-            )
+            if poster_id:
+                try:
+                    sent_file = await bot.send_video(
+                        chat_id=user_id,
+                        video=q_data["file_id"],
+                        thumb=poster_id,
+                        supports_streaming=True,
+                    )
+                except Exception:
+                    try:
+                        sent_file = await bot.send_document(
+                            chat_id=user_id,
+                            document=q_data["file_id"],
+                            thumb=poster_id,
+                        )
+                    except Exception:
+                        sent_file = None
+            if not sent_file:
+                sent_file = await bot.send_cached_media(
+                    chat_id=user_id,
+                    file_id=q_data["file_id"]
+                )
             await _apply_custom_caption(bot, sent_file, source_msg)
 
         if not sent_file:
