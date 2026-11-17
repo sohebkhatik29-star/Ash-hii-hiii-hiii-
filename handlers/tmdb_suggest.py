@@ -183,10 +183,14 @@ def build_unreleased_keyboard(item: Dict[str, Any]):
 
 
 
-def _http_get_json(url: str, timeout: float = 8.0) -> dict:
+def _http_get_json(url: str, timeout: float = 8.0):
+    """GET JSON — dict ya list dono return kar sakta hai."""
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "AshMovieBot/1.0", "Accept": "application/json"},
+        headers={
+            "User-Agent": "AshMovieBot/1.0 (Telegram bot; contact: admin)",
+            "Accept": "application/json",
+        },
         method="GET",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -900,6 +904,238 @@ async def tmdb_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
 
 
 
+# Wikidata instance-of QIDs that mean film / TV (common ones)
+_WIKI_FILM_QIDS = {
+    "Q11424",      # film
+    "Q24856",      # film series
+    "Q202866",     # animated film
+    "Q5398426",    # television series
+    "Q21191270",   # television series episode? skip usually
+    "Q15416",      # television program
+    "Q1259759",    # television film / TV movie
+    "Q506240",     # television film
+    "Q229390",     # 3D film
+    "Q29168811",   # animated television series
+}
+
+
+def _wiki_parse_time(time_val: str) -> tuple:
+    """Wikidata time '+2026-12-16T00:00:00Z' → (year, iso_date)."""
+    if not time_val:
+        return "", ""
+    m = re.search(r"([+-]?\d{4})-(\d{2})-(\d{2})", str(time_val))
+    if not m:
+        m2 = re.search(r"([+-]?\d{4})", str(time_val))
+        if m2:
+            y = m2.group(1).lstrip("+")
+            return y, ""
+        return "", ""
+    y = m.group(1).lstrip("+")
+    iso = f"{y}-{m.group(2)}-{m.group(3)}"
+    return y, iso
+
+
+async def wiki_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    Wikidata + Wikipedia (no API key) — title spelling + release year backup.
+    Filters to film / TV series only.
+    """
+    q = (query or "").strip()
+    if not q or len(q) < 2:
+        return []
+
+    # 1) Wikidata entity search
+    search_url = (
+        "https://www.wikidata.org/w/api.php?"
+        + urllib.parse.urlencode(
+            {
+                "action": "wbsearchentities",
+                "search": q,
+                "language": "en",
+                "uselang": "en",
+                "type": "item",
+                "limit": max(limit * 3, 10),
+                "format": "json",
+            }
+        )
+    )
+    try:
+        data = await asyncio.to_thread(_http_get_json, search_url, 10.0)
+    except Exception as e:
+        logger.warning("wiki_search search(%s) failed: %s", q, e)
+        data = {}
+
+    hits = data.get("search") or []
+    ids = [h.get("id") for h in hits if h.get("id")]
+    if not ids:
+        # 2) Wikipedia OpenSearch fallback (titles only)
+        try:
+            wp_url = (
+                "https://en.wikipedia.org/w/api.php?"
+                + urllib.parse.urlencode(
+                    {
+                        "action": "opensearch",
+                        "search": q,
+                        "limit": limit,
+                        "namespace": 0,
+                        "format": "json",
+                    }
+                )
+            )
+            wp = await asyncio.to_thread(_http_get_json, wp_url, 8.0)
+            # opensearch returns [query, [titles], [descs], [urls]]
+            titles = wp[1] if isinstance(wp, list) and len(wp) > 1 else []
+            descs = wp[2] if isinstance(wp, list) and len(wp) > 2 else []
+            out_wp: List[Dict[str, Any]] = []
+            for i, title in enumerate(titles or []):
+                desc = (descs[i] if i < len(descs) else "") or ""
+                low = (title + " " + desc).lower()
+                if not any(
+                    k in low
+                    for k in ("film", "movie", "television", "tv series", "series")
+                ):
+                    continue
+                year_m = re.search(r"\b(19\d{2}|20\d{2})\b", desc) or re.search(
+                    r"\b(19\d{2}|20\d{2})\b", title
+                )
+                year = year_m.group(1) if year_m else ""
+                label = f"{title} ({year})" if year else title
+                out_wp.append(
+                    {
+                        "title": title,
+                        "year": year,
+                        "release_date": "",
+                        "released_flag": None,
+                        "label": label,
+                        "confidence": 0.4,
+                        "source": "wiki",
+                        "tmdb_id": None,
+                        "imdb_id": None,
+                    }
+                )
+                if len(out_wp) >= limit:
+                    break
+            return out_wp
+        except Exception as e:
+            logger.warning("wiki opensearch(%s) failed: %s", q, e)
+            return []
+
+    # 3) Batch get entities for P31 + P577
+    ids_str = "|".join(ids[:15])
+    ent_url = (
+        "https://www.wikidata.org/w/api.php?"
+        + urllib.parse.urlencode(
+            {
+                "action": "wbgetentities",
+                "ids": ids_str,
+                "props": "labels|descriptions|claims",
+                "languages": "en",
+                "format": "json",
+            }
+        )
+    )
+    try:
+        ent_data = await asyncio.to_thread(_http_get_json, ent_url, 12.0)
+    except Exception as e:
+        logger.warning("wiki_search entities failed: %s", e)
+        ent_data = {}
+
+    entities = ent_data.get("entities") or {}
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    from datetime import date
+
+    today = date.today()
+
+    for qid in ids:
+        ent = entities.get(qid) or {}
+        if not ent or ent.get("missing") is not None:
+            continue
+        claims = ent.get("claims") or {}
+        # instance of (P31)
+        is_film = False
+        for snak in claims.get("P31") or []:
+            try:
+                v = (
+                    snak.get("mainsnak", {})
+                    .get("datavalue", {})
+                    .get("value", {})
+                    .get("id")
+                )
+                if v in _WIKI_FILM_QIDS:
+                    is_film = True
+                    break
+            except Exception:
+                pass
+        label = ((ent.get("labels") or {}).get("en") or {}).get("value") or ""
+        desc = ((ent.get("descriptions") or {}).get("en") or {}).get("value") or ""
+        if not is_film:
+            low = (label + " " + desc).lower()
+            if any(
+                k in low
+                for k in ("film", "movie", "television series", "tv series", "tv film")
+            ):
+                is_film = True
+        if not is_film or not label:
+            continue
+
+        # publication date P577
+        year, rd = "", ""
+        for snak in claims.get("P577") or []:
+            try:
+                tv = (
+                    snak.get("mainsnak", {})
+                    .get("datavalue", {})
+                    .get("value", {})
+                    .get("time")
+                )
+                year, rd = _wiki_parse_time(tv)
+                if year:
+                    break
+            except Exception:
+                pass
+        if not year:
+            ym = re.search(r"\b(19\d{2}|20\d{2})\b", desc)
+            if ym:
+                year = ym.group(1)
+
+        released_flag = None
+        if rd and len(rd) >= 10:
+            try:
+                y, m, d = int(rd[0:4]), int(rd[5:7]), int(rd[8:10])
+                released_flag = date(y, m, d) <= today
+            except Exception:
+                pass
+        elif year:
+            try:
+                released_flag = int(year) < today.year
+            except Exception:
+                pass
+
+        k = (label.lower(), year or "")
+        if k in seen:
+            continue
+        seen.add(k)
+        lab = f"{label} ({year})" if year else label
+        out.append(
+            {
+                "title": label,
+                "year": year,
+                "release_date": rd,
+                "released_flag": released_flag,
+                "label": lab,
+                "confidence": 0.55,
+                "source": "wiki",
+                "tmdb_id": None,
+                "imdb_id": None,
+                "wikidata_id": qid,
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
 async def openai_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
     OpenAI/ChatGPT fallback — spelling fix + release status when others miss.
@@ -991,7 +1227,7 @@ async def openai_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
 
 async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
-    TMDB + OMDb + Gemini + OpenAI — saari sources se lo, merge karo.
+    TMDB + OMDb + Wiki + Gemini + OpenAI — saari sources se lo, merge karo.
     Ek se na mile to dusra/teesra bhar de; dates/titles best se enrich.
     """
     q = (query or "").strip()
@@ -1000,6 +1236,7 @@ async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]
 
     tmdb_items: List[Dict[str, Any]] = []
     omdb_items: List[Dict[str, Any]] = []
+    wiki_items: List[Dict[str, Any]] = []
     gemini_items: List[Dict[str, Any]] = []
     openai_items: List[Dict[str, Any]] = []
 
@@ -1022,13 +1259,19 @@ async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]
     except Exception as e:
         logger.warning("multi omdb: %s", e)
 
-    # 3) Gemini (spelling + release)
+    # 3) Wikidata + Wikipedia (free, no key)
+    try:
+        wiki_items = await wiki_search(q, limit=limit)
+    except Exception as e:
+        logger.warning("multi wiki: %s", e)
+
+    # 4) Gemini (spelling + release)
     try:
         gemini_items = await gemini_search(q, limit=limit)
     except Exception as e:
         logger.warning("multi gemini: %s", e)
 
-    # 4) OpenAI / ChatGPT — last net for hard misses
+    # 5) OpenAI / ChatGPT — last net (optional, needs billing)
     try:
         openai_items = await openai_search(q, limit=limit)
     except Exception as e:
@@ -1067,7 +1310,7 @@ async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]
             prev["source"] = it.get("source") or prev.get("source")
             prev["_prio"] = priority
 
-    # priority: gemini spelling fixes first for options, then tmdb accuracy, then omdb
+    # priority: gemini/openai spelling, tmdb accuracy, omdb, wiki backup
     for it in gemini_items:
         _absorb(it, 1)
     for it in openai_items:
@@ -1076,6 +1319,8 @@ async def multi_source_search(query: str, limit: int = 5) -> List[Dict[str, Any]
         _absorb(it, 2)
     for it in omdb_items:
         _absorb(it, 3)
+    for it in wiki_items:
+        _absorb(it, 4)
 
     items = list(bucket.values())
 
