@@ -12,18 +12,32 @@ import asyncio
 import logging
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType, ChatMemberStatus
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from configs import Config
 
 logger = logging.getLogger("PremiumCmd")
 
-PREMIUM_TEXT = (
-    "This movie is available on Premium only.\n\n"
-    "To get Premium access and download this title, please message "
-    "@movies_1780\n\n"
-    "Thank you for understanding."
-)
+
+def _premium_username() -> str:
+    u = (getattr(Config, "OWNER_USERNAME", None) or "movies_1780").replace("@", "").strip()
+    return u or "movies_1780"
+
+
+def _premium_text() -> str:
+    u = _premium_username()
+    return (
+        "⭐ <b>Yeh movie sirf Premium hai.</b>\n\n"
+        "This movie is available on <b>Premium only</b>.\n\n"
+        f"Premium lene ke liye neeche button se contact karo: @{u}"
+    )
+
+
+def _premium_markup() -> InlineKeyboardMarkup:
+    u = _premium_username()
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"⭐ Premium — @{u}", url=f"https://t.me/{u}")]]
+    )
 
 # (chat_id, user_message_id) -> [bot_reply_message_ids]
 _PRM_REPLY_MAP: dict = {}
@@ -152,17 +166,27 @@ def register_premium_command(bot: Client):
             except Exception as e:
                 logger.warning("premium: delete cmd failed: %s", e)
 
+            text = _premium_text()
+            markup = _premium_markup()
+
             bot_msg = None
             try:
                 bot_msg = await client.send_message(
                     chat_id=message.chat.id,
-                    text=PREMIUM_TEXT,
+                    text=text,
                     reply_to_message_id=target.id,
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
                 )
             except Exception as e:
                 logger.warning("premium: send reply failed: %s", e)
                 try:
-                    bot_msg = await target.reply_text(PREMIUM_TEXT, quote=True)
+                    bot_msg = await target.reply_text(
+                        text,
+                        quote=True,
+                        reply_markup=markup,
+                        disable_web_page_preview=True,
+                    )
                 except Exception as e2:
                     logger.warning("premium: fallback reply failed: %s", e2)
 
