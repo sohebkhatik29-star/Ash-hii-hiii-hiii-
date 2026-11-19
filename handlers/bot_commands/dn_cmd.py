@@ -274,13 +274,13 @@ async def resolve_request_meta_async(
 
 
 
-_WATCH_INTERVAL = 2  # seconds between polls
-_WATCH_MAX = 200     # ~10 min coverage
+_WATCH_INTERVAL = 3  # seconds between polls
+_WATCH_MAX = 1200    # ~1 hour coverage (manual deletes within hour still cascade)
 _WATCHING: set = set()  # keys already being polled
 
 
 def track_bot_reply(chat_id: int, user_msg_id: int, bot_msg_id: int, client: Client = None):
-    """Link bot reply to user message so delete cascades both ways."""
+    """Link bot reply to user message so delete cascades both ways (memory + DB)."""
     try:
         chat_id = int(chat_id)
         user_msg_id = int(user_msg_id)
@@ -290,6 +290,13 @@ def track_bot_reply(chat_id: int, user_msg_id: int, bot_msg_id: int, client: Cli
         if bot_msg_id not in lst:
             lst.append(bot_msg_id)
         _BOT_REPLY_TO_USER[bot_msg_id] = (chat_id, user_msg_id)
+        # persist so cascade works even after Render restart
+        try:
+            import asyncio
+            from handlers.database import db as _db
+            asyncio.create_task(_db.save_msg_link(chat_id, user_msg_id, bot_msg_id))
+        except Exception as e:
+            logger.debug("track save_msg_link: %s", e)
         # start poll-watch (bots often miss deleted_messages updates)
         if client is not None and key not in _WATCHING:
             _WATCHING.add(key)
@@ -338,12 +345,22 @@ async def _poll_user_msg(client: Client, chat_id: int, user_msg_id: int):
 
 
 async def cascade_delete_for_user_msg(client: Client, chat_id: int, user_msg_id: int):
-    """User message deleted → delete all tracked bot replies."""
+    """User message deleted → delete all tracked bot replies (memory + DB)."""
     key = (int(chat_id), int(user_msg_id))
     bot_ids = list(_BOT_REPLIES.pop(key, None) or [])
     nf = _NOT_FOUND_MSG.pop(key, None)
     if nf and int(nf) not in [int(x) for x in bot_ids]:
         bot_ids.append(int(nf))
+    # also pull from DB (survives restart)
+    try:
+        from handlers.database import db as _db
+        extra = await _db.get_bot_replies_for_user(chat_id, user_msg_id)
+        for b in extra:
+            if int(b) not in [int(x) for x in bot_ids]:
+                bot_ids.append(int(b))
+        await _db.remove_msg_links_for_user(chat_id, user_msg_id)
+    except Exception as e:
+        logger.debug("cascade user DB lookup: %s", e)
     if not bot_ids:
         logger.debug("cascade user→bot: no bot replies for %s/%s", chat_id, user_msg_id)
         return
@@ -364,8 +381,15 @@ async def cascade_delete_for_user_msg(client: Client, chat_id: int, user_msg_id:
 
 
 async def cascade_delete_for_bot_reply(client: Client, chat_id: int, bot_msg_id: int):
-    """Bot reply deleted → delete original user message + sibling bot replies."""
+    """Bot reply deleted → delete original user message + sibling bot replies (memory + DB)."""
     info = _BOT_REPLY_TO_USER.pop(int(bot_msg_id), None)
+    if not info:
+        # try DB (after restart)
+        try:
+            from handlers.database import db as _db
+            info = await _db.get_user_for_bot_reply(bot_msg_id)
+        except Exception as e:
+            logger.debug("cascade bot DB lookup: %s", e)
     if not info:
         logger.debug("cascade bot→user: no mapping for bot_msg %s", bot_msg_id)
         return
@@ -374,6 +398,16 @@ async def cascade_delete_for_bot_reply(client: Client, chat_id: int, bot_msg_id:
     user_msg_id = int(user_msg_id)
     key = (chat_id, user_msg_id)
     siblings = list(_BOT_REPLIES.pop(key, []) or [])
+    # also from DB
+    try:
+        from handlers.database import db as _db
+        extra = await _db.get_bot_replies_for_user(chat_id, user_msg_id)
+        for b in extra:
+            if int(b) not in [int(x) for x in siblings]:
+                siblings.append(int(b))
+        await _db.remove_msg_links_for_user(chat_id, user_msg_id)
+    except Exception as e:
+        logger.debug("cascade bot siblings DB: %s", e)
     to_del = []
     for bid in siblings:
         _BOT_REPLY_TO_USER.pop(int(bid), None)
@@ -730,11 +764,29 @@ def register_dn_command(bot: Client):
         if (chat_id, msg_id) in _BOT_REPLIES or (chat_id, msg_id) in _NOT_FOUND_MSG:
             await cascade_delete_for_user_msg(client, chat_id, msg_id)
             return
+        # also check DB for user→bot (after restart)
+        try:
+            from handlers.database import db as _db
+            extra = await _db.get_bot_replies_for_user(chat_id, msg_id)
+            if extra:
+                await cascade_delete_for_user_msg(client, chat_id, msg_id)
+                return
+        except Exception:
+            pass
 
         # ---- B) Group: bot reply deleted → user msg ----
         if msg_id in _BOT_REPLY_TO_USER:
             await cascade_delete_for_bot_reply(client, chat_id, msg_id)
             return
+        # also check DB for bot→user
+        try:
+            from handlers.database import db as _db
+            info = await _db.get_user_for_bot_reply(msg_id)
+            if info:
+                await cascade_delete_for_bot_reply(client, chat_id, msg_id)
+                return
+        except Exception:
+            pass
 
         # ---- C) Bot PM: admin deleted Movie Request card / forward ----
         #     → delete user message + all bot replies in the GROUP

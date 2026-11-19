@@ -583,5 +583,103 @@ class Database:
             except Exception as e:
                 logger.error("[DB] clear_force_sub_pic: %s", e)
 
+    # ---------- Message reply links (user msg ↔ bot reply cascade delete) ----------
+    def _ensure_msg_links_col(self):
+        if not hasattr(self, "msg_links_col") or self.msg_links_col is None:
+            if self.has_mongo and self.db is not None:
+                self.msg_links_col = self.db["msg_links"]
+            else:
+                self.msg_links_col = None
+        if not hasattr(self, "_mem_msg_links"):
+            self._mem_msg_links = {}  # (chat_id, user_msg_id) -> [bot_msg_ids]
+        if not hasattr(self, "_mem_bot_to_user"):
+            self._mem_bot_to_user = {}  # bot_msg_id -> (chat_id, user_msg_id)
+
+    async def save_msg_link(self, chat_id: int, user_msg_id: int, bot_msg_id: int):
+        """Persist user_msg ↔ bot_reply so cascade works after restart."""
+        self._ensure_msg_links_col()
+        chat_id, user_msg_id, bot_msg_id = int(chat_id), int(user_msg_id), int(bot_msg_id)
+        key = (chat_id, user_msg_id)
+        lst = self._mem_msg_links.setdefault(key, [])
+        if bot_msg_id not in lst:
+            lst.append(bot_msg_id)
+        self._mem_bot_to_user[bot_msg_id] = key
+        if self.has_mongo and self.msg_links_col is not None:
+            try:
+                await self.msg_links_col.update_one(
+                    {"chat_id": chat_id, "user_msg_id": user_msg_id},
+                    {
+                        "$addToSet": {"bot_msg_ids": bot_msg_id},
+                        "$set": {"updated_at": datetime.datetime.utcnow()},
+                    },
+                    upsert=True,
+                )
+            except Exception as e:
+                logger.debug("[DB] save_msg_link: %s", e)
+
+    async def get_bot_replies_for_user(self, chat_id: int, user_msg_id: int) -> list:
+        self._ensure_msg_links_col()
+        chat_id, user_msg_id = int(chat_id), int(user_msg_id)
+        key = (chat_id, user_msg_id)
+        ids = list(self._mem_msg_links.get(key, []) or [])
+        if self.has_mongo and self.msg_links_col is not None:
+            try:
+                doc = await self.msg_links_col.find_one({"chat_id": chat_id, "user_msg_id": user_msg_id})
+                if doc:
+                    for b in (doc.get("bot_msg_ids") or []):
+                        if int(b) not in ids:
+                            ids.append(int(b))
+            except Exception as e:
+                logger.debug("[DB] get_bot_replies_for_user: %s", e)
+        return ids
+
+    async def get_user_for_bot_reply(self, bot_msg_id: int):
+        """Return (chat_id, user_msg_id) or None."""
+        self._ensure_msg_links_col()
+        bot_msg_id = int(bot_msg_id)
+        if bot_msg_id in self._mem_bot_to_user:
+            return self._mem_bot_to_user[bot_msg_id]
+        if self.has_mongo and self.msg_links_col is not None:
+            try:
+                doc = await self.msg_links_col.find_one({"bot_msg_ids": bot_msg_id})
+                if doc:
+                    return (int(doc["chat_id"]), int(doc["user_msg_id"]))
+            except Exception as e:
+                logger.debug("[DB] get_user_for_bot_reply: %s", e)
+        return None
+
+    async def remove_msg_links_for_user(self, chat_id: int, user_msg_id: int):
+        self._ensure_msg_links_col()
+        chat_id, user_msg_id = int(chat_id), int(user_msg_id)
+        key = (chat_id, user_msg_id)
+        bot_ids = self._mem_msg_links.pop(key, []) or []
+        for b in bot_ids:
+            self._mem_bot_to_user.pop(int(b), None)
+        if self.has_mongo and self.msg_links_col is not None:
+            try:
+                await self.msg_links_col.delete_one({"chat_id": chat_id, "user_msg_id": user_msg_id})
+            except Exception as e:
+                logger.debug("[DB] remove_msg_links_for_user: %s", e)
+
+    async def remove_msg_link_bot(self, bot_msg_id: int):
+        self._ensure_msg_links_col()
+        bot_msg_id = int(bot_msg_id)
+        info = self._mem_bot_to_user.pop(bot_msg_id, None)
+        if info:
+            key = info
+            lst = self._mem_msg_links.get(key, [])
+            if bot_msg_id in lst:
+                lst.remove(bot_msg_id)
+            if not lst:
+                self._mem_msg_links.pop(key, None)
+        if self.has_mongo and self.msg_links_col is not None:
+            try:
+                await self.msg_links_col.update_many(
+                    {"bot_msg_ids": bot_msg_id},
+                    {"$pull": {"bot_msg_ids": bot_msg_id}},
+                )
+            except Exception as e:
+                logger.debug("[DB] remove_msg_link_bot: %s", e)
+
 
 db = Database()
