@@ -681,5 +681,27 @@ class Database:
             except Exception as e:
                 logger.debug("[DB] remove_msg_link_bot: %s", e)
 
+    async def list_recent_msg_links(self, max_age_hours: int = 48) -> list:
+        """Return list of {chat_id, user_msg_id, bot_msg_ids} for links updated recently."""
+        self._ensure_msg_links_col()
+        out = []
+        if self.has_mongo and self.msg_links_col is not None:
+            try:
+                cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=max_age_hours)
+                async for doc in self.msg_links_col.find({"updated_at": {"$gte": cutoff}}):
+                    bots = [int(b) for b in (doc.get("bot_msg_ids") or []) if b]
+                    if bots:
+                        out.append({
+                            "chat_id": int(doc["chat_id"]),
+                            "user_msg_id": int(doc["user_msg_id"]),
+                            "bot_msg_ids": bots,
+                        })
+            except Exception as e:
+                logger.debug("[DB] list_recent_msg_links: %s", e)
+        for (cid, uid), bots in list(getattr(self, "_mem_msg_links", {}).items()):
+            if bots and not any(x["chat_id"] == cid and x["user_msg_id"] == uid for x in out):
+                out.append({"chat_id": int(cid), "user_msg_id": int(uid), "bot_msg_ids": [int(b) for b in bots]})
+        return out
+
 
 db = Database()

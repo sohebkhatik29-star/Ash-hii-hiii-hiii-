@@ -274,8 +274,8 @@ async def resolve_request_meta_async(
 
 
 
-_WATCH_INTERVAL = 3  # seconds between polls
-_WATCH_MAX = 1200    # ~1 hour coverage (manual deletes within hour still cascade)
+_WATCH_INTERVAL = 4  # seconds between polls
+_WATCH_MAX = 21600   # ~24 hour coverage (manual deletes within a day still cascade)
 _WATCHING: set = set()  # keys already being polled
 
 
@@ -821,5 +821,44 @@ def register_dn_command(bot: Client):
                 logger.warning("pm-delete user msg %s failed: %s", u_msg, e)
             return
 
+
+    # Restore polls after restart so old not-found replies still cascade on manual delete
+    async def _restore_watches():
+        try:
+            import asyncio
+            from handlers.database import db as _db
+            await asyncio.sleep(8)  # let bot fully start
+            links = await _db.list_recent_msg_links(max_age_hours=48)
+            restored = 0
+            for item in links:
+                cid = int(item["chat_id"])
+                uid = int(item["user_msg_id"])
+                bots = item.get("bot_msg_ids") or []
+                key = (cid, uid)
+                # reload memory maps
+                lst = _BOT_REPLIES.setdefault(key, [])
+                for b in bots:
+                    b = int(b)
+                    if b not in lst:
+                        lst.append(b)
+                    _BOT_REPLY_TO_USER[b] = (cid, uid)
+                if key not in _WATCHING and bots:
+                    _WATCHING.add(key)
+                    try:
+                        asyncio.create_task(_poll_user_msg(bot, cid, uid))
+                        restored += 1
+                    except Exception as e:
+                        logger.debug("restore watch start: %s", e)
+                        _WATCHING.discard(key)
+            if restored:
+                logger.info("dn: restored %s message-watch polls from DB", restored)
+        except Exception as e:
+            logger.debug("dn restore watches: %s", e)
+
+    try:
+        import asyncio
+        asyncio.create_task(_restore_watches())
+    except Exception:
+        pass
 
     logger.info("/dn registered")
