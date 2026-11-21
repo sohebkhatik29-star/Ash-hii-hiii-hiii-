@@ -180,11 +180,35 @@ async def schedule_delete(client, chat_id, message_ids, delay_seconds: int):
     if delay_seconds == 0:
         return
     await asyncio.sleep(int(delay_seconds))
-    for mid in message_ids:
-        try:
-            await client.delete_messages(chat_id, mid)
-        except Exception as e:
-            logger.debug("delete fail chat=%s mid=%s: %s", chat_id, mid, e)
+    ids = [int(m) for m in message_ids if m]
+    if not ids:
+        return
+    # Batch delete first (more reliable than one-by-one)
+    try:
+        await client.delete_messages(chat_id, ids)
+        logger.info("auto_delete batch ok chat=%s ids=%s", chat_id, ids)
+    except Exception as e:
+        logger.debug("auto_delete batch fail chat=%s: %s — trying one by one", chat_id, e)
+        for mid in ids:
+            try:
+                await client.delete_messages(chat_id, mid)
+            except Exception as e2:
+                logger.debug("delete fail chat=%s mid=%s: %s", chat_id, mid, e2)
+    # Extra safety: if any user msg was in the list, cascade-clean linked bot replies
+    # (covers cases where bot reply id was missing from schedule list)
+    try:
+        from handlers.bot_commands.dn_cmd import cascade_delete_for_user_msg, cascade_delete_for_bot_reply
+        for mid in ids:
+            try:
+                await cascade_delete_for_user_msg(client, chat_id, mid)
+            except Exception:
+                pass
+            try:
+                await cascade_delete_for_bot_reply(client, chat_id, mid)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("auto_delete cascade cleanup: %s", e)
 
 
 def schedule_result_delete(client, chat_id, message_ids):
