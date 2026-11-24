@@ -381,7 +381,10 @@ async def cascade_delete_for_user_msg(client: Client, chat_id: int, user_msg_id:
 
 
 async def cascade_delete_for_bot_reply(client: Client, chat_id: int, bot_msg_id: int):
-    """Bot reply deleted → delete original user message + sibling bot replies (memory + DB)."""
+    """Bot reply deleted → sirf sibling bot replies clean karo.
+    User ka original message MAT delete karo (admin sirf bot reply hataaye to user request rehni chahiye).
+    User msg delete hone pe hi bot replies cascade hote hain (cascade_delete_for_user_msg).
+    """
     info = _BOT_REPLY_TO_USER.pop(int(bot_msg_id), None)
     if not info:
         # try DB (after restart)
@@ -397,7 +400,7 @@ async def cascade_delete_for_bot_reply(client: Client, chat_id: int, bot_msg_id:
     chat_id = int(c_id)
     user_msg_id = int(user_msg_id)
     key = (chat_id, user_msg_id)
-    siblings = list(_BOT_REPLIES.pop(key, []) or [])
+    siblings = list(_BOT_REPLIES.get(key, []) or [])
     # also from DB
     try:
         from handlers.database import db as _db
@@ -405,30 +408,49 @@ async def cascade_delete_for_bot_reply(client: Client, chat_id: int, bot_msg_id:
         for b in extra:
             if int(b) not in [int(x) for x in siblings]:
                 siblings.append(int(b))
-        await _db.remove_msg_links_for_user(chat_id, user_msg_id)
     except Exception as e:
         logger.debug("cascade bot siblings DB: %s", e)
+    # Sirf OTHER bot replies delete (ye bot_msg already deleted hai)
+    # User message KOUCH nahi
     to_del = []
+    remaining = []
     for bid in siblings:
-        _BOT_REPLY_TO_USER.pop(int(bid), None)
-        if int(bid) != int(bot_msg_id):
-            to_del.append(int(bid))
-    # delete sibling bot replies + user message together
-    to_del.append(user_msg_id)
+        if int(bid) == int(bot_msg_id):
+            _BOT_REPLY_TO_USER.pop(int(bid), None)
+            continue
+        to_del.append(int(bid))
+        remaining.append(int(bid))
+    # memory update: is bot_msg_id ko list se hatao, baaki rehne do
+    if remaining:
+        _BOT_REPLIES[key] = remaining
+    else:
+        _BOT_REPLIES.pop(key, None)
+        _NOT_FOUND_MSG.pop(key, None)
+        # saari bot replies gayi → link cleanup
+        try:
+            from handlers.database import db as _db
+            await _db.remove_msg_links_for_user(chat_id, user_msg_id)
+        except Exception:
+            pass
+    if not to_del:
+        logger.info(
+            "cascade bot reply %s gone in %s — user msg %s kept (no sibling bots)",
+            bot_msg_id, chat_id, user_msg_id,
+        )
+        return
     try:
         await client.delete_messages(chat_id, to_del)
         logger.info(
-            "cascade: deleted user %s + siblings %s in %s (bot reply %s gone)",
-            user_msg_id, [x for x in to_del if x != user_msg_id], chat_id, bot_msg_id,
+            "cascade: deleted sibling bots %s in %s (bot reply %s gone, user %s kept)",
+            to_del, chat_id, bot_msg_id, user_msg_id,
         )
     except Exception as e:
-        logger.warning("cascade bot→user batch failed: %s — one by one", e)
+        logger.warning("cascade sibling batch failed: %s — one by one", e)
         for mid in to_del:
             try:
                 await client.delete_messages(chat_id, int(mid))
-                logger.info("cascade: deleted %s in %s (bot reply %s gone)", mid, chat_id, bot_msg_id)
             except Exception as e2:
-                logger.warning("cascade delete %s failed: %s", mid, e2)
+                logger.warning("cascade delete sibling %s failed: %s", mid, e2)
 
 
 
