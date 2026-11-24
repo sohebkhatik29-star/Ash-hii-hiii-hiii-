@@ -144,25 +144,6 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
     if mid is not None and _seen_message(int(mid)):
         return
 
-    session = await session_mgr.get_session(admin_id)
-    if not session:
-        # Admin ne /addmovie ke bina hi movie bheji → auto session start (same flow)
-        try:
-            status_msg = await message.reply_text(
-                "🎬 <b>Movie Upload Session Started</b> (auto)\n\n"
-                "File process ho rahi hai...\n"
-                "Saari qualities bhejo, phir <b>Generate Links</b> dabao.",
-                reply_markup=_SESSION_MARKUP,
-                quote=True,
-            )
-        except Exception:
-            status_msg = None
-        session = await session_mgr.start_addmovie_session(
-            admin_id,
-            status_msg.id if status_msg else 0,
-            message.chat.id,
-        )
-
     file_id = None
     filesize = 0
     file_name = ""
@@ -179,34 +160,12 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
         await message.reply_text("Sirf video/document support hai.", quote=True)
         return
 
-    ack = None
-    try:
-        ack = await message.reply_text("File process ho rahi hai...", quote=True)
-    except Exception:
-        pass
-
     caption = message.caption or ""
     try:
         meta = extract_movie_metadata(file_name, caption)
     except Exception:
         meta = {}
-    title = _safe(
-        meta.get("title")
-        or session.get("title")
-        or (file_name.rsplit(".", 1)[0] if file_name else "")
-        or "Unknown"
-    )
-    # Untitled / weak title → caption se dubara try
-    if (not title or title.lower() in ("untitled movie", "unknown", "video", "document")) and caption:
-        try:
-            from handlers.parser import clean_movie_title
-            t2 = clean_movie_title(caption, meta.get("year") or session.get("year"))
-            if t2 and t2.lower() not in ("untitled movie", "unknown"):
-                title = _safe(t2)
-        except Exception:
-            pass
-    year = meta.get("year") or session.get("year")
-    language = (meta.get("language") or session.get("language") or "").strip()
+    # title/year/quality resolved inside lock after session is known
     final_quality = meta.get("quality") or meta.get("quality_label") or "HD"
     season = (meta.get("season") or "").strip()
     episode = (meta.get("episode") or "").strip()
@@ -221,7 +180,52 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
     filesize_str = format_size(filesize) if filesize else "?"
     file_name = _safe(file_name)
 
+    # CRITICAL: auto-session start + process under ONE lock so multi-forward
+    # (3 qualities at once) never creates multiple sessions / cancel spam
     async with _proc_lock(admin_id):
+        session = await session_mgr.get_session(admin_id)
+        if not session:
+            # First file of a batch → start exactly one auto session
+            try:
+                status_msg = await message.reply_text(
+                    "🎬 <b>Movie Upload Session Started</b> (auto)\n\n"
+                    "File process ho rahi hai...\n"
+                    "Saari qualities bhejo, phir <b>Generate Links</b> dabao.",
+                    reply_markup=_SESSION_MARKUP,
+                    quote=True,
+                )
+            except Exception:
+                status_msg = None
+            session = await session_mgr.start_addmovie_session(
+                admin_id,
+                status_msg.id if status_msg else 0,
+                message.chat.id,
+            )
+        # later files in same batch reuse the same session (no new "Started")
+
+        title = _safe(
+            meta.get("title")
+            or session.get("title")
+            or (file_name.rsplit(".", 1)[0] if file_name else "")
+            or "Unknown"
+        )
+        if (not title or title.lower() in ("untitled movie", "unknown", "video", "document")) and caption:
+            try:
+                from handlers.parser import clean_movie_title
+                t2 = clean_movie_title(caption, meta.get("year") or session.get("year"))
+                if t2 and t2.lower() not in ("untitled movie", "unknown"):
+                    title = _safe(t2)
+            except Exception:
+                pass
+        year = meta.get("year") or session.get("year")
+        language = (meta.get("language") or session.get("language") or "").strip()
+
+        ack = None
+        try:
+            ack = await message.reply_text("File process ho rahi hai...", quote=True)
+        except Exception:
+            pass
+
         session = await session_mgr.get_session(admin_id)
         if not session:
             msg = "Session expire ho gaya. /addmovie dobara chalao."
