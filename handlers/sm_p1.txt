@@ -238,6 +238,29 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
                 await message.reply_text(msg, quote=True)
             return
 
+        # Guard: active session me alag title wali file mat merge karo
+        # (galti se dusri movie bhejne pe pehli movie me save na ho)
+        sess_title = (session.get("title") or "").strip()
+        if sess_title and title and title.lower() not in ("unknown", "untitled movie", "video", "document"):
+            try:
+                from handlers.parser import is_title_match
+                if not is_title_match(sess_title, title, threshold=0.78):
+                    msg = (
+                        f"❌ Ye file <b>{title}</b> current session "
+                        f"(<b>{sess_title}</b>) se match nahi karti.\n\n"
+                        f"Pehle <b>Cancel Session</b> dabao, phir nayi movie bhejo."
+                    )
+                    if ack:
+                        try:
+                            await ack.edit_text(msg)
+                        except Exception:
+                            await message.reply_text(msg, quote=True)
+                    else:
+                        await message.reply_text(msg, quote=True)
+                    return
+            except Exception:
+                pass
+
         movie_id = session.get("movie_id")
         active_title = session.get("title") or title
         active_year = session.get("year") or year
@@ -319,8 +342,20 @@ async def _handle_incoming_movie_file_inner(bot: Client, message: Message):
             pass
         asyncio.create_task(_bg_copy_and_patch(bot, message, movie_id, quality_key, quality_data))
 
-        qualities_list = (await db.get_movie(movie_id) or {}).get("qualities", {})
-        q_str = ", ".join(qualities_list.keys()) if qualities_list else quality_key
+        qualities_list = (await db.get_movie(movie_id) or {}).get("qualities", {}) or {}
+        # Movie session me series-episode style junk keys (S01 E01-05) hide karo —
+        # pehle galti se merge hui series qualities status me na dikhen
+        import re as _re
+        _ep_pat = _re.compile(r"(?i)\bS\s*\d{1,2}\s*E|\bE\d{2}(?:\s*-\s*E?\d{2})?\b")
+        _clean_keys = [k for k in qualities_list.keys() if not _ep_pat.search(str(k))]
+        # Prefer session-tracked keys if present (sirf is session me add hui)
+        sess_q = session.get("qualities") or []
+        if sess_q:
+            q_str = ", ".join(dict.fromkeys(sess_q))
+        elif _clean_keys:
+            q_str = ", ".join(_clean_keys)
+        else:
+            q_str = quality_key
         status_text = (
             f"Movie Session Active (v3.3)\n\n"
             f"Title: `{active_title}`\n"

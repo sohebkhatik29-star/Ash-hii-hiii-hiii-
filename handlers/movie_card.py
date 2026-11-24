@@ -74,6 +74,12 @@ def build_final_movie_card_text(movie: Dict[str, Any]) -> str:
     lang_str = " • ".join(languages) if languages else "Hindi"
 
     qualities = movie.get("qualities", {}) or {}
+    # Movie pe galti se merge hui series keys (S01 E01-05) hide karo
+    _title = str(movie.get("title") or "")
+    _is_series = bool(re.search(r"(?i)\bS\s*\d{1,2}\b|\bseason\b|\bepisode\b", _title))
+    if not _is_series:
+        _ep = re.compile(r"(?i)\bS\s*\d{1,2}\s*E|\bE\d{2}(?:\s*-\s*E?\d{2})?\b")
+        qualities = {k: v for k, v in qualities.items() if not _ep.search(str(k))}
     # Show ALL available qualities (sorted low→high), not just first key
     q_names = list(qualities.keys()) if qualities else []
     sorted_q = sorted(q_names, key=quality_sort_key) if q_names else []
@@ -91,7 +97,13 @@ def build_final_movie_card_text(movie: Dict[str, Any]) -> str:
 
 def build_final_movie_card_buttons(movie: Dict[str, Any], for_group: bool = False) -> InlineKeyboardMarkup:
     movie_id = movie.get("movie_id", "")
-    qualities = movie.get("qualities", {})
+    qualities = movie.get("qualities", {}) or {}
+    # Movie pe series-episode junk keys mat dikhao
+    _title = str(movie.get("title") or "")
+    _is_series = bool(re.search(r"(?i)\bS\s*\d{1,2}\b|\bseason\b|\bepisode\b", _title))
+    if not _is_series:
+        _ep = re.compile(r"(?i)\bS\s*\d{1,2}\s*E|\bE\d{2}(?:\s*-\s*E?\d{2})?\b")
+        qualities = {k: v for k, v in qualities.items() if not _ep.search(str(k))}
     sorted_qualities = sorted(qualities.items(), key=lambda item: quality_sort_key(item[0]))
 
     buttons = []
