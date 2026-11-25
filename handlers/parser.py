@@ -181,6 +181,11 @@ def clean_movie_title(raw_name: str, year: int = None) -> str:
         r"(?i)\bS\s*\d{1,2}\b",
         r"(?i)\bE\s*\d{1,3}(?:\s*[-\u2013to]+\s*E?\s*\d{1,3})?\b",
         r"(?i)\b(yify|rarbg|psa|codex|sparks|hdtv)\b",
+        # site / pack spam often left in title after year strip
+        r"(?i)\b(filmyz4u|filmywap|moviesverse|mkvcinemas|9xmovies|bollyflix|mkvcinema|skymovies|hdhub4u)\b",
+        r"(?i)\b(www|http|https|amzn|nf|netflix|prime|hotstar|disney|sonyliv)\b",
+        r"(?i)\b(complete|pack|web\s*series|webseries|series|season)\b",
+        r"(?i)\b(new|final|release|date|line|print)\b",
         r"\b(19\d{2}|20\d{2})\b",
         r"[:._\-+|/\\]+",
     ]
@@ -247,31 +252,44 @@ def extract_movie_metadata(filename: str, caption: str = "") -> Dict[str, Any]:
     season = extract_season(combined)
     episode = extract_episode_or_part(combined)
 
-    # Prefer the more descriptive of filename vs caption (forwarded files often have empty name)
+    # Prefer cleaner title: spam-filled long filenames (PNCHYT S2 NEW Www Filmyz4u...)
+    # used to win on length and pollute the session title. Score by cleaned length
+    # (short clean name is better) + slight preference for caption.
     def _base(s: str) -> str:
         s = re.sub(r"\.[a-z0-9]{2,4}$", "", s or "", flags=re.I).strip()
         return s
     fn_base = _base(filename)
     cap_base = _base(caption)
-    # Prefer longer non-generic source
     generic = {"", "video", "document", "movie", "file", "media", "unknown"}
     candidates = []
     if fn_base and fn_base.lower() not in generic:
-        candidates.append(fn_base)
+        candidates.append(("fn", fn_base))
     if cap_base and cap_base.lower() not in generic:
-        candidates.append(cap_base)
+        candidates.append(("cap", cap_base))
     if not candidates:
-        candidates = [fn_base or cap_base or ""]
-    # pick longest (usually full title+tags)
-    base = max(candidates, key=len)
-    title = clean_movie_title(base, year)
-    # If still Untitled, try the other candidate
-    if (not title or title.lower() == "untitled movie") and len(candidates) > 1:
-        for c in sorted(candidates, key=len, reverse=True):
-            t2 = clean_movie_title(c, year)
-            if t2 and t2.lower() != "untitled movie":
-                title = t2
-                break
+        candidates = [("raw", fn_base or cap_base or "")]
+
+    def _score(item):
+        src, raw = item
+        cleaned = clean_movie_title(raw, year)
+        cl = (cleaned or "").strip()
+        if not cl or cl.lower() == "untitled movie":
+            return (0, 0, 0)
+        # Prefer shorter cleaned titles (less leftover spam), caption slight boost
+        spam_penalty = 0
+        low = raw.lower()
+        for junk in ("filmyz", "www", "http", "amzn", "complete", "org", "new www"):
+            if junk in low:
+                spam_penalty += 1
+        # higher is better
+        return (1, -spam_penalty, -len(cl), 1 if src == "cap" else 0, cleaned)
+
+    ranked = sorted((_score(c) for c in candidates), reverse=True)
+    title = "Untitled Movie"
+    for sc in ranked:
+        if sc[0] == 1 and sc[-1]:
+            title = sc[-1]
+            break
     if not title or not title.strip():
         title = "Untitled Movie"
 
@@ -297,6 +315,10 @@ def extract_movie_metadata(filename: str, caption: str = "") -> Dict[str, Any]:
 
 
 def is_title_match(active_title: str, incoming_title: str, threshold: float = 0.72) -> bool:
+    """Same movie/series session check.
+    Handles messy vs clean titles: 'PNCHYT S2 ...' vs 'Panchayat S02'.
+    Season mismatch → no match. Same season → compare core name tokens.
+    """
     a = normalize_title(active_title)
     b = normalize_title(incoming_title)
     if not a or not b:
@@ -305,8 +327,46 @@ def is_title_match(active_title: str, incoming_title: str, threshold: float = 0.
         return True
     if a in b or b in a:
         return True
-    ratio = difflib.SequenceMatcher(None, a, b).ratio()
-    return ratio >= threshold
+
+    # Season must agree when both present (S01 vs S02 = different show entry)
+    sa = extract_season(active_title or "")
+    sb = extract_season(incoming_title or "")
+    if sa and sb and sa != sb:
+        return False
+
+    # Strip season/episode noise for core comparison
+    def _core(t: str) -> str:
+        t = re.sub(r"(?i)\bS\s*\d{1,2}\b", " ", t)
+        t = re.sub(r"(?i)\bE\s*\d{1,3}(?:\s*-\s*\d{1,3})?\b", " ", t)
+        t = re.sub(r"(?i)\b(complete|pack|web\s*series|series|season|new|www|org|amzn|nf)\b", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    ca, cb = _core(a), _core(b)
+    if not ca or not cb:
+        return difflib.SequenceMatcher(None, a, b).ratio() >= threshold
+    if ca == cb or ca in cb or cb in ca:
+        return True
+
+    ratio = difflib.SequenceMatcher(None, ca, cb).ratio()
+    if ratio >= threshold:
+        return True
+
+    # Token overlap: at least one significant token (>=4 chars) shared
+    # covers PNCHYT vs Panchayat poorly, so also try prefix / fuzzy token
+    ta = {w for w in ca.split() if len(w) >= 3}
+    tb = {w for w in cb.split() if len(w) >= 3}
+    if ta and tb:
+        inter = ta & tb
+        if inter:
+            return True
+        # fuzzy: any token shares long common prefix (panchayat / pnchyt-ish)
+        for x in ta:
+            for y in tb:
+                if len(x) >= 4 and len(y) >= 4:
+                    if x[:4] == y[:4] or difflib.SequenceMatcher(None, x, y).ratio() >= 0.7:
+                        return True
+    return ratio >= max(0.55, threshold - 0.15)
 
 
 def disambiguate_title_by_language(title: str, language: str = None) -> str:
